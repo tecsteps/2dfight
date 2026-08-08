@@ -747,6 +747,56 @@ export function flashLightCount() { return _flashLights.size; }
 // BASIC branch of the chunk for PCSS. Setting the type back to `PCFShadowMap`
 // (low/medium tiers) restores stock three behaviour, because the PCF branch of
 // the chunk below is a verbatim copy of the original.
+//
+// WHAT PCSS COSTS AT p95, AND THE ANSWER IS NOTHING
+//
+// PCSS is 28 texture fetches per shadowed fragment per casting light (12 blocker
+// + 16 filter), three lights cast, and it had never been ablated by name. It is
+// the obvious suspect in a chain that misses 60fps, and it is not the culprit.
+//
+// `tools/shadowgate.mjs` + `tools/shadowgate-page.js`, live CPU-vs-CPU fight at
+// 1920x1080 on `high`, adaptive OFF, ABBA quads of 2.6s blocks, quad-paired with
+// a bootstrap CI over quads. The tap count is changed by rewriting this chunk;
+// every block asserts the tap count and the filter branch on the GPU by pulling
+// the compiled fragment source back with `gl.getShaderSource`. Machine idle,
+// loadavg 3.2-4.2, baseline pair p50 14.05 / p95 17.83 / 13.0% of frames late:
+//
+//     arm                                  dp95      95% CI          verdict
+//     PCSS 28 taps -> hardware PCF, 5     +0.40   [-0.24, +1.14]   free
+//     PCSS 28 taps -> 14 (6 + 8)          -1.28   [-2.67, +0.12]   free
+//     PCSS 28 taps -> 2 (1 + 1)           -1.99   [ n/a, contended] free
+//     shadowMapSize 2560 -> 1024          +1.01   [-0.68, +2.66]   free
+//     NULL CONTROL, identical config      +0.38   [-1.28, +1.87]
+//     the whole shadow system OFF         -1.65   [-2.64, -0.71]   5/5 quads
+//
+// Two taps cost the same as twenty-eight, and hardware PCF costs the same as
+// PCSS. The filter is not on the critical path at all: the only shadow arm that
+// moves p95 is deleting the shadow system outright, for 1.65ms — which
+// independently replicates the 1.67ms [0.05, 3.29] the pass-budget round got for
+// the same ablation. So there is nothing to buy here by softening, by cheapening
+// or by shrinking, and `high` keeps `pcss: true` at 2560.
+//
+// Quality was measured too, because "free" is only half the question.
+// `tools/shadowquality.mjs` scores RMSE against the SHIPPED config integrated at
+// 4x, over a shadow mask built by differencing that against a shadows-off 4x
+// frame (12.6% of the frame). With resolution removed — truth(arm) against
+// truth(shipped) — hardware PCF sits 4.13 from the shipped picture on shadow
+// pixels and 2560 -> 1024 sits 1.97, against 22.12 for deleting the shadows. So
+// dropping to PCF would be a fifth of the way to having no shadows at all, in
+// exchange for nothing. 2560 is very nearly invisible at this framing (377 px/m)
+// and it is also free, so it stays for the stills.
+//
+// WHAT DID NOT WORK, recorded because it produced a confident wrong answer and
+// nearly shipped: the first three sessions measured PCSS -> PCF at a p95 ratio
+// of 0.57-0.61, a 40% saving, replicated across two sessions and 7/7 quads. It
+// was an artefact. Changing `shadowMap.type` without dropping the shadow maps
+// leaves half of them configured for the old sampler (see `#dropShadowMaps`),
+// the driver answers with GL_INVALID_OPERATION on every draw that samples one,
+// and a frame that draws almost nothing is 40% faster. The armed-pass assertion
+// passed, the GPU shader audit passed, and mean scene luma fell only 6% (68.9
+// against 73.1) — no config-level control could see it. What caught it was
+// looking at the picture, and what now catches it is an invariant assertion per
+// block: a PCF map must carry a comparison function and a Basic map must not.
 // ---------------------------------------------------------------------------
 
 /** Sentinel proving the upstream chunk still has the signature we replace. */
