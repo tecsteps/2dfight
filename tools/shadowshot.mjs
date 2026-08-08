@@ -33,6 +33,7 @@ await server.listen();
 const browser = await chromium.launch({ args: ['--use-angle=metal', '--ignore-gpu-blocklist', '--disable-frame-rate-limit', '--force-device-scale-factor=1'] });
 const page = await browser.newPage({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1 });
 page.on('pageerror', (e) => console.warn('[page-error]', e.message.split('\n')[0]));
+page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.warn('[' + m.type() + ']', m.text().slice(0, 400)); });
 await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load' });
 await page.waitForFunction('!!window.KB && !!window.KB.renderer && !!window.KB.fighters', null, { timeout: 90000 });
 await page.evaluate(`(() => { const KB = window.KB; KB.startMatch(0,1); KB.setPhase('fight'); if (KB.menus && KB.menus.show) KB.menus.show(null); KB.clock.getDelta = () => 1/60; })()`);
@@ -76,6 +77,16 @@ for (const [name, js] of shots) {
   const st = await page.evaluate(state);
   console.log(name.padEnd(18), JSON.stringify(st));
   writeFileSync(resolve(OUT, name + '.png'), await page.screenshot({ type: 'png' }));
+  // Same config with every post effect off: 'render,output' only. If the broken
+  // frame survives this, the scene render is broken; if it does not, the post
+  // chain is reading a broken depth texture.
+  await page.evaluate(`(() => { const r = window.KB.renderer; for (const k of ['ao','bloom','dof','motionBlur','grade','smaa']) r.setEffect(k, false); })()`);
+  await page.waitForTimeout(2500);
+  const bare = await page.evaluate(`(() => { const r = window.KB.renderer; return Object.keys(r._passes || {}).join(','); })()`);
+  writeFileSync(resolve(OUT, name + '-bare.png'), await page.screenshot({ type: 'png' }));
+  console.log('  bare passes:', bare);
+  await page.evaluate(`(() => { const r = window.KB.renderer; for (const k of ['ao','bloom','dof','motionBlur','grade','smaa']) r.setEffect(k, true); })()`);
+  await page.waitForTimeout(2500);
 }
 console.log('wrote', OUT);
 await browser.close();

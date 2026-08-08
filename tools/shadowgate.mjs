@@ -163,6 +163,10 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1 });
 page.on('pageerror', (e) => console.warn('[page-error]', e.message.split('\n')[0]));
+// GL errors are the ONLY direct evidence that the driver is dropping draws. An
+// arm can satisfy every config assertion and still be rendering nothing.
+let glErrors = 0;
+page.on('console', (m) => { if (/GL_INVALID|Mismatch between texture format/.test(m.text())) glErrors++; });
 
 await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load' });
 await page.waitForFunction('!!window.KB && !!window.KB.renderer && !!window.KB.fighters', null, { timeout: 90000 });
@@ -212,9 +216,14 @@ async function runBlock(cfg, label, meta, settle) {
   const audit = await page.evaluate('window.__sg.shaderAudit()');
   const pre = await page.evaluate('window.__sg.snapshot()');
   const load0 = os.loadavg()[0];
+  glErrors = 0;
   const r = await page.evaluate(`window.__sg.sample(${BLOCK})`);
   const post = await page.evaluate('window.__sg.snapshot()');
   const load1 = os.loadavg()[0];
+  const glErr = glErrors;
+  const luma = await page.evaluate('window.__sg.luma()');
+  const cmp = await page.evaluate('window.__sg.shadowCompare()');
+  const glApi = await page.evaluate('window.__sg.glErrors()');
 
   const voids = [];
   const ex = expectedPasses.join(' ');
@@ -268,6 +277,16 @@ async function runBlock(cfg, label, meta, settle) {
   if (pre.phase !== 'fight' || post.phase !== 'fight') voids.push('phase ' + pre.phase + '/' + post.phase);
   if (r.forcedPhase > 0) voids.push('phase forced ' + r.forcedPhase + 'x mid-block');
   if (r.ivals.length < MINFRAMES) voids.push('only ' + r.ivals.length + ' frames');
+  // IMAGE CONTROL. A driver that is dropping draws says so, and a frame that
+  // drew nothing is far darker than one that drew. Both are asserted.
+  if (glErr > 0) voids.push('GL errors on the console during the block: ' + glErr);
+  // gl.getError() rather than the console: Chromium stops reporting GL errors to
+  // the console after ~32 of them ("too many errors"), so a console counter
+  // reads zero for the rest of the session once an arm has misfired once.
+  if (glApi.n > 0) voids.push('gl.getError() returned ' + glApi.n + ' errors (first 0x' + glApi.first.toString(16) + ') -- the driver is dropping draws');
+  // The sampler/format invariant this whole class of failure lives in.
+  if (!cmp.ok) voids.push('shadow compare mode does not match shadowMap.type: ' + JSON.stringify(cmp));
+  if (!(luma > 20)) voids.push('scene luma ' + luma + ' -- the frame is empty or nearly so');
 
   const row = {
     label, ...meta, cfgKey: cfg.key, scale: cfg.scale,
@@ -281,6 +300,7 @@ async function runBlock(cfg, label, meta, settle) {
     load: [+load0.toFixed(2), +load1.toFixed(2)],
     drawCalls: pre.drawCalls, sceneDrawCalls: pre.sceneDrawCalls,
     triangles: pre.triangles, programs: pre.programs, progSig: pre.progSig,
+    glErrors: glErr, glApi, luma, shadowCompare: cmp,
     voids, ok: voids.length === 0,
     ivals: r.ivals.map((v) => +v.toFixed(3)),
   };
@@ -292,7 +312,7 @@ async function runBlock(cfg, label, meta, settle) {
     + `n=${String(row.frames).padStart(3)} p50 ${s ? s.p50.toFixed(2) : '  -  '} `
     + `p95 ${s ? s.p95.toFixed(2) : '-'} >16.67 ${s ? String(Math.round(s.over)).padStart(3) : ' -'}% `
     + `| load ${row.load[1].toFixed(2)} | dc ${String(row.drawCalls).padStart(4)} `
-    + `| gpu ${JSON.stringify(row.gpuPcss)}/pcf${row.gpuPcf}`
+    + `| luma ${String(row.luma).padStart(6)} | ${cmp.lights.join(',')} | gpu ${JSON.stringify(row.gpuPcss)}/pcf${row.gpuPcf}`
     + `${row.ok ? '' : '\n     VOID: ' + voids.join('; ')}`);
   return row;
 }

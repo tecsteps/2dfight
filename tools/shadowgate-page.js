@@ -243,6 +243,51 @@
     return progs.length + ':' + s;
   };
 
+  /** Frees every shadow map so the next frame reallocates it for the live type. */
+  const dropShadowMaps = () => {
+    (rp._lastScene || KB.scene).traverse((o) => {
+      if (!o.isLight || !o.shadow || !o.shadow.map) return;
+      if (o.shadow.map.depthTexture) { o.shadow.map.depthTexture.dispose(); o.shadow.map.depthTexture = null; }
+      o.shadow.map.dispose();
+      o.shadow.map = null;
+    });
+  };
+
+  /**
+   * THE INVARIANT THAT BREAKS, read straight off the live objects.
+   *
+   * A PCF shadow map must carry a comparison function and a Basic one must not.
+   * Anything else is a sampler/format mismatch, and the driver answers it by
+   * discarding every draw that samples the map. Reported per block and asserted.
+   */
+  P.shadowCompare = () => {
+    const type = rp.renderer.shadowMap.type;
+    const wantCompare = type === PCF_SHADOW_MAP;
+    const out = { type, wantCompare, lights: [], ok: true };
+    (rp._lastScene || KB.scene).traverse((o) => {
+      if (!o.isLight || !o.shadow || !o.castShadow) return;
+      const dt = o.shadow.map && o.shadow.map.depthTexture;
+      const has = !!(dt && dt.compareFunction);
+      out.lights.push((o.isDirectionalLight ? 'dir' : 'spot') + ':' + (o.shadow.map ? (has ? 'cmp' : 'nocmp') : 'NOMAP'));
+      if (!o.shadow.map || has !== wantCompare) out.ok = false;
+    });
+    return out;
+  };
+
+  /** Drains and counts GL errors. gl.getError() is not subject to the console's
+   *  "too many errors" suppression, which is what made the console useless. */
+  P.glErrors = () => {
+    const gl = rp.renderer.getContext();
+    let n = 0, first = 0;
+    for (let i = 0; i < 64; i++) {
+      const e = gl.getError();
+      if (e === gl.NO_ERROR) break;
+      if (!first) first = e;
+      n++;
+    }
+    return { n, first };
+  };
+
   /** Every shadow-casting light in the scene, as the GPU will see it. */
   const shadowLights = () => {
     const scene = rp._lastScene || KB.scene;
@@ -448,7 +493,22 @@
     }
     const wantType = wantPcss ? BASIC_SHADOW_MAP : PCF_SHADOW_MAP;
     rp._pcssActive = wantPcss && wantShadows;
-    if (rp.renderer.shadowMap.type !== wantType) rp.renderer.shadowMap.type = wantType;
+    if (rp.renderer.shadowMap.type !== wantType) {
+      rp.renderer.shadowMap.type = wantType;
+      // HAZARD 5, and it voided two whole sessions of this tool. three
+      // reconfigures a shadow map for a new type only inside the FIRST
+      // WebGLShadowMap.render after the change, and ScenePass draws shadow maps
+      // TWICE a frame, so the second batch keeps the old sampler configuration.
+      // A sampler2DShadow over a non-comparison depth texture is
+      // GL_INVALID_OPERATION on every draw that samples it: the driver drops
+      // every scene draw and the frame that reaches the screen is post over an
+      // almost empty buffer. It measured 40% FASTER, it passed the armed-pass
+      // assertion and the GPU shader audit, and its mean luma was only 6% low
+      // (68.9 against 73.1), so nothing already in this file could see it.
+      // RenderPipeline#setQuality does the same drop; this mirrors it, because
+      // this probe changes the type without going through setQuality.
+      dropShadowMaps();
+    }
 
     const recompiled = recompileAll(tag);
 
@@ -492,6 +552,38 @@
       // On the GPU: the tap signature every shadow-sampling program must carry.
       gpuPcssKey: wantPcss ? (taps[0] + '+' + taps[1]) : null,
     };
+  };
+
+  /**
+   * Mean luma of ONE freshly rendered frame, 480x270.
+   *
+   * THE CONTROL THIS TOOL WAS MISSING, and its absence voided a whole round.
+   * The armed pass list and the GPU shader audit both passed on an arm whose
+   * every scene draw was being dropped by the driver with GL_INVALID_OPERATION
+   * -- the configuration was exactly what was asked for, and the frame was a
+   * dark smear that measured 40% faster because it drew almost nothing. A
+   * config assertion cannot see that. A picture can.
+   *
+   * The render and the readback are in ONE synchronous task on purpose: without
+   * preserveDrawingBuffer the buffer is cleared between tasks and a later read
+   * returns black for every arm alike.
+   */
+  P.luma = () => {
+    const scene = rp._lastScene || KB.scene;
+    const cam = rp._lastCamera || KB.camera;
+    rp.render(scene, cam, 1 / 60);
+    const c = rp.canvas;
+    const t = P._lumaCanvas || (P._lumaCanvas = document.createElement('canvas'));
+    t.width = 480; t.height = 270;
+    const x = t.getContext('2d', { willReadFrequently: true });
+    x.imageSmoothingEnabled = true;
+    x.fillStyle = '#000';
+    x.fillRect(0, 0, 480, 270);
+    x.drawImage(c, 0, 0, 480, 270);
+    const d = x.getImageData(0, 0, 480, 270).data;
+    let s = 0;
+    for (let i = 0; i < d.length; i += 4) s += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    return +(s / (d.length / 4)).toFixed(3);
   };
 
   /* --------------------------------------------------------------- sampling */

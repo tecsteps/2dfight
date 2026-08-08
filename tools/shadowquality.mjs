@@ -223,7 +223,23 @@ const SHADOW_JS = `(() => {
     if (THREE.ShaderChunk[CHUNK] !== chunk) THREE.ShaderChunk[CHUNK] = chunk;
     rp._pcssActive = wantPcss && wantShadows;
     const type = wantPcss ? 0 : 1;               // BasicShadowMap / PCFShadowMap
-    if (rp.renderer.shadowMap.type !== type) rp.renderer.shadowMap.type = type;
+    if (rp.renderer.shadowMap.type !== type) {
+      rp.renderer.shadowMap.type = type;
+      // three reconfigures a shadow map for a new type only inside the FIRST
+      // WebGLShadowMap.render after the change, and ScenePass draws shadow maps
+      // twice a frame, so the second batch keeps the OLD sampler configuration
+      // and every draw that samples it is dropped with GL_INVALID_OPERATION.
+      // The first run of this tool scored the PCF arm at RMSE 66 on shadow
+      // pixels -- worse than deleting the shadows -- because that is what it was
+      // photographing. RenderPipeline#setQuality now does this drop; this
+      // mirrors it, because this tool changes the type without setQuality.
+      (rp._lastScene || KB.scene).traverse((o) => {
+        if (!o.isLight || !o.shadow || !o.shadow.map) return;
+        if (o.shadow.map.depthTexture) { o.shadow.map.depthTexture.dispose(); o.shadow.map.depthTexture = null; }
+        o.shadow.map.dispose();
+        o.shadow.map = null;
+      });
+    }
 
     const seen = new Set();
     let n = 0;
@@ -267,6 +283,28 @@ const SHADOW_JS = `(() => {
       out.pcss[key] = (out.pcss[key] || 0) + 1;
     }
     return out;
+  };
+
+  /** The sampler/format invariant: PCF maps must compare, Basic maps must not. */
+  S.compareOk = () => {
+    const want = rp.renderer.shadowMap.type === 1;
+    let ok = true;
+    const l = [];
+    (rp._lastScene || KB.scene).traverse((o) => {
+      if (!o.isLight || !o.shadow || !o.castShadow) return;
+      const dt = o.shadow.map && o.shadow.map.depthTexture;
+      const has = !!(dt && dt.compareFunction);
+      l.push((o.isDirectionalLight ? 'dir' : 'spot') + ':' + (o.shadow.map ? (has ? 'cmp' : 'nocmp') : 'NOMAP'));
+      if (!o.shadow.map || has !== want) ok = false;
+    });
+    return { ok, want, lights: l.sort().join(' ') };
+  };
+
+  S.glErrors = () => {
+    const gl = rp.renderer.getContext();
+    let n = 0;
+    for (let i = 0; i < 64; i++) { if (gl.getError() === gl.NO_ERROR) break; n++; }
+    return n;
   };
 
   S.shadowLights = () => {
@@ -550,11 +588,16 @@ async function armSetup(a) {
   // measured warm loop starts.
   await page.evaluate(`(${MEASURE_JS})(${SHIP}, 4, '__settle')`);
   const audit = await page.evaluate('window.__sq.audit()');
+  const cmp = await page.evaluate('window.__sq.compareOk()');
+  const glErr = await page.evaluate('window.__sq.glErrors()');
   audits[a.key] = audit;
-  return { applied, audit };
+  if (!cmp.ok || glErr > 0) console.warn(`  SETUP-FAIL ${a.key}: compare ${JSON.stringify(cmp)} glErrors ${glErr}`);
+  return { applied, audit, cmp, glErr };
 }
 
-function auditOk(a, audit) {
+function auditOk(a, audit, cmp, glErr) {
+  if (cmp && !cmp.ok) return false;
+  if (glErr > 0) return false;
   const keys = Object.keys(audit.pcss);
   if (a.shadows === false) return audit.withShadow === 0;
   if (!a.pcss) return audit.pcf > 0 && keys.length === 0;
@@ -564,8 +607,8 @@ function auditOk(a, audit) {
 
 /* ---- truth planes ------------------------------------------------------ */
 for (const a of RUN) {
-  const { applied, audit } = await armSetup(a);
-  const ok = auditOk(a, audit);
+  const { applied, audit, cmp, glErr } = await armSetup(a);
+  const ok = auditOk(a, audit, cmp, glErr);
   const m = await page.evaluate(`(${MEASURE_JS})(${TRUTH}, ${WARM}, 'truth-${a.key}')`);
   if (m.png) pngs['truth-' + a.key] = m.png;
   log(`truth-${a.key.padEnd(10)} ${m.rendered} lights ${JSON.stringify(await page.evaluate('window.__sq.shadowLights()'))} `
@@ -584,8 +627,8 @@ if (RUN.find((a) => a.key === 'ship') && RUN.find((a) => a.key === 'noshadow')) 
 
 /* ---- delivered planes at the shipped scale ----------------------------- */
 for (const a of RUN) {
-  const { applied, audit } = await armSetup(a);
-  const ok = auditOk(a, audit);
+  const { applied, audit, cmp, glErr } = await armSetup(a);
+  const ok = auditOk(a, audit, cmp, glErr);
   const m = await page.evaluate(`(${MEASURE_JS})(${SHIP}, ${WARM}, 'ship-${a.key}')`);
   if (m.png) pngs['ship-' + a.key] = m.png;
   // One output pixel of lateral parallax AT THE SUBJECT DISTANCE. pxPerM is
