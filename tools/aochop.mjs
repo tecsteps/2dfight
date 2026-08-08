@@ -55,6 +55,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -72,6 +73,33 @@ const OUT = arg('out', resolve(REPO, 'scratchpad/aochop.json'));
 const ONLY = arg('only', '');
 
 const log = (...a) => console.log('[aochop]', ...a);
+
+/**
+ * SETUP CONTROL: DID THE SUBJECT HOLD STILL?
+ *
+ * Added after a run of this file reported timings for a pass whose source had
+ * been reverted by another agent 77 seconds in. The page had loaded its modules
+ * before the write and was therefore unaffected -- but nothing in the run SAID
+ * so, and it took a transcript archaeology by a third party to establish it.
+ *
+ * So the run now states it. The files that define what is being measured are
+ * hashed before the first arm and after every arm; a hash that moves is
+ * recorded against the arms it spans. It cannot prevent the write, and on this
+ * harness it does not even invalidate the result -- the module graph is loaded
+ * once per page.goto and a disk write cannot reach it -- but 'the subject was
+ * edited while I measured it' should be a line in the report, not a thing
+ * somebody reconstructs afterwards.
+ */
+const SUBJECT_FILES = ['src/engine/RenderPipeline.js', 'tools/aogate-page.js'];
+const hashSubject = () => {
+  const h = {};
+  for (const f of SUBJECT_FILES) {
+    try { h[f] = createHash('sha1').update(readFileSync(resolve(REPO, f))).digest('hex').slice(0, 12); }
+    catch { h[f] = 'missing'; }
+  }
+  return h;
+};
+const sameHash = (a, b) => SUBJECT_FILES.every((f) => a[f] === b[f]);
 
 const pct = (s, p) => {
   if (!s.length) return NaN;
@@ -182,13 +210,14 @@ async function newSession(warmMs) {
   if (sessions === 1) {
     log('setup', JSON.stringify({ quality: info.quality, gpu: info.gpu }));
     log('armed at boot :', info.armed.join(' '));
-    hazard = await page.evaluate('window.__ao.hazard()');
+    hazard = info.hasSharedBuffer ? await page.evaluate('window.__ao.hazard()') : { skipped: 'tree does not carry the shared-normal-buffer change' };
+      log('tree carries the shared-normal-buffer change:', !!info.hasSharedBuffer);
     log('HAZARD assertion flags direct assignment:', hazard.assertionWouldFlag,
       '| the trap pays for the buffer and never reads it:', hazard.trapPaysAndDoesNotRead);
   }
   await page.evaluate(`window.__ao.apply(${JSON.stringify(BASE)})`);
   // Prime every program variant BEFORE warming, so no compile can land in a chop.
-  for (const m of ['shared', 'depth', 'shared', 'depth']) {
+  for (const m of (info.hasSharedBuffer ? ['shared', 'depth', 'shared', 'depth'] : ['depth'])) {
     await page.evaluate(`window.__ao.setNormalMode('${m}')`);
     await page.waitForTimeout(600);
   }
@@ -209,7 +238,9 @@ await newSession(WARM);
 
 /* ------------------------------------------------------------- the chops */
 
-const report = { arms: [], params: { SEGS, SEGMS, DROP }, defects: [] };
+const subjectAtStart = hashSubject();
+log('subject hash  :', JSON.stringify(subjectAtStart));
+const report = { arms: [], params: { SEGS, SEGMS, DROP }, subjectAtStart, defects: [] };
 const raw = {};
 
 for (const armDef of ARMS) {
@@ -220,9 +251,11 @@ for (const armDef of ARMS) {
   await page.waitForTimeout(1200);
   const armedPre = await page.evaluate('window.__ao.armed()');
   const load0 = os.loadavg()[0];
+  const subjectPre = hashSubject();
   const opt = { modes: armDef.modes, segMs: SEGMS, segs: SEGS, drop: DROP, pdSamples: armDef.pd, repeat: armDef.rep || [1, 1], gtaoSamples: armDef.gs || null };
   const r = await page.evaluate(`window.__ao.chop(${JSON.stringify(opt)})`);
   const load1 = os.loadavg()[0];
+  const subjectPost = hashSubject();
   const armedPost = await page.evaluate('window.__ao.armed()');
   await page.evaluate('window.__ao.setPdSamples(12)');
   await page.evaluate('window.__ao.setAoRepeat(1)');
@@ -231,6 +264,8 @@ for (const armDef of ARMS) {
   /* --- SETUP CONTROL, per segment ---------------------------------------- */
   const defects = [];
   if (armedPre.join(' ') !== armedPost.join(' ')) defects.push('armed list moved during the chop');
+  if (!sameHash(subjectPre, subjectPost)) defects.push('SUBJECT SOURCE EDITED DURING THIS ARM: ' + JSON.stringify(subjectPre) + ' -> ' + JSON.stringify(subjectPost));
+  if (!sameHash(subjectAtStart, subjectPre)) defects.push('subject source differs from run start (a previous arm spans an edit): ' + JSON.stringify(subjectPre));
   const segs = r.segs;
   for (const s of segs) {
     const wantShared = s.mode === 'shared';
@@ -276,6 +311,10 @@ for (const armDef of ARMS) {
   const row = {
     key: armDef.key, note: armDef.note, labelA, labelB,
     repeat: (armDef.rep || [1, 1])[0],
+    subjectPre, subjectPost, subjectHeldStill: sameHash(subjectPre, subjectPost),
+    // The page loaded its modules at session start, so this records whether the
+    // module graph in the page can still be described by what is on disk.
+    sessionLoadedFromSameSource: sameHash(subjectAtStart, subjectPre),
     segsTotal: segs.length, segsUsable: usable.length,
     framesA: framesA.length, framesB: framesB.length,
     framesPerSeg: +mean(usable.map((s) => s.ivals.length)).toFixed(1),
@@ -339,7 +378,11 @@ for (const r of report.arms) {
     + `${String(pf.est).padStart(8)} [${String(pf.lo).padStart(7)},${String(pf.hi).padStart(7)}] `
     + `${String(r.pooledDelta.p95).padStart(8)} [${String(p95 ? p95.lo : '-').padStart(7)},${String(p95 ? p95.hi : '-').padStart(7)}]`);
 }
-console.log(`\nsetup defects: ${report.defects.length ? report.defects.join(' | ') : 'none'}`);
+report.subjectAtEnd = hashSubject();
+report.subjectHeldStillWholeRun = sameHash(subjectAtStart, report.subjectAtEnd);
+console.log(`\nsubject source held still for the whole run: ${report.subjectHeldStillWholeRun}`
+  + (report.subjectHeldStillWholeRun ? '' : ` (${JSON.stringify(subjectAtStart)} -> ${JSON.stringify(report.subjectAtEnd)})`));
+console.log(`setup defects: ${report.defects.length ? report.defects.join(' | ') : 'none'}`);
 log('wrote', OUT);
 
 await browser.close();

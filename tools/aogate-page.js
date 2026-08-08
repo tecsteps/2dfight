@@ -103,7 +103,10 @@
     if (!ao) return null;
     const d = sceneDepth();
     if (mode === 'depth') ao.setGBuffer(d, undefined);
-    else ao.setGBuffer(d, ao.viewNormals.texture);
+    else {
+      if (!ao.viewNormals) throw new Error("normal mode 'shared' requires the shared-normal-buffer change in src/engine/RenderPipeline.js; this tree does not carry it");
+      ao.setGBuffer(d, ao.viewNormals.texture);
+    }
     P.instrumentAo();
     return P.aoState();
   };
@@ -179,10 +182,15 @@
       present: true,
       gtaoNVT: ao.gtaoMaterial.defines.NORMAL_VECTOR_TYPE,
       pdNVT: ao.pdMaterial.defines.NORMAL_VECTOR_TYPE,
-      wired: ao.normalTexture === ao.viewNormals.texture,
+      // 'viewNormals' only exists when the tree carries the shared-normal-buffer
+      // change. Without it the shared arm is unavailable, but the arms that are
+      // pure GTAOPass define flips -- the trace-sample and denoise-tap ladders --
+      // still run, and run against a completely unmodified pipeline.
+      hasSharedBuffer: !!ao.viewNormals,
+      wired: !!ao.viewNormals && ao.normalTexture === ao.viewNormals.texture,
       hasNormalTexture: !!ao.normalTexture,
       aoSize: ao.width + 'x' + ao.height,
-      normalSize: ao.viewNormals.width + 'x' + ao.viewNormals.height,
+      normalSize: ao.viewNormals ? ao.viewNormals.width + 'x' + ao.viewNormals.height : null,
       gtaoSamples: ao.gtaoMaterial.defines.SAMPLES,
       pdSamples: ao.pdSamples,
       blendIntensity: +ao.blendIntensity.toFixed(3),
@@ -264,6 +272,12 @@
       rp.setEffect = (n, v) => { P._rebuilds++; return origSet(n, v); };
     }
 
+    // This probe A/Bs a change that must be PRESENT in the tree to be turned
+    // off. Fail here, loudly, rather than 200 lines later with a TypeError --
+    // an earlier run of this file lost its whole session to exactly that when a
+    // sibling agent reverted RenderPipeline.js mid-flight.
+    const _ao = aoPass();
+    P.hasSharedBuffer = !!(_ao && _ao.viewNormals);
     P.instrumentAo();
 
     const gl = rp.renderer.getContext();
@@ -275,6 +289,7 @@
       gpu: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'unknown',
       armed: P.armed(),
       ao: P.aoState(),
+      hasSharedBuffer: P.hasSharedBuffer,
       effects: JSON.parse(JSON.stringify(rp.effects)),
     };
   };

@@ -1972,10 +1972,17 @@ class ScenePass extends Pass {
  * the ABBA-quad rig in `tools/aogate.mjs` could not, its NULL arm came back
  * +2.85ms). Live CPU-vs-CPU fight, 1632x918, 85-90 pairs per arm:
  *
- *     Poisson denoise, 12 taps -> 2    -0.12 ms  [-0.43, +0.21]   <- FREE
- *     GTAO trace, 11 -> 3 samples      -0.90 ms  [-1.62, -0.22]   <- the cost
+ *     Poisson denoise, 12 taps -> 2    -0.21 ms  [-0.82, +0.41]
+ *     GTAO trace, 11 -> 3 samples      -0.33 ms  [-1.16, +0.45]
+ *     GTAO trace, same, amplified x6   -0.26 ms  [-0.76, +0.19]  per frame
  *     shared normal buffer             -0.99 ms  [-2.31, +0.34]
- *     NULL (a mode against itself)     +0.10 ms  [-1.22, +1.45]
+ *     NULL (a mode against itself)     +0.06 ms  [-0.25, +0.36]  <- the tolerance
+ *
+ * The first four rows above were re-measured on a quiet box (loadavg 3.4, p50
+ * 14.8ms — the regime the budget is actually about) after an earlier reading
+ * quoted the trace at -0.90 ms; see docs/PROFILING.md. The null is now +-0.35ms,
+ * which is the tightest this rig has ever been, and NOTHING in the AO pass
+ * separates from it by much.
  *
  * Ten of twelve denoise taps — ninety depth fetches a pixel — cost nothing
  * measurable, because that 5x5 stencil is one or two cache lines on this GPU
@@ -1989,11 +1996,26 @@ class ScenePass extends Pass {
  * 4x-integrated frame versus 21.3822 shipped, and 7.3837 against 7.3914
  * frame-to-frame under a replayed camera orbit.
  *
- * WHERE THE COST ACTUALLY IS: the trace. 11 -> 3 samples takes it from 24 depth
- * taps a pixel to 6 and returns 0.90 ms, so a cheaper kernel or a quarter-res
- * trace is the live option and the denoise is not worth touching. And AO is not
- * invisible at fight framing — removing the pass moves subject RMSE by 9.36
- * with 59,480 subject pixels past 8/255 — so cutting it is not free either.
+ * ## WHERE THE COST ACTUALLY IS: NOT SAMPLING
+ *
+ * `setEffect('ao', false)` removes 2.24 ms of p95. The two knobs above control
+ * everything this pass SAMPLES, and between them they are worth ~0.5 ms of it.
+ * So about three quarters of GTAO's cost is fixed plumbing: four fullscreen
+ * draws a frame, of which `copyMaterial` (blitting the read buffer) and
+ * `blendMaterial` (the multiply) both run at FULL resolution, plus the
+ * half-float target traffic under them.
+ *
+ * That retires the usual three ideas at once — a cheaper kernel, fewer
+ * directions and a quarter-res trace all attack the 0.5 ms, and quarter-res
+ * does not touch the two full-res draws at all. The lever with the mass behind
+ * it is deleting those two draws: fold the AO multiply into a pass already
+ * running at full resolution (the grade, or `ScenePass`'s blit) rather than
+ * paying a dedicated copy and blend for it. Unmeasured; stated as the next
+ * experiment, not as a result.
+ *
+ * And AO is not invisible at fight framing — removing the pass moves subject
+ * RMSE by 9.36 with 59,480 subject pixels past 8/255 — so cutting it outright
+ * is not free either.
  */
 class HalfResGtaoPass extends GTAOPass {
   setSize(width, height) {
@@ -4210,9 +4232,15 @@ export class RenderPipeline {
    * corrupted frame that drew almost nothing (it read 40% faster).
    */
   #dropShadowMaps() {
-    this.scene.traverse((obj) => {
+    this.scene?.traverse((obj) => {
       if (!obj.isLight || !obj.shadow || !obj.shadow.map) return;
-      obj.shadow.map.depthTexture?.dispose();
+      // Same order as three's own recreation path: detach the depth texture
+      // before disposing the target, or the target's dispose handler walks a
+      // texture that has already been freed.
+      if (obj.shadow.map.depthTexture) {
+        obj.shadow.map.depthTexture.dispose();
+        obj.shadow.map.depthTexture = null;
+      }
       obj.shadow.map.dispose();
       obj.shadow.map = null;
     });

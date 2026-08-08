@@ -6093,6 +6093,71 @@ the product change that retunes an instrument, and the contended machine: **the 
 test was modified mid-run by someone else.** In a shared workspace with parallel agents that is
 not exotic, and no gate in this repo asserts that its subject held still while it measured.
 
+### RESOLUTION of that caveat, from the harness's author
+
+Both halves answered: **the harness was not contaminated, and the number was still wrong.**
+
+**1. The harness cannot be contaminated by a mid-run write.** `tools/aochop.mjs` loads the
+module graph once per `page.goto` and never re-reads it: vite is started with `hmr: false`
+and `watch: { ignored: ['**/*'] }`, and the driver prints `session N: priming done` on every
+page load — the 21:14:49 run printed it exactly once. An ES module already evaluated in a live
+page is not reachable by a write to disk.
+
+That argument is a priori, so here is the positive proof, which happens to exist because the
+probe crashes in a recognisable way on precisely the tree in question. `tools/aogate-page.js`
+dereferenced `ao.viewNormals.texture` inside `aoState()`, and `setup()` calls `aoState()`
+before any measurement, so on a tree *without* the change it throws immediately. Two later
+runs did exactly that and died before their first segment — one with a bare `TypeError`, one
+with the named guard that replaced it. The 21:14:49 run instead passed setup and completed
+**170/170 segments on all four arms with zero setup defects**, and that per-segment setup
+control asserts the trace sample count, the denoise tap count, both `NORMAL_VECTOR_TYPE`
+defines, the normal-texture identity and the amplifier — on every segment. A page whose
+`HalfResGtaoPass` lacked `viewNormals` could not have produced one of those assertions, let
+alone 680 of them.
+
+One wording correction: the checkout did not remove "the AO pass". The AO pass exists at HEAD.
+It removed the subclass's shared-normal-buffer additions.
+
+**2. The number does not survive re-measurement anyway.** Re-run on a tree that never carried
+the change at all (`scratchpad/aochop-verify.json`, 190 segments, 95 pairs per arm), on a box
+that had finally gone quiet — loadavg 3.4, p50 14.8 ms, which is the first time this
+investigation measured anything in the regime the budget is actually about:
+
+```
+null (a mode against itself)      +0.06 ms  [-0.25, +0.36]   <- tolerance is now +-0.35 ms
+Poisson denoise, 12 taps -> 2     -0.21 ms  [-0.82, +0.41]
+GTAO trace, 11 -> 3 samples       -0.33 ms  [-1.16, +0.45]
+GTAO trace, same, amplified x6    -0.26 ms  [-0.76, +0.19]   per frame
+```
+
+So −0.903 ms re-measures at −0.33, with the two amplified reads (−0.16 and −0.26 per frame)
+landing lower still. The CIs overlap, so the readings are compatible; the first one simply sat
+at the pessimistic end of a wide interval taken while the box was loaded. **Best estimate for
+cutting the GTAO trace from 24 depth taps to 6 is ≈0.3 ms, not 0.9.** The caveat's instruction
+to distrust the magnitude was right, and right for a reason nobody had proposed: not
+contamination, just noise.
+
+**3. What that leaves, which is the useful part.** The whole AO pass is 2.24 ms of p95
+(`3d6d133`'s ranked table, replicated over two sessions). The two knobs that control how much
+it *samples* account for ≈0.5 ms of that between them. So **roughly three quarters of GTAO's
+cost is not sampling at all** — it is the pass's fixed plumbing: four fullscreen draws per
+frame, of which the `copyMaterial` blit of the read buffer and the `blendMaterial` multiply
+both run at FULL resolution, plus the half-float render-target traffic underneath them.
+
+This retires three of the four ideas usually reached for. A cheaper kernel, fewer directions,
+and quarter-resolution all attack the ≈0.5 ms and leave the ≈1.7 ms untouched — quarter-res
+does not even touch the two full-res draws. The lever with the mass behind it is removing
+those two draws: fold the AO multiply into a pass that is already running at full resolution
+(the grade, or `ScenePass`'s blit) instead of paying a dedicated copy and blend for it. That
+is unmeasured and is stated as the next experiment, not as a result.
+
+**4. And the gate the caveat says does not exist now does.** `tools/aochop.mjs` hashes
+`src/engine/RenderPipeline.js` and `tools/aogate-page.js` before the first arm and after every
+arm, and records `subjectHeldStill` per arm and `subjectHeldStillWholeRun` for the run. It
+cannot prevent the write and on this harness it would not even invalidate the result — but
+"the subject was edited while I measured it" should be a line in the report rather than
+something a third party reconstructs from transcripts a day later.
+
 ### Recovery, stated generally
 
 Established twice today, +73 and +106 lines: **uncommitted work destroyed in a shared
