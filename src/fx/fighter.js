@@ -342,7 +342,7 @@ var FX = FX || {};
        * with 300 units/s still on the clock. */
       var ceil = this.launched
         ? (this.ceilY !== undefined ? this.ceilY : this.groundY - 132)
-        : this.groundY - 150;
+        : this.groundY - 88;
       if (this.y < ceil) { this.y = ceil; if (this.vy < 0) this.vy = 0; }
       if (this.y >= this.groundY) {
         /* Capture the impact velocity and drive it into the hip spring, so

@@ -555,5 +555,33 @@ var FX = FX || {};
     }
   }
 
+  /* Render just a fighter's head into a box, for the HUD portrait.
+   *
+   * The head geometry already exists and is solved every frame, so a
+   * portrait costs a depth clear and about twenty small primitives -- and
+   * because it is the live pose, it flinches when the fighter is hit and
+   * blinks when they blink. The shader's scale and offset are borrowed for
+   * the duration and put back. */
+  F.drawPortrait = function (sh, f, cx, cy, S2, w, h) {
+    var p = f.pose(), sk = f.skin;
+    var oS = sh.S, oOx = sh.ox, oOy = sh.oy, oZ = sh.zBias;
+    var oTint = sh.tint, oB0 = sh.bx0, oB1 = sh.bx1, oB2 = sh.by0, oB3 = sh.by1;
+    sh.S = S2; sh.zBias = 0; sh.tint = f.flash * 0.7;
+    sh.tintR = sk.tint[0]; sh.tintG = sk.tint[1]; sh.tintB = sk.tint[2];
+    /* Put the head's own centre at (cx, cy). begin() and every primitive
+     * apply `world * S + o`, so solving for o places the portrait without
+     * touching a single coordinate in the head builder. */
+    sh.ox = cx - p.headC[0] * S2 + (f.facing > 0 ? -w * 0.06 : w * 0.06);
+    sh.oy = cy - p.headC[1] * S2 + h * 0.10;
+    // clip to the box, in world units around the head
+    var hw = (w * 0.5) / S2, hh = (h * 0.5) / S2;
+    sh.begin(p.headC[0] - hw, p.headC[1] - hh, p.headC[0] + hw, p.headC[1] + hh);
+    sh.clearOcc();
+    sh.addOcc(p.headC[0], p.headC[1] + L.headRY * 1.5, L.headRX * 1.6, Z.head + 4, 0.5);
+    drawHead(sh, p, f, sk, p.fw);
+    sh.S = oS; sh.ox = oOx; sh.oy = oOy; sh.zBias = oZ; sh.tint = oTint;
+    sh.bx0 = oB0; sh.bx1 = oB1; sh.by0 = oB2; sh.by1 = oB3;
+  };
+
   F.Z = Z;
 })(FX);

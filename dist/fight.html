@@ -1208,7 +1208,7 @@ var FX = FX || {};
        * with 300 units/s still on the clock. */
       var ceil = this.launched
         ? (this.ceilY !== undefined ? this.ceilY : this.groundY - 132)
-        : this.groundY - 150;
+        : this.groundY - 88;
       if (this.y < ceil) { this.y = ceil; if (this.vy < 0) this.vy = 0; }
       if (this.y >= this.groundY) {
         /* Capture the impact velocity and drive it into the hip spring, so
@@ -2217,6 +2217,34 @@ var FX = FX || {};
     }
   }
 
+  /* Render just a fighter's head into a box, for the HUD portrait.
+   *
+   * The head geometry already exists and is solved every frame, so a
+   * portrait costs a depth clear and about twenty small primitives -- and
+   * because it is the live pose, it flinches when the fighter is hit and
+   * blinks when they blink. The shader's scale and offset are borrowed for
+   * the duration and put back. */
+  F.drawPortrait = function (sh, f, cx, cy, S2, w, h) {
+    var p = f.pose(), sk = f.skin;
+    var oS = sh.S, oOx = sh.ox, oOy = sh.oy, oZ = sh.zBias;
+    var oTint = sh.tint, oB0 = sh.bx0, oB1 = sh.bx1, oB2 = sh.by0, oB3 = sh.by1;
+    sh.S = S2; sh.zBias = 0; sh.tint = f.flash * 0.7;
+    sh.tintR = sk.tint[0]; sh.tintG = sk.tint[1]; sh.tintB = sk.tint[2];
+    /* Put the head's own centre at (cx, cy). begin() and every primitive
+     * apply `world * S + o`, so solving for o places the portrait without
+     * touching a single coordinate in the head builder. */
+    sh.ox = cx - p.headC[0] * S2 + (f.facing > 0 ? -w * 0.06 : w * 0.06);
+    sh.oy = cy - p.headC[1] * S2 + h * 0.10;
+    // clip to the box, in world units around the head
+    var hw = (w * 0.5) / S2, hh = (h * 0.5) / S2;
+    sh.begin(p.headC[0] - hw, p.headC[1] - hh, p.headC[0] + hw, p.headC[1] + hh);
+    sh.clearOcc();
+    sh.addOcc(p.headC[0], p.headC[1] + L.headRY * 1.5, L.headRX * 1.6, Z.head + 4, 0.5);
+    drawHead(sh, p, f, sk, p.fw);
+    sh.S = oS; sh.ox = oOx; sh.oy = oOy; sh.zBias = oZ; sh.tint = oTint;
+    sh.bx0 = oB0; sh.bx1 = oB1; sh.by0 = oB2; sh.by1 = oB3;
+  };
+
   F.Z = Z;
 })(FX);
 
@@ -2312,7 +2340,12 @@ var FX = FX || {};
   var SCALE_START = 1;                // 3.24 -> 1439x810; step up if it holds
   var SCALE = SCALE_LADDER[SCALE_START];
   var GROUND = 216;
-  var WALL_TOP = 118;                 // top of the temple wall, in world units
+  /* Top of the temple wall -- and therefore of the balustrade and the crowd
+   * line, the two strongest horizontals in the frame. At 118 they ran
+   * straight through both fighters' shoulders in every single screenshot.
+   * The band from the head down to the guard is where the readable action
+   * is, and it has to be free of long horizontals. */
+  var WALL_TOP = 96;
   var WALL_L = 30, WALL_R = W - 30;
   var BAY = 62;                       // pillar-to-pillar pitch, in world units
   /* How high a launched fighter may go. A juggle that carries someone off
@@ -2932,7 +2965,13 @@ var FX = FX || {};
     // `cross` sat in the move table with no input path to it at all
     if (c.p) { f.start(c.d ? 'uppercut' : (back ? 'hook' : (fwd ? 'cross' : 'jab'))); return; }
     if (c.k) { f.start(c.d ? 'sweep' : (back ? 'roundhouse' : (c.u ? 'highKick' : 'lowKick'))); return; }
-    if (c.u) { f.start('jump'); f.vy = -840; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
+    /* Jump velocity is set by the frame, not by taste. Gravity is 1500 and
+     * the apex is v^2/2g, so -490 gives 80 units of lift and 39 frames of
+     * airtime -- and 80 is what the framing allows: the floor is 216, the
+     * fighter is 125 tall, and the head has to stay inside the frame. A
+     * commercial fighter jumps two body heights because its camera is far
+     * wider relative to the character than this one is. */
+    if (c.u) { f.start('jump'); f.vy = -490; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
       this.fx.dust(f.x, f.y, 7, 1); return; }
     if (c.d) { f.start(back ? 'blockLow' : 'crouch'); return; }
     if (back) { f.start('block'); f.vx = -f.facing * 78; return; }
@@ -3227,6 +3266,18 @@ var FX = FX || {};
       var tc2 = sup.skin.tint;
       surf.addDisc(gx2, gy2, 150 * S * (0.5 + sp2 * 0.9), tc2[0], tc2[1], tc2[2], 0.20 * k2);
       surf.addDisc(gx2, gy2, 62 * S * (0.5 + sp2 * 0.9), tc2[0], tc2[1], tc2[2], 0.28 * k2);
+      /* A trail off the striking hand. The super's whole visual identity
+       * was a slightly bigger spark; a smear that follows the fist is what
+       * actually says "this is the big one". */
+      var sup2 = sup.pose();
+      var swr = sup2.arms[1].wrist, sel = sup2.arms[1].elbow;
+      for (var q4 = 0; q4 < 7; q4++) {
+        var tq = q4 / 6;
+        var lx2 = sel[0] + (swr[0] - sel[0]) * (1 + tq * 0.55);
+        var ly2 = sel[1] + (swr[1] - sel[1]) * (1 + tq * 0.55);
+        surf.addDisc(lx2 * S + pan, ly2 * S + oy, (9 - q4) * S,
+          tc2[0], tc2[1], tc2[2], 0.13 * (1 - tq) * k2);
+      }
       // speed lines converging on the attacker during the windup
       if (sp2 < 0.5) {
         var n2 = 26;
@@ -3414,7 +3465,7 @@ var FX = FX || {};
 
   Match.prototype.hud = function (surf) {
     var S = SCALE, w = surf.w;
-    var bw = 152 * S, bh = 11 * S, by = 12 * S, mg = 14 * S;
+    var bw = 128 * S, bh = 11 * S, by = 12 * S, mg = 12 * S;
     // chip bars trail the real value
     if (this.ghostA === undefined) { this.ghostA = 1; this.ghostB = 1; }
     var ha = this.a.hp / this.a.maxHp, hb = this.b.hp / this.b.maxHp;
@@ -3428,21 +3479,38 @@ var FX = FX || {};
     }
     var ca = hc(ha, this.tHud || 0), cb2 = hc(hb, this.tHud || 0);
     this.tHud = (this.tHud || 0) + 1;
-    bar(surf, mg, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
-    bar(surf, w - mg - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
+    var bgap = 33 * S;                       // room for the portrait plate
+    bar(surf, mg + bgap, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
+    bar(surf, w - mg - bgap - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
     // super meters
-    meterBar(surf, mg + 4 * S, by + bh + 5 * S, bw * 0.56, 4.5 * S, this.a.meter / 100, false, this.tHud);
-    meterBar(surf, w - mg - 4 * S - bw * 0.56, by + bh + 5 * S, bw * 0.56, 4.5 * S,
+    meterBar(surf, mg + bgap + 4 * S, by + bh + 5 * S, bw * 0.56, 4.5 * S, this.a.meter / 100, false, this.tHud);
+    meterBar(surf, w - mg - bgap - 4 * S - bw * 0.56, by + bh + 5 * S, bw * 0.56, 4.5 * S,
       this.b.meter / 100, true, this.tHud);
-    if (this.a.meter >= 100) text(surf, 'MAX', mg + 4 * S + bw * 0.56 + 5 * S, by + bh + 5 * S,
+    if (this.a.meter >= 100) text(surf, 'MAX', mg + bgap + 4 * S + bw * 0.56 + 5 * S, by + bh + 5 * S,
       1.5 * S, F.rgb(255, 236, 170), F.rgb(20, 10, 8));
-    if (this.b.meter >= 100) text(surf, 'MAX', w - mg - 4 * S - bw * 0.56 - 5 * S - textW('MAX', 1.5 * S),
+    if (this.b.meter >= 100) text(surf, 'MAX', w - mg - bgap - 4 * S - bw * 0.56 - 5 * S - textW('MAX', 1.5 * S),
       by + bh + 5 * S, 1.5 * S, F.rgb(255, 236, 170), F.rgb(20, 10, 8));
 
+    /* Portraits. The single thing that most makes a fighting-game HUD read
+     * as one, and the head is already solved every frame -- so it is the
+     * live head, blinking and flinching, not a static picture. */
+    var pw = 26 * S, ph = 26 * S, pty = by - 3 * S;
+    for (var pi = 0; pi < 2; pi++) {
+      var pf = pi ? this.b : this.a;
+      var pxx = pi ? w - mg - pw : mg;
+      surf.fillRect(pxx - 2 * S, pty - 2 * S, pw + 4 * S, ph + 4 * S, F.rgb(12, 10, 15));
+      surf.fillRect(pxx - 1 * S, pty - 1 * S, pw + 2 * S, ph + 2 * S, F.rgb(92, 82, 88));
+      surf.gradientV(pxx, pty, pw, ph, F.rgb(46, 38, 48), F.rgb(20, 16, 24));
+      F.drawPortrait(this.sh, pf, pxx + pw * 0.5, pty + ph * 0.5, S * 1.15, pw, ph);
+      // a lit lower edge, so the plate has a thickness
+      surf.blendRect(pxx, pty + ph - 1.2 * S, pw, 1.2 * S, 190, 158, 120, 0.45);
+    }
+
     var np = 1.5 * S;
-    text(surf, this.a.name, mg, by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+    text(surf, this.a.name, mg + pw + 5 * S, by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
     var nb = this.b.name;
-    text(surf, nb, w - mg - textW(nb, np), by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+    text(surf, nb, w - mg - pw - 5 * S - textW(nb, np), by + bh + 11 * S, np,
+      F.rgb(240, 226, 200), F.rgb(10, 8, 12));
 
     // timer
     var ts = String(Math.max(0, Math.ceil(this.time)));
@@ -3455,7 +3523,7 @@ var FX = FX || {};
     // round pips
     for (var i = 0; i < 2; i++) {
       for (var k = 0; k < 2; k++) {
-        var px = i ? w - mg - 7 * S - k * 11 * S : mg + k * 11 * S;
+        var px = i ? w - mg - pw - 12 * S - k * 11 * S : mg + pw + 5 * S + k * 11 * S;
         var on = this.wins[i] > k;
         var pyy = by + bh + 20 * S, rq = 3.6 * S;
         // a diamond, and a warm glow behind it when the round is won
