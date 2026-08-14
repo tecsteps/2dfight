@@ -83,6 +83,11 @@ var FX = FX || {};
     this.occ = new Float64Array(64 * 5); this.nOcc = 0;
     this.ox = 0; this.oy = 0;                          // screen shake
     this.ghost = 0;                                    // >0 draws an afterimage
+    /* A whole-object depth offset, in world units. Two fighters share one
+     * depth buffer, and in a 2D fighter one of them is simply in front of
+     * the other -- biasing each by more than a body's depth makes them
+     * occlude cleanly instead of interleaving limb by limb. */
+    this.zBias = 0;
 
     /* The half-vector is a constant of the light rig, but it was being
      * rebuilt -- including a reciprocal square root -- for every shaded
@@ -101,7 +106,7 @@ var FX = FX || {};
     if (this.nOcc >= 64) return;
     var S = this.S, o = this.occ, i = this.nOcc * 5, rr = r * S;
     o[i] = x * S + this.ox; o[i + 1] = y * S + this.oy; o[i + 2] = rr * rr;
-    o[i + 3] = z * S; o[i + 4] = k === undefined ? 0.5 : k;
+    o[i + 3] = (z + this.zBias) * S; o[i + 4] = k === undefined ? 0.5 : k;
     this.nOcc++;
   };
 
@@ -210,7 +215,7 @@ var FX = FX || {};
     var S = this.S;
     ax = ax * S + this.ox; ay = ay * S + this.oy;
     bx = bx * S + this.ox; by = by * S + this.oy;
-    r0 *= S; r1 *= S; zb *= S;
+    r0 *= S; r1 *= S; zb = (zb + this.zBias) * S;
     var dx = bx - ax, dy = by - ay;
     var seg = Math.sqrt(dx * dx + dy * dy);
     if (seg < 0.0001) { this.sphere(ax / S, ay / S, Math.max(r0, r1) / S, zb / S, m, ao); return; }
@@ -327,7 +332,7 @@ var FX = FX || {};
   Shader.prototype.ellipsoid = function (cx, cy, rx, ry, rot, zb, m, ao) {
     var S = this.S;
     cx = cx * S + this.ox; cy = cy * S + this.oy;
-    rx *= S; ry *= S; zb *= S;
+    rx *= S; ry *= S; zb = (zb + this.zBias) * S;
     var ca = Math.cos(rot), sa = Math.sin(rot);
     var rr = Math.max(rx, ry);
     var x0 = Math.floor(cx - rr - 1), x1 = Math.ceil(cx + rr + 1);
@@ -451,33 +456,57 @@ var FX = FX || {};
    * bevel toward its edges. Used for cloth panels and blades, where a tube
    * would read wrong. Coordinates are already in device space. */
   Shader.prototype.polySlab = function (pts, zb, m, bevel, ao) {
-    var n = pts.length, i;
+    /* Takes world coordinates like every other primitive. It used to take
+     * device coordinates, which made it the one shape a caller had to
+     * transform by hand. */
+    var S = this.S, n = pts.length, i;
+    var q = this._poly || (this._poly = []);
+    q.length = 0;
     var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
     for (i = 0; i < n; i++) {
-      if (pts[i][0] < minX) minX = pts[i][0];
-      if (pts[i][0] > maxX) maxX = pts[i][0];
-      if (pts[i][1] < minY) minY = pts[i][1];
-      if (pts[i][1] > maxY) maxY = pts[i][1];
+      var qx0 = pts[i][0] * S + this.ox, qy0 = pts[i][1] * S + this.oy;
+      q.push([qx0, qy0]);
+      if (qx0 < minX) minX = qx0;
+      if (qx0 > maxX) maxX = qx0;
+      if (qy0 < minY) minY = qy0;
+      if (qy0 > maxY) maxY = qy0;
     }
+    pts = q; zb = (zb + this.zBias) * S; bevel = (bevel || 3) * S;
     var x0 = Math.max(this.bx0, Math.floor(minX)), x1 = Math.min(this.bx1, Math.ceil(maxX) + 1);
     var y0 = Math.max(this.by0, Math.floor(minY)), y1 = Math.min(this.by1, Math.ceil(maxY) + 1);
-    var bv = bevel || 3;
+    if (x1 <= x0 || y1 <= y0) return;
+    var bv = bevel;
+
+    /* Edge planes, precomputed. These are constants of the polygon, and
+     * rebuilding them per pixel meant a square root and two divides per edge
+     * per pixel -- for a four-sided cloth panel, sixteen divides and four
+     * square roots to shade one pixel. Now each edge is one dot product. */
+    var ed = this._edge || (this._edge = []);
+    var ne = 0;
+    for (i = 0; i < n; i++) {
+      var ax = pts[i][0], ay = pts[i][1];
+      var j = (i + 1) % n;
+      var ex = pts[j][0] - ax, ey = pts[j][1] - ay;
+      var el = Math.sqrt(ex * ex + ey * ey);
+      if (el < 0.0001) continue;
+      var nxe = ey / el, nye = -ex / el;            // outward if CW
+      var e0 = ed[ne] || (ed[ne] = {});
+      e0.nx = nxe; e0.ny = nye; e0.d = ax * nxe + ay * nye;   // plane offset
+      ne++;
+    }
+    if (ne < 3) return;
 
     for (var y = y0; y < y1; y++) {
+      var py = y + 0.5;
       for (var x = x0; x < x1; x++) {
         // signed distance to the polygon boundary (convex assumption)
-        var px = x + 0.5, py = y + 0.5;
+        var px = x + 0.5;
         var inside = true, best = 1e9, bnx = 0, bny = 0;
-        for (i = 0; i < n; i++) {
-          var ax = pts[i][0], ay = pts[i][1];
-          var j = (i + 1) % n, bx = pts[j][0], by = pts[j][1];
-          var ex = bx - ax, ey = by - ay;
-          var el = Math.sqrt(ex * ex + ey * ey);
-          if (el < 0.0001) continue;
-          var nxe = ey / el, nye = -ex / el;          // outward if CW
-          var d = (px - ax) * nxe + (py - ay) * nye;
+        for (i = 0; i < ne; i++) {
+          var e1 = ed[i];
+          var d = px * e1.nx + py * e1.ny - e1.d;
           if (d > 0.5) { inside = false; break; }
-          if (-d < best) { best = -d; bnx = nxe; bny = nye; }
+          if (-d < best) { best = -d; bnx = e1.nx; bny = e1.ny; }
         }
         if (!inside) continue;
         var cov = best + 0.5; if (cov > 1) cov = 1; else if (cov <= 0) continue;

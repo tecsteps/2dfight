@@ -33,6 +33,8 @@ var FX = FX || {};
     this.canvas = null; this.ctx = null; this.img = null; this.out = null;
   }
 
+  /* Attaching re-sizes the canvas backing store, which also clears it. Safe
+   * to call again on the same canvas when the render resolution changes. */
   Surface.prototype.attach = function (canvas) {
     this.canvas = canvas;
     canvas.width = this.w; canvas.height = this.h;
@@ -148,17 +150,34 @@ var FX = FX || {};
       ((nb > 255 ? 255 : nb | 0) << 16) | ((ng > 255 ? 255 : ng | 0) << 8) | (nr > 255 ? 255 : nr | 0);
   };
 
+  /* Additive disc with a quadratic falloff.
+   *
+   * This is the hottest routine in the effects layer -- sparks, dust, glows
+   * and motion streaks all land here -- and it used to take a square root
+   * and make a function call for every pixel it touched. Working in squared
+   * distance and writing the pixel inline removes both. The falloff shape
+   * changes slightly (1-q)^2 rather than (1-sqrt(q))^2, which is a little
+   * fuller in the middle and is compensated in the callers' alpha. */
   Surface.prototype.addDisc = function (cx, cy, rad, r, g, b, a) {
-    var x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(this.w - 1, Math.ceil(cx + rad));
-    var y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(this.h - 1, Math.ceil(cy + rad));
-    var r2 = rad * rad;
+    if (rad <= 0 || a <= 0) return;
+    var x0 = Math.max(0, Math.ceil(cx - rad)), x1 = Math.min(this.w - 1, Math.floor(cx + rad));
+    var y0 = Math.max(0, Math.ceil(cy - rad)), y1 = Math.min(this.h - 1, Math.floor(cy + rad));
+    if (x1 < x0 || y1 < y0) return;
+    var ir2 = 1 / (rad * rad), px = this.px, W = this.w;
     for (var y = y0; y <= y1; y++) {
-      var dy = y - cy;
+      var dy = y - cy, dy2 = dy * dy, o = y * W;
       for (var x = x0; x <= x1; x++) {
-        var dx = x - cx, d2 = dx * dx + dy * dy;
-        if (d2 > r2) continue;
-        var f = 1 - Math.sqrt(d2) / rad;
-        this.addPx(x, y, r, g, b, a * f * f);
+        var dx = x - cx;
+        var q = (dx * dx + dy2) * ir2;
+        if (q >= 1) continue;
+        var f = 1 - q;
+        var al = a * f * f;
+        var i = o + x, v = px[i];
+        var nr = (v & 255) + r * al;
+        var ng = ((v >>> 8) & 255) + g * al;
+        var nb = ((v >>> 16) & 255) + b * al;
+        px[i] = 0xff000000 | ((nb > 255 ? 255 : nb | 0) << 16) |
+          ((ng > 255 ? 255 : ng | 0) << 8) | (nr > 255 ? 255 : nr | 0);
       }
     }
   };
@@ -198,27 +217,65 @@ var FX = FX || {};
   /* Soft alpha disc -- dust and smoke. Drawing these as squares was
    * leaving grey blocks on the floor. */
   Surface.prototype.blendDisc = function (cx, cy, rad, r, g, b, a) {
-    var x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(this.w - 1, Math.ceil(cx + rad));
-    var y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(this.h - 1, Math.ceil(cy + rad));
-    var r2 = rad * rad;
+    if (rad <= 0 || a <= 0) return;
+    var x0 = Math.max(0, Math.ceil(cx - rad)), x1 = Math.min(this.w - 1, Math.floor(cx + rad));
+    var y0 = Math.max(0, Math.ceil(cy - rad)), y1 = Math.min(this.h - 1, Math.floor(cy + rad));
+    if (x1 < x0 || y1 < y0) return;
+    var ir2 = 1 / (rad * rad), px = this.px, W = this.w;
     for (var y = y0; y <= y1; y++) {
-      var dy = y - cy;
+      var dy = y - cy, dy2 = dy * dy, o = y * W;
       for (var x = x0; x <= x1; x++) {
-        var dx = x - cx, d2 = dx * dx + dy * dy;
-        if (d2 > r2) continue;
-        var f = 1 - d2 / r2;
-        this.blendPx(x, y, r, g, b, a * f);
+        var dx = x - cx;
+        var q = (dx * dx + dy2) * ir2;
+        if (q >= 1) continue;
+        var al = a * (1 - q);
+        if (al > 1) al = 1;
+        var i = o + x, v = px[i], ia = 1 - al;
+        px[i] = 0xff000000 |
+          (((((v >>> 16) & 255) * ia + b * al) | 0) << 16) |
+          (((((v >>> 8) & 255) * ia + g * al) | 0) << 8) |
+          ((((v & 255) * ia + r * al) | 0));
       }
     }
   };
 
   /* A soft additive streak along a segment -- motion arcs, no shading. */
+  /* An additive capsule along a segment -- motion arcs and speed lines.
+   *
+   * This used to stamp up to twenty-three overlapping discs along the line,
+   * so every pixel near the middle was shaded a dozen times and the alpha
+   * stacked unpredictably with the segment's length. One pass over the
+   * segment's bounding box, shading each pixel exactly once by its distance
+   * to the axis, is both cheaper and gives a streak of even density. */
   Surface.prototype.addStreak = function (ax, ay, bx, by, rad, r, g, b, a) {
-    var dx = bx - ax, dy = by - ay;
-    var n = Math.max(2, Math.min(22, Math.sqrt(dx * dx + dy * dy) / 3 | 0));
-    for (var i = 0; i <= n; i++) {
-      var t = i / n;
-      this.addDisc(ax + dx * t, ay + dy * t, rad, r, g, b, a);
+    if (rad <= 0 || a <= 0) return;
+    var ex = bx - ax, ey = by - ay;
+    var len2 = ex * ex + ey * ey;
+    var inv = len2 > 1e-6 ? 1 / len2 : 0;
+    var x0 = Math.max(0, Math.ceil(Math.min(ax, bx) - rad));
+    var x1 = Math.min(this.w - 1, Math.floor(Math.max(ax, bx) + rad));
+    var y0 = Math.max(0, Math.ceil(Math.min(ay, by) - rad));
+    var y1 = Math.min(this.h - 1, Math.floor(Math.max(ay, by) + rad));
+    if (x1 < x0 || y1 < y0) return;
+    var ir2 = 1 / (rad * rad), px = this.px, W = this.w;
+    for (var y = y0; y <= y1; y++) {
+      var vy = y - ay, o = y * W;
+      for (var x = x0; x <= x1; x++) {
+        var vx = x - ax;
+        var t = (vx * ex + vy * ey) * inv;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        var qx = vx - ex * t, qy = vy - ey * t;
+        var q = (qx * qx + qy * qy) * ir2;
+        if (q >= 1) continue;
+        var f = 1 - q;
+        var al = a * f * f;
+        var i = o + x, v = px[i];
+        var nr = (v & 255) + r * al;
+        var ng = ((v >>> 8) & 255) + g * al;
+        var nb = ((v >>> 16) & 255) + b * al;
+        px[i] = 0xff000000 | ((nb > 255 ? 255 : nb | 0) << 16) |
+          ((ng > 255 ? 255 : ng | 0) << 8) | (nr > 255 ? 255 : nr | 0);
+      }
     }
   };
 

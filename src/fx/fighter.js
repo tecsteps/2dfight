@@ -103,16 +103,27 @@ var FX = FX || {};
     blockLow: { dur: 0, loop: true },
     jump: { dur: 0, loop: true },
 
-    jab:       { dur: 0.22, hit: [0.40, 0.60], dmg: 4,  reach: 52, hy: 12,  arm: 0, push: 52,  hs: 0.16 },
-    cross:     { dur: 0.30, hit: [0.40, 0.62], dmg: 8,  reach: 58, hy: 10,  arm: 1, push: 132, hs: 0.24 },
-    hook:      { dur: 0.34, hit: [0.42, 0.62], dmg: 10, reach: 46, hy: 14,  arm: 1, push: 155, hs: 0.28, arc: 1 },
-    uppercut:  { dur: 0.40, hit: [0.38, 0.60], dmg: 13, reach: 40, hy: 36,  arm: 1, push: 120, hs: 0.34, launch: 250 },
-    lowKick:   { dur: 0.30, hit: [0.40, 0.62], dmg: 7,  reach: 50, hy: -30, leg: 1, push: 96,  hs: 0.22, low: 1 },
-    highKick:  { dur: 0.38, hit: [0.40, 0.62], dmg: 12, reach: 62, hy: 22,  leg: 1, push: 190, hs: 0.30 },
-    roundhouse:{ dur: 0.44, hit: [0.40, 0.62], dmg: 15, reach: 66, hy: 18,  leg: 1, push: 300, hs: 0.36, arc: 1.6, launch: 150 },
-    sweep:     { dur: 0.36, hit: [0.40, 0.62], dmg: 8,  reach: 52, hy: -40, leg: 1, push: 90,  hs: 0.26, low: 1, trip: 1 },
+    /* Startup, active and recovery all fall out of `dur` and the `hit`
+     * window. Recovery used to equal startup on every move, so a 15-damage
+     * launcher was exactly as safe as a jab -- there was no reason to ever
+     * throw anything but the heaviest option. The heavies now carry their
+     * cost: the same active frames sit earlier in a longer move. */
+    jab:       { dur: 0.24, hit: [0.36, 0.55], dmg: 4,  reach: 52, hy: 12,  arm: 0, push: 52,  hs: 0.16 },
+    cross:     { dur: 0.36, hit: [0.33, 0.52], dmg: 8,  reach: 58, hy: 10,  arm: 1, push: 132, hs: 0.24 },
+    hook:      { dur: 0.46, hit: [0.31, 0.46], dmg: 10, reach: 46, hy: 14,  arm: 1, push: 155, hs: 0.28, arc: 1 },
+    uppercut:  { dur: 0.56, hit: [0.27, 0.43], dmg: 13, reach: 40, hy: 36,  arm: 1, push: 120, hs: 0.34, launch: 250 },
+    lowKick:   { dur: 0.34, hit: [0.35, 0.55], dmg: 7,  reach: 50, hy: -30, leg: 1, push: 96,  hs: 0.22, low: 1 },
+    highKick:  { dur: 0.50, hit: [0.30, 0.47], dmg: 12, reach: 62, hy: 22,  leg: 1, push: 190, hs: 0.30 },
+    roundhouse:{ dur: 0.62, hit: [0.28, 0.44], dmg: 15, reach: 66, hy: 18,  leg: 1, push: 300, hs: 0.36, arc: 1.6, launch: 150 },
+    sweep:     { dur: 0.50, hit: [0.29, 0.45], dmg: 8,  reach: 52, hy: -40, leg: 1, push: 90,  hs: 0.26, low: 1, trip: 1 },
 
-    special:   { dur: 0.62, hit: [0.38, 0.66], dmg: 26, reach: 76, hy: 8, arm: 1,
+    /* Air normals. Without them there is no jump-in, no air-to-air and no
+     * cross-up -- roughly half the neutral game of any commercial fighter
+     * was missing because every attack branch sat behind an onGround test. */
+    airPunch:  { dur: 0.34, hit: [0.26, 0.66], dmg: 7,  reach: 48, hy: -6, arm: 1, push: 90,  hs: 0.24, air: 1 },
+    airKick:   { dur: 0.40, hit: [0.24, 0.68], dmg: 11, reach: 58, hy: -18, leg: 1, push: 150, hs: 0.30, air: 1 },
+
+    special:   { dur: 0.80, hit: [0.30, 0.52], dmg: 26, reach: 76, hy: 8, arm: 1,
                  push: 560, hs: 0.5, launch: 300, super: 1 },
 
     grab:      { dur: 0.34, hit: [0.24, 0.44], grab: 1, reach: 34, hy: 6 },
@@ -123,11 +134,25 @@ var FX = FX || {};
     hitLow:    { dur: 0.30, stun: 1 },
     hitHeavy:  { dur: 0.45, stun: 1 },
     knockdown: { dur: 1.25, stun: 1 },
-    getup:     { dur: 0.55 },
+    // wake-up is invulnerable, or getting knocked down is a loop
+    getup:     { dur: 0.55, inv: 1 },
     victory:   { dur: 0, loop: true },
     defeat:    { dur: 0, loop: true }
   };
   F.MOVES = MOVES;
+
+  /* Where the working limb actually is, in world coordinates.
+   *
+   * Hit detection used to run off the authored `reach` number, which several
+   * moves never physically achieve -- a roundhouse claimed 87 units of range
+   * against a foot that reached 48, so blows landed with a visible gap. The
+   * drawn pose is the truth; this reads it. */
+  F.limbTip = function (f) {
+    var d = f.def(), p = f.pose();
+    if (d.leg) return p.legs[1].ankle;
+    if (d.arm !== undefined) return p.arms[d.arm].wrist;
+    return p.arms[1].wrist;
+  };
 
   /* ---- the fighter --------------------------------------------------- */
 
@@ -139,6 +164,7 @@ var FX = FX || {};
     this.facing = 1;
     this.groundY = 0;
     this.onGround = true;
+    this.launched = 0; this.juggle = 0;
 
     this.hp = 100; this.maxHp = 100;
     this.meter = 0;                       // builds toward the special
@@ -172,6 +198,8 @@ var FX = FX || {};
     ];
     // a kicking foot gets its own local target while it is off the ground
     this.kick = { on: 0, x: new Spring(0, 18), y: new Spring(0, 18), leg: 1 };
+    // how far the kicking ankle has left the floor for its target, 0..1
+    this.kickB = new Spring(0, 26);
 
     // always-on life
     this.breath = Math.random() * TAU;
@@ -188,6 +216,11 @@ var FX = FX || {};
       back: 0.78, up: 1.4, grav: 620 };
     this.hair = [];
     for (var i = 0; i < this.hairStyle.n; i++) this.hair.push({ x: 0, y: 0, vx: 0, vy: 0 });
+    /* Gi hem. Two points -- one in front of the legs, one behind -- hanging
+     * off the belt. Without them the lower body is two bare tubes, and a
+     * loose garment is most of what a gi's silhouette actually is. They also
+     * lag the body, so a dash or a landing flares the cloth for free. */
+    this.hem = [{ x: 0, y: 0, vx: 0, vy: 0 }, { x: 0, y: 0, vx: 0, vy: 0 }];
     this.belt = [{ x: 0, y: 0, vx: 0, vy: 0 }, { x: 0, y: 0, vx: 0, vy: 0 }];
     this.trail = [];
   }
@@ -201,6 +234,10 @@ var FX = FX || {};
     this.hipH.set(L.standHip);
     var c = this.chest();
     for (var i = 0; i < this.hair.length; i++) { this.hair[i].x = c[0]; this.hair[i].y = c[1]; }
+    for (var j = 0; j < this.hem.length; j++) {
+      this.hem[j].x = this.x; this.hem[j].y = this.y - 30;
+      this.hem[j].vx = this.hem[j].vy = 0;
+    }
     for (var j = 0; j < this.belt.length; j++) { this.belt[j].x = c[0]; this.belt[j].y = c[1]; }
   };
 
@@ -249,11 +286,15 @@ var FX = FX || {};
 
     // gravity and ground
     if (!this.onGround) {
-      this.vy += 1800 * dt;
+      this.vy += 1500 * dt;
       this.y += this.vy * dt;
-      // ceiling, so a juggle cannot carry anyone out of frame. The match
-      // sets ceilY from its own framing; this is only the fallback.
-      var ceil = this.ceilY !== undefined ? this.ceilY : this.groundY - 132;
+      /* Ceiling, so a juggle cannot carry anyone out of frame. It applies
+       * only to fighters who were put in the air by a hit -- clamping a
+       * voluntary jump stopped it dead at 72% of its natural apex, mid-rise,
+       * with 300 units/s still on the clock. */
+      var ceil = this.launched
+        ? (this.ceilY !== undefined ? this.ceilY : this.groundY - 132)
+        : this.groundY - 150;
       if (this.y < ceil) { this.y = ceil; if (this.vy < 0) this.vy = 0; }
       if (this.y >= this.groundY) {
         /* Capture the impact velocity and drive it into the hip spring, so
@@ -261,6 +302,7 @@ var FX = FX || {};
          * hip actually rose on landing and the character read as a decal. */
         var iv = this.vy;
         this.y = this.groundY; this.vy = 0; this.onGround = true;
+        this.launched = 0; this.juggle = 0;   // landing ends a juggle chain
         this.hipH.v -= Math.min(20, iv * 0.045); this.hipH.d = 0;
         this.lean.v += Math.min(14, iv * 0.03);
         this.landV = iv;
@@ -314,15 +356,25 @@ var FX = FX || {};
     if (m === 'dash' || m === 'backdash') lean = m === 'dash' ? 18 : -14;
     if (crouching) lean = 16;
     if (m === 'block' || m === 'blockLow') { lean = -3; tw0 = -16; }
-    if (d.arm || d.leg) lean = 6 + 18 * strikeEnv(p);
+    /* A kick throws the leg forward, so the torso has to go back or the
+      * centre of mass leaves the support foot entirely. It used to lean
+      * *into* a head-height kick. */
+    if (d.arm !== undefined) lean = 6 + 18 * strikeEnv(p);
+    else if (d.leg) lean = 6 - 26 * strikeEnv(p);
     if (m === 'hitHigh' || m === 'hitHeavy') lean = -22 * Math.sin(Math.PI * p);
     if (m === 'hitLow') lean = 22 * Math.sin(Math.PI * p);
     if (m === 'victory') lean = -4 + br * 2;
 
     // breathing lifts the chest and rocks the shoulders
-    var hip = L.standHip - 22 * this.crouchS.v + br * 3.4;
+    /* Hip height. The bob used to come entirely from the 0.7 Hz breath
+     * sine, which is unrelated to the 2 Hz step cadence -- so while walking
+     * the torso floated over the legs instead of dropping onto each one. */
+    var hip = L.standHip - 26 * this.crouchS.v + br * 3.4;
+    if ((m === 'walk' || m === 'dash') && Math.abs(this.vx) > 4) {
+      hip -= 2.8 * Math.abs(Math.sin(this.phase * TAU));
+    }
     if (m === 'sweep') hip = L.standHip - 36 * Math.sin(Math.PI * p);
-    if (!this.onGround) hip = L.standHip - 6;
+    if (!this.onGround) hip = L.standHip - 15;
 
     /* Going down: the torso rotates flat AND the pelvis drops to the floor.
      * Both, or it reads as a bow. */
@@ -376,13 +428,20 @@ var FX = FX || {};
     var br = Math.sin(this.breath), br2 = Math.sin(this.breath * 2);
     // guard stance: lead hand up and forward, rear hand by the chin
     var brA = Math.sin(this.breath + 0.6);
-    var g = [[8 + br * 2.6, 7 + br2 * 2.2], [17 + brA * 3.0, 11 + br2 * 2.4]];
+    /* Guard. The lead fist used to sit at head height and only 17 forward,
+     * which put it squarely on the character's own jaw -- twenty-five head
+     * primitives rendered and then covered by a skin-coloured ball. The
+     * hands now sit at sternum height and well in front of the face. */
+    var g = [[9 + br * 2.2, 1 + br2 * 1.8], [21 + brA * 2.6, 6 + br2 * 2.0]];
 
-    if (m === 'block') { g = [[14, 17], [7, 19]]; }
+    // Block: both forearms stacked vertically in front of the chest and
+    // face. The old target swung the elbow up and behind, so the arm arced
+    // over the crown and the pose read as a stretch, not a guard.
+    if (m === 'block') { g = [[17, 11], [13, 5]]; }
     else if (m === 'blockLow') { g = [[9, -2], [13, 1]]; }
     else if (m === 'crouch') { g = [[6, -4], [12, -1]]; }
     else if (m === 'walk') { g = [[7 + Math.sin(this.phase * TAU) * 3, 1], [16, 5]]; }
-    else if (m === 'jump') { g = [[-4, 2], [13, 15]]; }
+    else if (m === 'jump') { g = [[-2, 6], [11, 13]]; }
     else if (m === 'hitHigh' || m === 'hitHeavy') {
       var k = Math.sin(Math.PI * p);
       g = [[7 - 9 * k, 1 + 10 * k], [14 - 12 * k, 5 + 12 * k]];
@@ -445,10 +504,13 @@ var FX = FX || {};
       this.kick.on = 1; this.kick.leg = 1;
       this.kick.x.w = this.kick.y.w = (p < 0.58 ? 110 : 40);
       this.kick.x.t = kx; this.kick.y.t = ky;
+      this.kickB.t = 1;
     } else {
       this.kick.on = 0;
       this.kick.x.t = 4; this.kick.y.t = -34;
+      this.kickB.t = 0;
     }
+    this.kickB.step(dt);
 
     var gy = this.groundY;
 
@@ -496,7 +558,9 @@ var FX = FX || {};
      * The stance drifts with the weight shift so he is never truly still. */
     var lead = this.facing, back = -this.facing;
     var shift = this.hipShift.v;
-    var stanceW = 15 + 7 * this.crouchS.v;
+    // a crouch is compact: lower AND narrower. Widening it made the
+    // silhouette bigger than standing, which is the opposite of the read.
+    var stanceW = 15 - 3.5 * this.crouchS.v;
     var want = [this.x + back * stanceW * 0.85 - shift, this.x + lead * stanceW + shift * 0.6];
     if (this.kick.on) {
       // planted foot takes all the weight and slides under the body
@@ -548,6 +612,28 @@ var FX = FX || {};
       h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.22;
       h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.22;
     }
+    /* Hem: each point hangs from the belt on a fixed-length link, damped
+     * hard so it drapes rather than flaps. `HEM_LEN` is measured from the
+     * belt, so the hem sits around mid-thigh. */
+    var hemAx = pp.hip[0], hemAy = pp.hip[1] + 2;
+    for (var q = 0; q < 2; q++) {
+      var e2 = this.hem[q];
+      var side = q === 0 ? this.facing : -this.facing;   // 0 = front, 1 = back
+      e2.vy += 1500 * dt;
+      // a little outward bias so the panels part around the legs
+      e2.vx += side * 90 * dt;
+      e2.vx *= 0.90; e2.vy *= 0.90;
+      e2.x += e2.vx * dt; e2.y += e2.vy * dt;
+      var hx2 = e2.x - hemAx, hy2 = e2.y - hemAy;
+      var hd = Math.sqrt(hx2 * hx2 + hy2 * hy2) || 0.0001;
+      var hk = (hd - 19) / hd;
+      e2.x -= hx2 * hk; e2.y -= hy2 * hk;
+      e2.vx += (-hx2 * hk) / Math.max(dt, 0.0001) * 0.30;
+      e2.vy += (-hy2 * hk) / Math.max(dt, 0.0001) * 0.30;
+      // never let a panel swing above the belt
+      if (e2.y < hemAy + 8) { e2.y = hemAy + 8; if (e2.vy < 0) e2.vy = 0; }
+    }
+
     var bx = this.x - this.facing * 3, by = hipY + 3;
     for (var j = 0; j < this.belt.length; j++) {
       var b = this.belt[j];
@@ -611,23 +697,38 @@ var FX = FX || {};
     for (var j = 0; j < 2; j++) {
       var hxp = hipX + (j ? 1 : -1) * fw * L.hipD * 0.40;
       var ax, ay, angle;
-      if (this.kick.on && j === 1) {
-        ax = chest[0] + fw * this.kick.x.v;
-        ay = chest[1] - this.kick.y.v;
-        angle = this.def().low ? 8 : -4;
+      var wx0 = this.feet[j].wx, wy0 = this.feet[j].wy - 4;
+      if (j === 1 && this.kickB.v > 0.002) {
+        /* Blend between the world-planted foot and the kick target.
+         *
+         * The ankle used to switch between the two the instant a kick
+         * started, teleporting it up to 24 world units -- a fifth of body
+         * height -- in a single frame. kickB ramps, so the foot leaves the
+         * floor instead of cutting to the target. */
+        var kx2 = chest[0] + fw * this.kick.x.v;
+        var ky2 = chest[1] - this.kick.y.v;
+        var t2 = this.kickB.v;
+        ax = wx0 + (kx2 - wx0) * t2;
+        ay = wy0 + (ky2 - wy0) * t2;
+        angle = (this.def().low ? 8 : -4) * t2 + this.feet[j].angle * (1 - t2);
       } else {
-        ax = this.feet[j].wx; ay = this.feet[j].wy - 4;
+        ax = wx0; ay = wy0;
         angle = this.feet[j].angle;
       }
       var rdx = ax - hxp, rdy = ay - hipY;
       var rd = Math.sqrt(rdx * rdx + rdy * rdy), reach = L.uLeg + L.lLeg - 1;
       if (rd > reach) { ax = hxp + rdx / rd * reach; ay = hipY + rdy / rd * reach; }
       var knee = ik2(hxp, hipY, ax, ay, L.uLeg, L.lLeg, -fw);
+      // a knee cannot pass through the floor; in a deep crouch it used to,
+      // which is what made the pose read as kneeling rather than crouching
+      if (this.onGround && knee[1] > this.groundY - 9) knee[1] = this.groundY - 9;
       legs.push({ hip: [hxp, hipY], knee: knee, ankle: [ax, ay], angle: angle });
     }
 
     return {
       fw: fw, hip: [hipX, hipY], waist: waist, chest: chest, neck: neck,
+      // the renderer needs the twist to decide which shoulder is in front
+      twist: this.twist.v,
       headC: headC, headA: headA, leanA: leanA,
       shoulders: shoulders, arms: arms, hands: hands, legs: legs
     };

@@ -32,7 +32,9 @@ var FX = FX || {};
     var sk = o.skin;
     var dark = shade(sk, 0.70), deep = shade(sk, 0.52);
     var lit = shade(sk, 1.10);
-    var lip = [Math.min(255, sk[0] * 0.92), sk[1] * 0.70, sk[2] * 0.68];
+    // barely shifted from skin. At a strong chroma shift this read as
+    // lipstick on both fighters and muddled the character read entirely.
+    var lip = [Math.min(255, sk[0] * 0.95), sk[1] * 0.83, sk[2] * 0.80];
     return {
       skin: F.mat(sk[0], sk[1], sk[2], 0.22, 30, 0.5, 1.0),
       // sockets, the underside of the jaw, the shadow beside the nose
@@ -53,6 +55,15 @@ var FX = FX || {};
       hairLit: F.mat(Math.min(255, o.hair[0] * 1.55 + 14), Math.min(255, o.hair[1] * 1.5 + 12),
         Math.min(255, o.hair[2] * 1.45 + 16), 0.14, 14, 0.7),
       metal: F.mat(210, 218, 232, 0.75, 60, 1.0),
+      /* Far-side copies of the garment and skin, pulled 22% toward the
+       * ambient. Dimming a far limb with ambient occlusion alone kept its
+       * chroma, so on a white gi the two legs fused into one shape from hip
+       * to ankle and the far arm vanished into the chest during every
+       * strike. Distance desaturates; it does not only darken. */
+      giFar: F.mat(o.gi[0] * 0.78 + 9, o.gi[1] * 0.78 + 10, o.gi[2] * 0.78 + 13, 0.02, 4, 0.30),
+      gi2Far: F.mat(o.gi2[0] * 0.78 + 9, o.gi2[1] * 0.78 + 10, o.gi2[2] * 0.78 + 13, 0.02, 4, 0.26),
+      skinFar: F.mat(sk[0] * 0.78 + 9, sk[1] * 0.78 + 10, sk[2] * 0.78 + 13, 0.16, 26, 0.40, 0.9),
+      trimFar: F.mat(o.trim[0] * 0.78 + 9, o.trim[1] * 0.78 + 10, o.trim[2] * 0.78 + 13, 0.12, 18, 0.40),
       name: o.name, tint: o.tint || [255, 210, 120],
       hairStyle: o.hairStyle,
       // per-character face proportions, so the two heads are not one head
@@ -69,7 +80,7 @@ var FX = FX || {};
       name: 'KAI',
       skin: [232, 176, 138], gi: [206, 202, 196], gi2: [158, 154, 152],
       trim: [206, 46, 62], hair: [34, 30, 40], tint: [255, 220, 150],
-      hairStyle: { n: 3, seg: 3.0, r0: 3.2, taper: 0.72, back: 0.62, up: 3.2, grav: 520 },
+      hairStyle: { n: 3, seg: 2.6, r0: 3.3, taper: 0.86, back: 0.62, up: 3.2, grav: 520 },
       brow: 1.15, jaw: 1.10, nose: 1.0
     }),
     /* RYO: blue gi, gold belt, a long braid that swings. Narrower jaw and a
@@ -78,7 +89,7 @@ var FX = FX || {};
       name: 'RYO',
       skin: [206, 150, 112], gi: [58, 92, 168], gi2: [40, 66, 124],
       trim: [242, 196, 72], hair: [58, 40, 30], tint: [150, 200, 255],
-      hairStyle: { n: 4, seg: 4.2, r0: 2.9, taper: 0.5, back: 0.86, up: 0.4, grav: 700 },
+      hairStyle: { n: 4, seg: 3.2, r0: 3.4, taper: 0.84, back: 0.86, up: 0.4, grav: 700 },
       brow: 0.86, jaw: 0.92, nose: 1.12
     })
   };
@@ -110,8 +121,20 @@ var FX = FX || {};
     S = S || 1; ox = ox || 0; oy = oy || 0;
     var lift = Math.max(0, groundY - f.y);
     var k = Math.max(0.34, 1 - lift / 150);
-    surf.shadowEllipse((f.x + 4) * S + ox, (groundY + 2) * S + oy, 34 * k * S, 9 * k * S, 0.44 * k);
-    surf.shadowEllipse((f.x + 4) * S + ox, (groundY + 2) * S + oy, 15 * k * S, 4.2 * k * S, 0.58 * k);
+    var gy = (groundY + 2) * S + oy;
+    /* One pool under the hips, and a tighter one under each foot weighted by
+     * how close that foot is to the floor. Pinning the whole shadow to f.x
+     * meant a sweep or a low kick put the extended leg over bare ground and
+     * the fighter read as floating. */
+    var p = f.pose();
+    surf.shadowEllipse((p.hip[0] + 2) * S + ox, gy, 30 * k * S, 8 * k * S, 0.38 * k);
+    for (var i = 0; i < 2; i++) {
+      var a = p.legs[i].ankle;
+      var near = Math.max(0, 1 - Math.max(0, groundY - a[1]) / 46);
+      if (near <= 0.02) continue;
+      surf.shadowEllipse(a[0] * S + ox, gy, (7 + 6 * near) * k * S,
+        (2.6 + 1.6 * near) * k * S, 0.50 * k * near);
+    }
   };
 
   F.drawShadow = function (surf, f, groundY, S) {
@@ -141,49 +164,145 @@ var FX = FX || {};
     sh.addOcc(p.shoulders[1][0], p.shoulders[1][1], L.shoulderR * 1.4, Z.torso - 2, 0.45);
     sh.addOcc(p.arms[1].wrist[0], p.arms[1].wrist[1], 9, Z.nearArm, 0.4);
 
-    var far = 0, near = 1;                    // arm/leg indices
-    drawLeg(sh, p.legs[far], sk, Z.farLeg, 0.72, fw);
-    drawArm(sh, p.arms[far], sk, Z.farArm, 0.74, fw);
+    /* Which shoulder is toward the viewer follows the twist. It used to be
+     * hardcoded as arm 1, while the twist swings forty degrees during every
+     * strike -- so on a hook or a roundhouse the arm that should have come
+     * forward was drawn twenty-seven depth units *behind* the torso and
+     * disappeared into it. The near and far depths interpolate rather than
+     * snapping, or the arms would pop mid-swing. */
+    var tw = Math.sin((p.twist || 0) * Math.PI / 180);
+    var swap = 0.5 + 0.5 * Math.max(-1, Math.min(1, tw * 2.2));   // 0..1
+    var zArm1 = Z.nearArm + (Z.farArm - Z.nearArm) * swap;
+    var zArm0 = Z.farArm + (Z.nearArm - Z.farArm) * swap;
+    var far = swap > 0.5 ? 1 : 0, near = 1 - far;
+    var zFarArm = far ? zArm1 : zArm0, zNearArm = far ? zArm0 : zArm1;
+
+    // the far limbs cast into the near ones as well as receiving
+    sh.addOcc(p.arms[near].elbow[0], p.arms[near].elbow[1], 11, Z.torso - 4, 0.45);
+    sh.addOcc(p.legs[1].knee[0], p.legs[1].knee[1], 13, Z.torso, 0.40);
+
+    drawHem(sh, p, f, sk, fw, 1);             // the panel behind both legs
+    drawLeg(sh, sk, p.legs[0], 1, Z.farLeg, 0.66, fw);
+    drawArm(sh, sk, p.arms[far], 1, zFarArm, 0.68, fw);
 
     drawTorso(sh, p, f, sk, fw);
     drawHead(sh, p, f, sk, fw);
 
-    drawLeg(sh, p.legs[near], sk, Z.nearLeg, 1.0, fw);
-    drawArm(sh, p.arms[near], sk, Z.nearArm, 1.0, fw);
+    drawLeg(sh, sk, p.legs[1], 0, Z.nearLeg, 1.0, fw);
+    drawHem(sh, p, f, sk, fw, 0);             // and the panel in front of them
+    drawArm(sh, sk, p.arms[near], 0, zNearArm, 1.0, fw);
     sh.ghost = 0;
   };
 
-  function drawLeg(sh, lg, sk, z, ao, fw) {
-    // bare lower leg, gi trouser over the thigh and knee
-    var mid = lerp(lg.knee, lg.ankle, 0.44);
-    sh.capsule(lg.hip[0], lg.hip[1], lg.knee[0], lg.knee[1], 8.2, 6.3, z, sk.gi, ao);
-    sh.capsule(lg.knee[0], lg.knee[1], mid[0], mid[1], 6.4, 5.4, z, sk.gi, ao);
-    // shin starts inside the trouser cuff so there is no ring at the seam
-    sh.capsule(mid[0], mid[1], lg.ankle[0], lg.ankle[1], 5.0, 3.2, z + 0.6, sk.skin, ao);
-    // foot
-    var a = (lg.angle || 0) * Math.PI / 180;
-    var fx = Math.cos(a) * fw, fy = Math.sin(a);
-    sh.capsule(lg.ankle[0], lg.ankle[1] + 1, lg.ankle[0] + fx * L.foot * 0.8,
-      lg.ankle[1] + 1 + fy * L.foot * 0.8, 4.2, 3.0, z - 2, sk.skin, ao);
-    // ankle wrap
-    sh.sphere(lg.ankle[0], lg.ankle[1], 3.6, z - 1, sk.trim, ao);
+  /* A gi panel hanging off the belt.
+   *
+   * Drawn as a flat slab rather than a tube, because cloth has a face and an
+   * edge and a capsule has neither. The quad is built from the belt down to
+   * the simulated hem point, splayed at the bottom, so the panel widens as
+   * it falls and flares when the body moves under it. */
+  function drawHem(sh, p, f, sk, fw, back) {
+    var e = f.hem[back ? 1 : 0];
+    var dir = back ? -fw : fw;
+    var b = lerp(p.hip, p.waist, 0.30);
+    var la = p.leanA * Math.PI / 180;
+    // across the body at the belt
+    var ax2 = Math.cos(la + Math.PI / 2), ay2 = Math.sin(la + Math.PI / 2);
+    var t0 = [b[0] - ax2 * L.hipD * 0.30 + dir * 1.0, b[1] - ay2 * L.hipD * 0.30];
+    var t1 = [b[0] + ax2 * L.hipD * 0.30 + dir * L.hipD * 1.05,
+      b[1] + ay2 * L.hipD * 0.30];
+    // hem edge, splayed toward the direction of travel
+    var hxv = e.x - b[0], hyv = e.y - b[1];
+    var hl = Math.sqrt(hxv * hxv + hyv * hyv) || 1;
+    var pxv = -hyv / hl, pyv = hxv / hl;              // across the panel
+    var wsp = 4.8;
+    var h0 = [e.x - pxv * wsp - dir * 0.6, e.y - pyv * wsp];
+    var h1 = [e.x + pxv * wsp + dir * 2.6, e.y + pyv * wsp];
+    var z = back ? Z.farLeg + 5 : Z.nearLeg - 3.4;
+    var quad = dir > 0 ? [t0, t1, h1, h0] : [t1, t0, h0, h1];
+    sh.polySlab(quad, z, back ? sk.gi2 : sk.gi, 2.6, back ? 0.72 : 0.96);
+    /* A weighted edge along the hem. A bevelled slab alone reads as a flat
+     * shape cut out of card; the thing that says "cloth" is a defined,
+     * slightly darker border where the fabric turns over. */
+    sh.capsule(h0[0], h0[1], h1[0], h1[1], 1.5, 1.7, z - 0.9,
+      back ? sk.gi2 : sk.gi2, back ? 0.7 : 0.94);
   }
 
-  function drawArm(sh, a, sk, z, ao, fw) {
+  /* Pick the near or far material set. */
+  function matsOf(sk, far) {
+    return far
+      ? { gi: sk.giFar, gi2: sk.gi2Far, skin: sk.skinFar, trim: sk.trimFar,
+          skinLit: sk.skinFar, skinDark: sk.skinFar }
+      : sk;
+  }
+
+  function drawLeg(sh, sk0, lg, far, z, ao, fw) {
+    var sk = matsOf(sk0, far);
+    /* Segment radii are continuous across every joint now, and consecutive
+     * segments overlap rather than butt together. Restarting a segment at a
+     * different radius, one depth step in front of the last, left a hard
+     * crescent of light at every knee and elbow. */
+    var mid = lerp(lg.knee, lg.ankle, 0.46);
+    sh.capsule(lg.hip[0], lg.hip[1], lg.knee[0], lg.knee[1], 8.2, 6.4, z, sk.gi, ao);
+    sh.capsule(lg.knee[0], lg.knee[1], mid[0], mid[1], 6.4, 5.2, z, sk.gi, ao);
+    // shin starts back inside the trouser cuff, at the cuff's own radius
+    var cuff = lerp(lg.knee, lg.ankle, 0.34);
+    sh.capsule(cuff[0], cuff[1], lg.ankle[0], lg.ankle[1], 5.2, 3.2, z, sk.skin, ao);
+    /* Foot. A single capsule off the ankle gave every character a rounded
+     * stump, and a stump has no direction -- you cannot tell a planted foot
+     * from a pointed one, which is most of what sells a kick. This is a
+     * heel, an arch and a ball with toes, built along the foot's own axis. */
+    var a = (lg.angle || 0) * Math.PI / 180;
+    var fx = Math.cos(a) * fw, fy = Math.sin(a);        // toe direction
+    var ux = -fy, uy = fx;                             // up off the sole
+    var ank = [lg.ankle[0], lg.ankle[1] + 0.6];
+    function ft(along, up) {
+      return [ank[0] + fx * along + ux * up * fw, ank[1] + fy * along + uy * up * fw];
+    }
+    var heel = ft(-3.6, 0.2), ball = ft(L.foot * 0.60, -0.4), toe = ft(L.foot * 0.86, -0.6);
+    // heel, then the sole tapering forward
+    sh.capsule(heel[0], heel[1], ball[0], ball[1], 3.9, 3.2, z - 2, sk.skin, ao);
+    sh.capsule(ball[0], ball[1], toe[0], toe[1], 3.1, 2.2, z - 2.4, sk.skin, ao);
+    // the instep: a raised wedge from the ankle down to the ball, which is
+    // what gives the foot a top rather than a flat side
+    var inst = ft(L.foot * 0.30, 2.0);
+    sh.capsule(ank[0], ank[1] - 1.6, inst[0], inst[1], 3.4, 2.6, z - 1.4, sk.skin, ao);
+    // ankle wrap
+    sh.sphere(lg.ankle[0], lg.ankle[1], 3.5, z - 1, sk.trim, ao);
+  }
+
+  function drawArm(sh, sk0, a, far, z, ao, fw) {
+    var sk = matsOf(sk0, far);
     // deltoid: a cap angled down the upper arm, not a ball stuck on the
-    // chest. The ball read unmistakably as a breast on both fighters.
-    var delt = lerp(a.sh, a.elbow, 0.30);
-    sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 7.0, 5.2, z + 1, sk.gi, ao);
+    // chest. The ball read unmistakably as a breast on both fighters, and
+    // at a 7.0 front radius the capsule was still doing it.
+    var delt = lerp(a.sh, a.elbow, 0.42);
+    sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 5.8, 5.2, z + 1, sk.gi, ao);
     var sleeve = lerp(a.sh, a.elbow, 0.60);
-    sh.capsule(a.sh[0], a.sh[1], sleeve[0], sleeve[1], 6.4, 5.2, z, sk.gi, ao);
-    sh.capsule(sleeve[0], sleeve[1], a.elbow[0], a.elbow[1], 4.8, 4.2, z + 0.6, sk.skin, ao);
+    sh.capsule(a.sh[0], a.sh[1], sleeve[0], sleeve[1], 6.2, 5.0, z, sk.gi, ao);
+    // continuous radii through the sleeve cuff and the elbow
+    var cuf = lerp(a.sh, a.elbow, 0.50);
+    sh.capsule(cuf[0], cuf[1], a.elbow[0], a.elbow[1], 5.0, 4.2, z, sk.skin, ao);
     sh.capsule(a.elbow[0], a.elbow[1], a.wrist[0], a.wrist[1], 4.2, 3.5, z, sk.skin, ao);
-    // wrist wrap and fist
+    /* Wrist wrap and fist. A sphere on the end of the forearm is a ball,
+     * and a ball has no knuckles and no direction -- a jab and a block ended
+     * in exactly the same shape. A fist is a squarish block of knuckles
+     * across the punch direction, with a thumb laid along the near side. */
     var wa = ang(a.elbow, a.wrist);
-    sh.capsule(a.wrist[0] - Math.cos(wa) * 3, a.wrist[1] - Math.sin(wa) * 3,
-      a.wrist[0], a.wrist[1], 4.0, 4.2, z - 1, sk.trim, ao);
-    sh.ellipsoid(a.wrist[0] + Math.cos(wa) * 2.6, a.wrist[1] + Math.sin(wa) * 2.6,
-      4.8, 4.2, wa, z - 2, sk.skin, ao);
+    var cw = Math.cos(wa), sw = Math.sin(wa);
+    var px2 = -sw, py2 = cw;                            // across the forearm
+    sh.capsule(a.wrist[0] - cw * 3, a.wrist[1] - sw * 3,
+      a.wrist[0], a.wrist[1], 3.8, 4.0, z - 1, sk.trim, ao);
+    // the block of the closed hand: wider across than along
+    sh.ellipsoid(a.wrist[0] + cw * 2.4, a.wrist[1] + sw * 2.4,
+      3.9, 4.6, wa, z - 2, sk.skin, ao);
+    // knuckle row, standing proud of the front face
+    var kx = a.wrist[0] + cw * 4.3, ky = a.wrist[1] + sw * 4.3;
+    sh.capsule(kx - px2 * 3.0, ky - py2 * 3.0, kx + px2 * 3.0, ky + py2 * 3.0,
+      2.0, 1.7, z - 3.2, sk.skin, ao);
+    // thumb, folded across
+    sh.capsule(a.wrist[0] + cw * 1.4 + px2 * 2.6 * fw, a.wrist[1] + sw * 1.4 + py2 * 2.6 * fw,
+      a.wrist[0] + cw * 3.6 + px2 * 1.4 * fw, a.wrist[1] + sw * 3.6 + py2 * 1.4 * fw,
+      1.7, 1.4, z - 3.4, sk.skin, ao);
   }
 
   function drawTorso(sh, p, f, sk, fw) {
@@ -294,33 +413,50 @@ var FX = FX || {};
     fc(0.6, 1.4, 4.6, 0.2, 2.0, 1.4, FS - 0.45, sk.skinLit, 1);
 
     /* ---- brow, nose, mouth: the silhouette breakers ---- */
-    // brow ridge, lit on top, and the shadow it casts into the socket
-    fc(0.4, 3.4, 5.4, 2.9, 2.0 * BR, 1.5 * BR, FS - 0.65, sk.skinLit, 1);
-    fp(4.2, 1.5, 3.0, 1.7, HZ, FS - 0.50, sk.skinDark, 0.80);
+    /* Brow ridge, lit on top, and the shadow it drops into the socket.
+     * Both used to be about twice this size, and together with the lash and
+     * the fringe they stacked into one horizontal dark band -- the character
+     * read as wearing sunglasses, and that band, not the eye, was what the
+     * silhouette reported. */
+    fc(0.6, 3.2, 5.4, 2.75, 1.2 * BR, 0.9 * BR, FS - 0.65, sk.skinLit, 1);
+    fp(4.4, 1.4, 1.8, 1.0, HZ, FS - 0.50, sk.skinDark, 0.86);
 
-    // nose: bridge from between the brows out to a tip past the outline
-    fc(4.6, 3.0, R * 0.98 * NS, -0.5, 1.5, 1.9, FS - 0.95, sk.skinLit, 1);
-    fp(R * 1.02 * NS, -1.1, 2.0, 1.8, HZ, FS - 1.10, sk.skin, 1);
+    /* Nose: bridge from between the brows out to a tip that breaks the
+     * outline by about a tenth of the head radius. It used to overhang by
+     * forty percent, which with the heavy brow gave both fighters a
+     * Punch-and-Judy profile. */
+    fc(4.4, 2.9, R * 0.84 * NS, -0.5, 1.2, 1.35, FS - 0.95, sk.skinLit, 1);
+    fp(R * 0.88 * NS, -1.0, 1.35, 1.15, HZ, FS - 1.10, sk.skin, 1);
     // the wing of the nostril, and the shadow under it
-    fp(R * 0.70 * NS, -2.1, 1.05, 0.8, HZ, FS - 0.85, sk.skinDark, 0.92);
+    fp(R * 0.62 * NS, -1.9, 0.85, 0.62, HZ, FS - 0.85, sk.skinDark, 0.92);
 
-    // lips, and the crease between them
-    fp(R * 0.84, -3.4, 1.55, 0.85, HZ, FS - 0.80, sk.lip, 1);
-    fp(R * 0.78, -4.3, 1.6, 0.95, HZ, FS - 0.85, sk.lip, 1);
-    fc(R * 0.48, -3.82, R * 0.94, -3.94, 0.42, 0.34, FS - 1.05, sk.skinDeep, 0.9);
+    // the mouth is carried by the crease, not by colour: one soft form and
+    // one dark line, rather than two saturated ellipses
+    fp(R * 0.80, -3.7, 1.05, 0.55, HZ, FS - 0.80, sk.lip, 1);
+    fc(R * 0.46, -3.72, R * 0.92, -3.84, 0.38, 0.30, FS - 1.05, sk.skinDeep, 0.9);
 
     /* ---- eye ---- */
+    /* Eye. The sclera was rx 2.25 on a head of radius 7.4 -- thirty percent
+     * of the head's width, where a real eye in profile is nearer thirteen --
+     * and the iris sat further forward than the sclera's own centre, so the
+     * pupil hung off the front of the eyeball. Both are the loudest feature
+     * on the character, so both were loudly wrong. */
     var open = f.blinkT % f.blink > 0.13 ? 1 : 0.12;
-    var ey = 0.4;
-    fp(4.8, ey, 2.25, 1.65 * open, HZ, FS - 0.70, sk.sclera, 1);
-    fp(5.6, ey - 0.1, 1.15, 1.35 * open, HZ, FS - 0.90, sk.iris, 1);
+    var ey = 0.5;
+    fp(4.7, ey, 1.7, 1.25 * open, HZ, FS - 0.70, sk.sclera, 1);
+    fp(5.25, ey - 0.05, 0.86, 1.02 * open, HZ, FS - 0.90, sk.iris, 1);
     // catchlight -- one bright cluster is what makes an eye look alive
-    if (open > 0.5) fp(5.95, ey + 0.62, 0.5, 0.44, HZ, FS - 1.30, sk.sclera, 1.4);
-    // upper lid and lash line, which also give the eye an expression
-    fc(2.8, ey + 1.9, 6.5, ey + 1.35, 1.0, 0.78, FS - 0.80, sk.skin, 0.92);
-    fc(3.2, ey + 1.35, 6.5, ey + 0.9, 0.38, 0.30, FS - 1.05, sk.hair, 1);
-    // eyebrow
-    fc(2.0, ey + 3.3, 6.1, ey + 2.6, 0.78 * BR, 0.46 * BR, FS - 1.00, sk.hair, 1);
+    if (open > 0.5) fp(5.45, ey + 0.46, 0.36, 0.32, HZ, FS - 1.30, sk.sclera, 1.4);
+    // upper and lower lids: in near profile the visible eye is a wedge, and
+    // the lids are what cut that wedge out of the socket. They sit clear of
+    // the sclera's own extent -- overlapping it ate most of the eye.
+    fc(3.1, ey + 1.75, 6.1, ey + 1.30, 0.72, 0.56, FS - 0.80, sk.skin, 0.92);
+    fc(3.5, ey - 1.60, 6.0, ey - 1.25, 0.62, 0.48, FS - 0.80, sk.skin, 0.90);
+    fc(3.4, ey + 1.22, 6.1, ey + 0.90, 0.26, 0.21, FS - 1.05, sk.hair, 1);
+    /* Eyebrow. Kept close to the skin: pushed proud of the face it stopped
+     * reading as hair on a brow and started reading as a black bar floating
+     * in front of the forehead. */
+    fc(2.3, ey + 3.0, 6.0, ey + 2.35, 0.66 * BR, 0.40 * BR, FS - 0.72, sk.hair, 0.92);
 
     /* ---- ear ---- */
     fp(-3.4, -0.6, 1.7, 2.5, HZ - 0.2 * fw, FS - 0.60, sk.skin, 0.94);
@@ -332,7 +468,7 @@ var FX = FX || {};
     fp(-2.9, 3.0, R * 0.82, RY * 0.78, HZ, FS - 0.20, sk.hair, 1);
     fp(-4.8, -1.0, R * 0.50, RY * 0.62, HZ, FS - 0.05, sk.hair, 0.94);
     // fringe over the forehead, swept back off the brow
-    fp(1.9, RY * 0.72, 4.6, 2.5, HZ + 0.26 * fw, FS - 0.55, sk.hair, 1);
+    fp(1.9, RY * 0.72 + 1.2, 4.6, 2.5, HZ + 0.26 * fw, FS - 0.55, sk.hair, 1);
     // a lit strand across the crown, so the mass is not one flat silhouette
     fc(-5.0, RY * 0.72, 2.2, RY * 0.90, 1.15, 0.85, FS - 0.75, sk.hairLit, 1);
     // sideburn, in front of the ear
@@ -342,6 +478,8 @@ var FX = FX || {};
      * RYO's braid are the same four lines of code and different silhouettes. */
     var st = f.hairStyle, hr = st.r0;
     var prev = at(-R * st.back, st.up);
+    sh.ellipsoid(prev[0], prev[1], hr * 0.8, hr * 0.62, ha, FS + 0.1 + hr * 0.7,
+      sk.trim, 0.92);
     for (var i = 0; i < f.hair.length; i++) {
       var h = f.hair[i];
       var ra = hr * Math.pow(st.taper, i), rb2 = hr * Math.pow(st.taper, i + 1);

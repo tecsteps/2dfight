@@ -22,7 +22,15 @@ var FX = FX || {};
    * two thirds -- the proportion a fighting game actually uses. Nothing
    * about the characters changed, only how much room they are given. */
   var W = 444, H = 250;               // world units
-  var SCALE = 3.24;                   // device pixels per world unit
+  /* Device pixels per world unit. Not a constant: the renderer is entirely
+   * on the CPU, so the honest ceiling is whatever the machine can hold at 60
+   * frames, and that is a phone-to-desktop range of maybe six to one. The
+   * match measures its own frame cost and walks this ladder, so a desktop
+   * gets the full 1439x810 and a slow device stays playable instead of
+   * running at 20fps in the name of a fixed number. */
+  var SCALE_LADDER = [4.05, 3.24, 2.6, 2.05, 1.6];
+  var SCALE_START = 1;                // 3.24 -> 1439x810; step up if it holds
+  var SCALE = SCALE_LADDER[SCALE_START];
   var GROUND = 216;
   var WALL_TOP = 118;                 // top of the temple wall, in world units
   var WALL_L = 30, WALL_R = W - 30;
@@ -71,16 +79,22 @@ var FX = FX || {};
     bg.addDisc(sunX, sunY, 15 * S, 255, 232, 196, 0.85);
 
     /* ---- distant ranges, hazing toward the sky as they recede ---- */
-    for (i = 0; i < 3; i++) {
+    /* Far to near, so a near range paints over a far one. Painted the other
+     * way round the dark near range punched up through the pale far one as a
+     * hard-edged wedge. The profile sums incommensurate sines rather than
+     * using |sin|, which has a cusp at every zero crossing -- that cusp was
+     * giving every hill the same symmetric hump and a sharp notch between. */
+    for (i = 2; i >= 0; i--) {
       var baseY = (WALL_TOP - 2 - i * 11) * S;
       var amp = (30 - i * 8) * S;
-      // nearer ranges are darker; the far one is nearly sky
-      var k = i / 2;
+      var k = i / 2;                       // 1 = farthest, hazed toward sky
       var col = F.rgb(44 + k * 74, 36 + k * 54, 62 + k * 40);
       for (x = 0; x < w; x++) {
-        var t = x / w;
-        var yy = baseY - Math.abs(Math.sin(t * (5 + i * 3) + i * 2.1)) * amp
-          - Math.sin(t * (17 + i * 7)) * amp * 0.22;
+        var t = x / w * 6.2831853;
+        var yy = baseY - amp * (
+          0.52 + 0.30 * Math.sin(t * (0.7 + i * 0.4) + i * 2.1)
+          + 0.14 * Math.sin(t * (1.9 + i * 0.6) + i * 1.3)
+          + 0.07 * Math.sin(t * (4.3 + i) + i * 4.7));
         bg.fillRect(x, yy, 1, baseY - yy + 8 * S, col);
       }
     }
@@ -96,8 +110,11 @@ var FX = FX || {};
       bg.fillRect(bx, by, bw2, 1.4 * S, F.rgb(84, 62, 62));          // lit lintel
       bg.fillRect(bx, by + bh2 - 1.4 * S, bw2, 1.4 * S, F.rgb(12, 8, 12));
       // a lit window deep in the bay
-      bg.blendRect(bx + 15 * S, by + 12 * S, 14 * S, 20 * S, 226, 146, 78, 0.30);
-      bg.addDisc(bx + 22 * S, by + 22 * S, 16 * S, 255, 156, 74, 0.13);
+      // the lit window varies bay to bay; identical windows in a perfect row
+      // are the strongest "this was generated, not designed" signal there is
+      var wa = 0.16 + hash(i, 37) * 0.28;
+      bg.blendRect(bx + 15 * S, by + (10 + hash(i, 41) * 5) * S, 14 * S, 20 * S, 226, 146, 78, wa);
+      bg.addDisc(bx + 22 * S, by + 22 * S, 16 * S, 255, 156, 74, wa * 0.45);
     }
     // pillars
     for (i = 0; i * BAY + 2 < W + BAY; i++) {
@@ -132,16 +149,38 @@ var FX = FX || {};
 
     /* ---- lanterns ---- */
     for (i = 0; i < LANTERNS.length; i++) {
-      var lx = LANTERNS[i] * S, ly = (WALL_TOP + 26) * S;
+      if (hash(i, 29) < 0.17) continue;          // a gap in the row
+      var lx = LANTERNS[i] * S, ly = (WALL_TOP + 22 + hash(i, 3) * 10) * S;
+      var lb = 0.80 + hash(i, 17) * 0.20;        // and they are not all as bright
       bg.fillRect(lx - 0.5 * S, wallTop + 3 * S, 1 * S, ly - wallTop - 3 * S, F.rgb(30, 22, 26));
       // paper body, lit from inside
-      bg.blendRect(lx - 4 * S, ly, 8 * S, 11 * S, 236, 154, 84, 0.95);
-      bg.blendRect(lx - 4 * S, ly, 8 * S, 2 * S, 255, 206, 150, 0.9);
+      bg.blendRect(lx - 4 * S, ly, 8 * S, 11 * S, 236, 154, 84, 0.95 * lb);
+      bg.blendRect(lx - 4 * S, ly, 8 * S, 2 * S, 255, 206, 150, 0.9 * lb);
       bg.fillRect(lx - 4.6 * S, ly - 1.4 * S, 9.2 * S, 1.6 * S, F.rgb(46, 32, 30));
       bg.fillRect(lx - 4.6 * S, ly + 11 * S, 9.2 * S, 1.6 * S, F.rgb(46, 32, 30));
-      bg.addDisc(lx, ly + 5 * S, 26 * S, 255, 150, 66, 0.30);
-      bg.addDisc(lx, ly + 5 * S, 11 * S, 255, 200, 130, 0.42);
+      bg.addDisc(lx, ly + 5 * S, 26 * S, 255, 150, 66, 0.30 * lb);
+      bg.addDisc(lx, ly + 5 * S, 11 * S, 255, 200, 130, 0.42 * lb);
     }
+
+    /* Two hand-placed landmarks at non-multiples of the bay pitch. Without
+     * an anchor the eye slides across a repeating pattern and reads the
+     * whole wall as wallpaper. */
+    var gx0 = 96 * S, gy0 = (WALL_TOP + 30) * S;
+    bg.fillRect(gx0 - 22 * S, gy0 - 22 * S, 3 * S, 24 * S, F.rgb(64, 48, 44));
+    bg.fillRect(gx0 + 19 * S, gy0 - 22 * S, 3 * S, 24 * S, F.rgb(64, 48, 44));
+    bg.fillRect(gx0 - 24 * S, gy0 - 24 * S, 48 * S, 3 * S, F.rgb(78, 58, 52));
+    for (var gr = 0; gr < 5; gr++) {          // the gong, in beaten bronze
+      var rr2 = (17 - gr * 3.2) * S;
+      bg.blendDisc(gx0, gy0, rr2, 188 - gr * 12, 142 - gr * 6, 62 + gr * 8, 0.92);
+    }
+    bg.addDisc(gx0 - 4 * S, gy0 - 5 * S, 7 * S, 255, 216, 150, 0.10);
+
+    var bnx = 300 * S;                         // and a hanging banner
+    bg.blendRect(bnx - 9 * S, wallTop + 4 * S, 18 * S, 56 * S, 128, 34, 40, 0.94);
+    bg.blendRect(bnx - 9 * S, wallTop + 4 * S, 18 * S, 3 * S, 176, 58, 58, 0.94);
+    bg.blendRect(bnx - 2.5 * S, wallTop + 14 * S, 5 * S, 5 * S, 226, 196, 140, 0.9);
+    bg.blendRect(bnx - 2.5 * S, wallTop + 24 * S, 5 * S, 5 * S, 226, 196, 140, 0.9);
+    bg.blendRect(bnx - 2.5 * S, wallTop + 34 * S, 5 * S, 5 * S, 226, 196, 140, 0.9);
 
     /* ---- floor ---- */
     bg.gradientV(0, fy, w, h - fy, F.rgb(104, 80, 72), F.rgb(26, 20, 22));
@@ -193,21 +232,33 @@ var FX = FX || {};
 
   function Fx() { this.p = []; this.rings = []; this.shake = 0; this.hitstop = 0; this.flash = 0; }
 
-  Fx.prototype.spark = function (x, y, n, power, col) {
+  /* An impact sprays along the blow, not in all directions. Isotropic
+   * sparks made an uppercut and a hook produce the identical puff, and the
+   * eye reads direction long before it reads colour. `dir` is the attacker's
+   * facing; `up` biases the cone for rising or falling blows. */
+  Fx.prototype.spark = function (x, y, n, power, col, dir, up) {
+    dir = dir || 1; up = up || 0;
+    var base = Math.atan2(-up, dir);
     for (var i = 0; i < n; i++) {
-      var a = Math.random() * Math.PI * 2;
-      var sp = (30 + Math.random() * 190) * power;
-      this.p.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 40,
-        life: 0.18 + Math.random() * 0.34, t: 0, r: 1 + Math.random() * 2.4,
+      // a +/-55 degree cone, with a few long spikes at triple speed
+      var spike = i < 4;
+      var a = base + (Math.random() - 0.5) * (spike ? 0.5 : 1.92);
+      var sp = (40 + Math.random() * 170) * power * (spike ? 3.0 : 1);
+      this.p.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 30,
+        life: (spike ? 0.10 : 0.16) + Math.random() * 0.30, t: 0,
+        r: spike ? 1.1 : 1 + Math.random() * 2.4,
         c: col || [255, 226, 150], g: 380, add: 1 });
     }
+    // one short bright bloom at the contact point, so the hit has a centre
+    this.p.push({ x: x, y: y, vx: 0, vy: 0, life: 0.09, t: 0,
+      r: 7 + power * 7, c: col || [255, 226, 150], g: 0, add: 1, bloom: 1 });
   };
   Fx.prototype.dust = function (x, y, n, dir) {
     for (var i = 0; i < n; i++) {
       this.p.push({ x: x + (Math.random() - 0.5) * 12, y: y - Math.random() * 3,
         vx: (Math.random() - 0.3) * 55 * (dir || 1), vy: -18 - Math.random() * 42,
         life: 0.4 + Math.random() * 0.5, t: 0, r: 2 + Math.random() * 4.5,
-        c: [186, 160, 138], g: 60, add: 0 });
+        c: [210, 176, 142], g: 60, add: 0 });
     }
   };
   Fx.prototype.ring = function (x, y, power, col) {
@@ -228,7 +279,7 @@ var FX = FX || {};
       a = this.rings[i]; a.t += dt;
       if (a.t >= a.life) this.rings.splice(i, 1);
     }
-    if (this.shake > 0) this.shake = Math.max(0, this.shake - dt * 5.5);
+    if (this.shake > 0) this.shake = Math.max(0, this.shake - dt * 3.2);
     if (this.flash > 0) this.flash = Math.max(0, this.flash - dt * 6);
   };
 
@@ -241,12 +292,18 @@ var FX = FX || {};
       var al = (1 - u) * (1 - u) * 0.9;
       // a thin expanding shell, drawn additively
       var x0 = a.x * S + ox, y0 = a.y * S + oy;
-      var steps = Math.max(18, (rad * 0.9) | 0);
+      // a filled shell with real thickness, falling off on both sides
+      var th2 = Math.max(1.4, rad * 0.20);
+      var steps = Math.max(40, (rad * 3.2) | 0);
       for (var k = 0; k < steps; k++) {
         var th = k / steps * Math.PI * 2;
-        var px = x0 + Math.cos(th) * rad, py = y0 + Math.sin(th) * rad * 0.62;
-        surf.addPx(px | 0, py | 0, a.c[0], a.c[1], a.c[2], al);
-        surf.addPx((px + 1) | 0, py | 0, a.c[0], a.c[1], a.c[2], al * 0.6);
+        var cth = Math.cos(th), sth = Math.sin(th);
+        for (var q2 = -1; q2 <= 1; q2++) {
+          var rq = rad + q2 * th2 * 0.5;
+          var fq = al * (q2 === 0 ? 1 : 0.45);
+          surf.addPx((x0 + cth * rq) | 0, (y0 + sth * rq * 0.62) | 0,
+            a.c[0], a.c[1], a.c[2], fq);
+        }
       }
     }
     for (i = 0; i < this.p.length; i++) {
@@ -254,7 +311,8 @@ var FX = FX || {};
       var t = 1 - a.t / a.life;
       var r = a.r * (a.add ? t : 1 + (1 - t) * 1.4) * S;
       var px2 = a.x * S + ox, py2 = a.y * S + oy;
-      if (a.add) surf.addDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 1.5);
+      if (a.bloom) surf.addDisc(px2, py2, Math.max(1, a.r * S * (0.5 + t)), a.c[0], a.c[1], a.c[2], t * 1.9);
+      else if (a.add) surf.addDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 1.5);
       else surf.blendDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 0.34);
     }
   };
@@ -262,13 +320,15 @@ var FX = FX || {};
   /* ---- match ---------------------------------------------------------- */
 
   function Match(canvas) {
-    this.surf = new F.Surface(Math.round(W * SCALE), Math.round(H * SCALE));
-    this.surf.attach(canvas);
-    this.bg = new F.Surface(Math.round(W * SCALE), Math.round(H * SCALE));
-    paintStage(this.bg);
-
-    this.sh = new F.Shader(this.surf);
-    this.sh.S = SCALE;
+    this.canvas = canvas;
+    this.scaleIx = SCALE_START;
+    this.sh = new F.Shader(null);
+    this.buildSurfaces();
+    /* costHold starts high: the first couple of seconds are JIT warm-up and
+     * a cold stage repaint, and judging the machine on those frames dropped
+     * the resolution on hardware that could hold it comfortably. */
+    this.frameCost = 10; this.costN = 0; this.costHold = 180;
+    this.frontIx = 0;
     this.fx = new Fx();
 
     this.a = new F.Fighter(F.SKINS.kai, { name: 'KAI' });
@@ -321,19 +381,40 @@ var FX = FX || {};
     var p = at.progress();
     if (p < d.hit[0] || p > d.hit[1]) return;
 
+    // wake-up and backdash are invulnerable; the flags existed but nothing
+    // ever read them, so neither option escaped anything
+    if (df.def().inv) return;
+
+    /* Range comes from the limb, not from the move table.
+     *
+     * `reach * 0.92 + 26` over-reached the drawn limb by between 14 and 39
+     * world units depending on the move -- a roundhouse connected with the
+     * foot a clear body-width from the victim. HALF_W is the victim's own
+     * hurtbox half-width. */
+    var HALF_W = 15;
+    var tip = F.limbTip(at);
     var dx = (df.x - at.x) * at.facing;
-    var reachW = d.reach * 0.92 + 26;
-    if (dx < -12 || dx > reachW) return;
-    // height check: crouching ducks highs, jumping avoids lows
+    var tipR = (tip[0] - at.x) * at.facing;
+    if (dx < -14 || dx - HALF_W > tipR) return;
+
+    // vertical: the limb has to arrive somewhere on the body
     var lowMove = !!d.low;
+    var ty = tip[1];
+    if (ty < df.y - 152 || ty > df.y + 8) return;
+    // crouching ducks highs, and a low cannot catch an airborne fighter
     var dfCrouch = df.crouchS.v > 0.55;
     if (!lowMove && dfCrouch && !d.super) return;
     if (lowMove && !df.onGround) return;
 
     at.hitLanded = true;
 
-    var hx = at.x + at.facing * (dx * 0.6 + 14);
-    var hy = df.y - (lowMove ? 22 : 78);
+    /* Contact point: the limb tip, pulled back to the victim's near surface
+     * so it never floats past them. Sparks used to spawn from a formula that
+     * put them a dozen units in front of the foot and eighteen short of the
+     * body, touching neither fighter. */
+    var hx = tip[0], hy = tip[1];
+    var face = df.x - at.facing * HALF_W;
+    if ((hx - face) * at.facing > 0) hx = face;
 
     // blocking: correct guard height, facing the attacker
     var guarding = (df.move === 'block' || df.move === 'blockLow') &&
@@ -347,7 +428,12 @@ var FX = FX || {};
       at.vx -= at.facing * 22;
       df.flash = 0.5;
       df.lean.v -= 6; df.hand[1].x.v -= 5;
-      this.fx.spark(hx, hy, 9, 0.5, [180, 220, 255]);
+      /* Blockstun. There was none at all, so blocking anything was a free
+       * punish and there was no risk in throwing anything. The attacker eats
+       * the larger share on a heavy, which is what makes it punishable. */
+      df.stun = Math.max(df.stun, 0.06 + d.hs * 0.28);
+      at.stun = Math.max(at.stun, 0.10 + d.hs * 0.55);
+      this.fx.spark(hx, hy, 9, 0.5, [180, 220, 255], -at.facing, 0.3);
       this.fx.ring(hx, hy, 0.5, [170, 210, 255]);
       this.fx.shake = Math.max(this.fx.shake, d.hs * 0.4);
       this.fx.hitstop = Math.max(this.fx.hitstop, 0.075);
@@ -364,7 +450,7 @@ var FX = FX || {};
       df.flash = 0.85;
       at.start('throw');
       at.meter = Math.min(100, at.meter + td * 1.5);
-      this.fx.spark(hx, hy, 22, 0.9, [255, 210, 160]);
+      this.fx.spark(hx, hy, 22, 0.9, [255, 210, 160], at.facing, 0.4);
       this.fx.shake = Math.max(this.fx.shake, 0.3);
       this.fx.shakeDir = at.facing;
       if (this.onSound) this.onSound('grab');
@@ -374,20 +460,44 @@ var FX = FX || {};
     var dmg = d.dmg * (1 - Math.min(0.45, at.combo * 0.07));
     df.hp = Math.max(0, df.hp - dmg);
     df.flash = 1;
+
+    /* Deform the victim NOW, on the contact frame.
+     *
+     * `hitHigh` ramps its lean from zero, so with an 8-22 frame hitstop the
+     * freeze landed on a body that had barely started reacting -- the head
+     * was still moving 17 frames later, long after the impact had passed.
+     * The frozen frame has to be the reacting one. These are instant
+     * displacements of the pose springs, which then settle normally. */
+    var imp = Math.min(1.7, 0.45 + d.dmg / 13);
+    df.lean.v -= (lowMove ? -28 : 30) * imp;
+    df.headA.v -= 34 * imp;
+    df.hipH.v -= 7 * imp;
+    df.twist.v += at.facing * df.facing * 24 * imp;
+    df.hand[0].x.v -= 20 * imp; df.hand[1].x.v -= 26 * imp;
+    df.hand[0].y.v += 10 * imp; df.hand[1].y.v += 15 * imp;
+    // and the attacker recoils a little into the blow
+    at.lean.v += 5 * imp;
     df.stun = (d.super ? 0.7 : 0.26 + d.hs * 0.5) * (1 - Math.min(0.40, at.combo * 0.06));
     df.vx += at.facing * d.push;
     at.vx -= at.facing * d.push * 0.10;
     at.combo++;
     at.comboT = 0;
-    at.meter = Math.min(100, at.meter + (d.super ? -100 : dmg * 1.5));
+    // a super costs meter when it is thrown, not when it connects -- charged
+    // on hit only, a whiffed or blocked super was free and repeatable
+    if (!d.super) at.meter = Math.min(100, at.meter + dmg * 1.5);
 
     if (d.launch) {
-      /* Only launch from the floor, or from the top of an existing arc.
-       * Re-applying full launch velocity on every juggle hit walked the
-       * victim off the top of the screen. */
+      /* Juggle decay. Each successive hit while airborne lifts less, and
+       * after four the victim simply falls -- otherwise a launcher loops on
+       * itself indefinitely, and the measured combo ceiling was however long
+       * the attacker cared to keep going. */
+      df.juggle = (df.juggle || 0) + (df.onGround ? 0 : 1);
+      var lf = Math.pow(0.66, df.juggle);
+      if (df.juggle > 3) lf = 0;
       if (df.onGround) df.vy = -d.launch;
-      else df.vy = Math.max(df.vy - d.launch * 0.35, -d.launch * 0.8);
+      else if (lf > 0) df.vy = Math.max(df.vy - d.launch * 0.35 * lf, -d.launch * 0.8 * lf);
       df.onGround = false;
+      df.launched = 1;
       df.start('knockdown');
     } else if (d.trip) {
       df.start('knockdown');
@@ -396,13 +506,18 @@ var FX = FX || {};
     }
 
     this.fx.spark(hx, hy, d.super ? 70 : 28 + d.dmg * 2, d.super ? 2.4 : 0.8 + d.dmg / 20,
-      d.super ? [255, 190, 255] : [255, 228, 150]);
+      d.super ? [255, 190, 255] : [255, 228, 150],
+      at.facing, d.launch ? 0.85 : (lowMove ? -0.4 : 0.15));
     if (d.dmg >= 10) this.fx.dust(hx, GROUND, 7, at.facing);
     this.fx.flash = Math.max(this.fx.flash, d.super ? 0.8 : 0.22);
     this.fx.ring(hx, hy, d.super ? 2.2 : 0.6 + d.dmg / 20, d.super ? [255, 170, 255] : null);
     this.fx.shake = Math.max(this.fx.shake, d.hs);
     this.fx.shakeDir = at.facing;
-    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.36 : 0.09 + d.hs * 0.24);
+    /* Hitstop. At the old values the whole normal range spanned 7.7 to 10.6
+     * frames -- a jab and a roundhouse felt the same -- and 13.7% of the
+     * match was frozen. Lower base, steeper slope: lighter lights, heavier
+     * heavies, and about half the total freeze. */
+    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.30 : 0.035 + d.hs * 0.30);
     if (d.super) this.fx.flash = 0.8;
     if (this.onSound) this.onSound(d.super ? 'super' : (d.dmg >= 10 ? 'heavy' : 'hit'));
   };
@@ -429,7 +544,18 @@ var FX = FX || {};
     var fwd = f.facing > 0 ? c.r : c.l;
     var back = f.facing > 0 ? c.l : c.r;
 
-    if (!f.onGround) return;
+    /* Airborne. Attacks used to be gated out entirely up here, which meant
+     * no jump-in, no air-to-air and no cross-up. Two air normals plus a
+     * little drift restore the vertical axis. */
+    if (!f.onGround) {
+      if (f.launched || f.stun > 0) return;
+      if (c.p) { f.start('airPunch'); return; }
+      if (c.k) { f.start('airKick'); return; }
+      if (fwd) f.vx += f.facing * 9;
+      else if (back) f.vx -= f.facing * 9;
+      if (f.vx > 150) f.vx = 150; else if (f.vx < -150) f.vx = -150;
+      return;
+    }
 
     // double-tap dash
     var tapKey = fwd ? 'f' : (back ? 'b' : null);
@@ -448,9 +574,10 @@ var FX = FX || {};
       f.tapHeld = 1;
     } else f.tapHeld = 0;
 
-    if (c.s && f.meter >= 100) { f.start('special'); f.vx = f.facing * 40; return; }
+    if (c.s && f.meter >= 100) { f.meter = 0; f.start('special'); f.vx = f.facing * 40; return; }
     if (c.g) { f.start('grab'); return; }
-    if (c.p) { f.start(c.d ? 'uppercut' : (back ? 'hook' : 'jab')); return; }
+    // `cross` sat in the move table with no input path to it at all
+    if (c.p) { f.start(c.d ? 'uppercut' : (back ? 'hook' : (fwd ? 'cross' : 'jab'))); return; }
     if (c.k) { f.start(c.d ? 'sweep' : (back ? 'roundhouse' : (c.u ? 'highKick' : 'lowKick'))); return; }
     if (c.u) { f.start('jump'); f.vy = -600; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
       this.fx.dust(f.x, f.y, 7, 1); return; }
@@ -477,30 +604,60 @@ var FX = FX || {};
     }
     if (this.aiT[i] > 0) return this.aiHold[i] || c;
 
+    /* Whiff punish: if the opponent has committed and their active frames
+     * are past, step in and take the free hit. Without this the AI only ever
+     * reacted, never capitalised. */
+    var whiffed = fd.hit && foe.progress() > fd.hit[1] && !foe.moveDone && dist < 92;
+    if (whiffed && Math.random() < 0.72) {
+      c[toward] = 1; c.p = 1;
+      this.aiT[i] = 0.18; this.aiHold[i] = c; return c;
+    }
+
     if (f.meter >= 100 && dist < 90 && Math.random() < 0.5) { c.s = 1; this.aiT[i] = 0.9; this.aiHold[i] = c; return c; }
     if (dist > 108) { c[toward] = 1; this.aiT[i] = 0.12 + Math.random() * 0.2; this.aiHold[i] = c; return c; }
     if (dist > 74) {
-      if (Math.random() < 0.42) { c.k = 1; c.u = Math.random() < 0.4 ? 1 : 0; }
+      var rf = Math.random();
+      // at range: the long kicks, which need a direction held with the button
+      if (rf < 0.24) { c.k = 1; c[away] = 1; }            // roundhouse
+      else if (rf < 0.40) { c.k = 1; c.u = 1; }           // highKick
+      else if (rf < 0.50) { c.u = 1; c[toward] = 1; }     // jump in
       else c[toward] = 1;
       this.aiT[i] = 0.22 + Math.random() * 0.3;
+      this.aiHold[i] = c;
       return c;
     }
+    /* Up close. The old table combined a direction with a button in only one
+     * branch, so hook, roundhouse and sweep -- every move that needs both --
+     * were never once thrown across a whole match. */
     var r = Math.random();
-    if (r < 0.30) c.p = 1;
-    else if (r < 0.46) { c.p = 1; c.d = 1; }
-    else if (r < 0.60) c.k = 1;
-    else if (r < 0.68) c.g = 1;
-    else if (r < 0.78) { c.u = 1; c[toward] = 1; }
-    else if (r < 0.90) { c[away] = 1; }
+    if (r < 0.16) c.p = 1;                                 // jab
+    else if (r < 0.28) { c.p = 1; c[toward] = 1; }         // cross
+    else if (r < 0.40) { c.p = 1; c[away] = 1; }           // hook
+    else if (r < 0.50) { c.p = 1; c.d = 1; }               // uppercut
+    else if (r < 0.60) c.k = 1;                            // lowKick
+    else if (r < 0.68) { c.k = 1; c.d = 1; }               // sweep
+    else if (r < 0.74) { c.k = 1; c[away] = 1; }           // roundhouse
+    else if (r < 0.81) c.g = 1;                            // grab
+    else if (r < 0.88) { c.u = 1; c[toward] = 1; }
+    else if (r < 0.96) { c[away] = 1; }                    // block / back off
     else c.d = 1;
-    this.aiT[i] = 0.20 + Math.random() * 0.34;
+    this.aiT[i] = 0.18 + Math.random() * 0.30;
+    this.aiHold[i] = c;
     return c;
   };
 
   Match.prototype.step = function (dt) {
     this.tick = (this.tick || 0) + 1;
+    /* Nothing ages during hitstop except the freeze itself and the screen
+     * flash. The shake used to decay right through it, so a jab's 1.7 frames
+     * of shake were entirely consumed inside 7.7 frames of freeze and there
+     * was none left when the world started moving again. */
+    if (this.fx.hitstop > 0) {
+      this.fx.hitstop -= dt;
+      if (this.fx.flash > 0) this.fx.flash = Math.max(0, this.fx.flash - dt * 6);
+      return;
+    }
     this.fx.update(dt);
-    if (this.fx.hitstop > 0) { this.fx.hitstop -= dt; return; }
 
     if (this.bannerT > 0) this.bannerT -= dt;
     if (!this.over) {
@@ -528,8 +685,8 @@ var FX = FX || {};
       if (f.x > WALL_R) { f.x = WALL_R; f.vx = Math.min(0, f.vx); }
     });
     var gap = this.b.x - this.a.x;
-    if (Math.abs(gap) < 36) {
-      var push = (36 - Math.abs(gap)) * 0.5 * Math.sign(gap || 1);
+    if (Math.abs(gap) < 44) {
+      var push = (44 - Math.abs(gap)) * 0.5 * Math.sign(gap || 1);
       this.a.x -= push; this.b.x += push;
     }
 
@@ -555,6 +712,45 @@ var FX = FX || {};
     if (this.onSound) this.onSound('ko');
   };
 
+  /* (Re)build the surfaces at the current SCALE and repaint the stage. This
+   * costs a stage repaint -- one visible hitch -- so it only runs on a
+   * deliberate resolution change, never per frame. */
+  Match.prototype.buildSurfaces = function () {
+    SCALE = SCALE_LADDER[this.scaleIx];
+    F.WORLD.SCALE = SCALE;
+    var pw = Math.round(W * SCALE), ph = Math.round(H * SCALE);
+    this.surf = new F.Surface(pw, ph);
+    this.surf.attach(this.canvas);
+    this.bg = new F.Surface(pw, ph);
+    paintStage(this.bg);
+    this.sh.s = this.surf;
+    this.sh.S = SCALE;
+    // the page sizes the canvas element to the viewport; its backing store
+    // just changed, so it has to lay out again
+    if (typeof window !== 'undefined' && window.dispatchEvent) {
+      window.dispatchEvent(new Event('resize'));
+    }
+  };
+
+  /* Watch the cost of a frame and walk the resolution ladder. Hysteresis in
+   * both directions and a hold after each change, so a single slow frame --
+   * a GC pause, a tab regaining focus -- cannot start it oscillating. */
+  Match.prototype.adaptScale = function (ms) {
+    if (this.costHold > 0) { this.costHold--; this.frameCost = ms; return; }
+    this.frameCost += (ms - this.frameCost) * 0.05;
+    this.costN++;
+    if (this.costN < 120) return;
+    this.costN = 0;
+    /* The gap between the two thresholds has to be wider than the cost ratio
+     * between two rungs, or a step down lands somewhere that immediately
+     * asks to step back up. Adjacent rungs differ by about 1.55x in area. */
+    if (this.frameCost > 15.5 && this.scaleIx < SCALE_LADDER.length - 1) {
+      this.scaleIx++; this.buildSurfaces(); this.costHold = 180;
+    } else if (this.frameCost < 8.0 && this.scaleIx > 0) {
+      this.scaleIx--; this.buildSurfaces(); this.costHold = 180;
+    }
+  };
+
   Match.prototype.readInput = function () {
     var i = this.input;
     return { l: i.l, r: i.r, u: i.u, d: i.d, p: i.p, k: i.k, s: i.s, g: i.g };
@@ -576,7 +772,9 @@ var FX = FX || {};
      * white noise reads as a rattle, a sine reads as an impact. */
     var ox = 0, oy = 0;
     if (this.fx.shake > 0) {
-      var k = this.fx.shake * this.fx.shake * 16 * S;
+      /* Amplitude was 0.09%-0.9% of screen width where commercial fighters
+       * run 1-4%, and squaring it made the light hits vanish entirely. */
+      var k = this.fx.shake * 30 * S;
       this.shakeT = (this.shakeT || 0) + 1;
       ox = Math.sin(this.shakeT * 1.9) * k * (this.fx.shakeDir || 1);
       oy = Math.sin(this.shakeT * 2.7) * k * 0.45;
@@ -592,15 +790,62 @@ var FX = FX || {};
     var pan = ox - cx;
     this.sh.ox = pan; this.sh.oy = oy;
 
+    /* Super treatment. The move was flagged `super: 1` in the move table and
+     * nothing anywhere reacted to it, so the game's money shot rendered
+     * exactly like a cross. The stage drops away, the attacker keeps their
+     * light and gains a warm ground glow, and the whole thing is driven off
+     * the same progress value the strike envelope uses. */
+    var sup = null;
+    if (this.a.def().super && !this.a.moveDone) sup = this.a;
+    else if (this.b.def().super && !this.b.moveDone) sup = this.b;
+    if (sup) {
+      var sp2 = sup.progress();
+      // full darkness through the startup, releasing over the recovery
+      var k2 = sp2 < 0.52 ? Math.min(1, sp2 / 0.18) : Math.max(0, 1 - (sp2 - 0.52) / 0.34);
+      surf.blendRect(0, 0, surf.w, surf.h, 6, 4, 16, 0.62 * k2);
+      // radial light thrown off the attacker
+      var gx2 = sup.x * S + pan, gy2 = (sup.y - 62) * S + oy;
+      var tc2 = sup.skin.tint;
+      surf.addDisc(gx2, gy2, 150 * S * (0.5 + sp2 * 0.9), tc2[0], tc2[1], tc2[2], 0.20 * k2);
+      surf.addDisc(gx2, gy2, 62 * S * (0.5 + sp2 * 0.9), tc2[0], tc2[1], tc2[2], 0.28 * k2);
+      // speed lines converging on the attacker during the windup
+      if (sp2 < 0.5) {
+        var n2 = 26;
+        for (var q3 = 0; q3 < n2; q3++) {
+          var th3 = q3 / n2 * Math.PI * 2 + sp2 * 3;
+          var r1 = (150 - sp2 * 190) * S, r2 = r1 + 52 * S;
+          surf.addStreak(gx2 + Math.cos(th3) * r1, gy2 + Math.sin(th3) * r1 * 0.8,
+            gx2 + Math.cos(th3) * r2, gy2 + Math.sin(th3) * r2 * 0.8,
+            1.2 * S, tc2[0], tc2[1], tc2[2], 0.30 * k2);
+        }
+      }
+    }
+
     F.drawShadowAt(surf, this.a, GROUND, S, pan, oy);
     F.drawShadowAt(surf, this.b, GROUND, S, pan, oy);
 
-    // far fighter first
-    var order = this.a.y <= this.b.y ? [this.a, this.b] : [this.b, this.a];
+    /* One depth pass covering both fighters.
+     *
+     * They used to get a `begin()` each, and `begin()` clears the depth
+     * buffer over its box -- so whichever fighter was drawn second won every
+     * overlapping pixel outright. Limbs passed straight through torsos on
+     * every throw, juggle and trade. With a single cleared region and a
+     * whole-body depth bias per fighter, occlusion falls out of the depth
+     * buffer that was already there. */
+    var ba = F.fighterBounds(this.a), bb = F.fighterBounds(this.b);
+    this.sh.begin(Math.min(ba.x0, bb.x0), Math.min(ba.y0, bb.y0),
+      Math.max(ba.x1, bb.x1), Math.max(ba.y1, bb.y1));
+
+    // whoever is committed to a move comes forward, and stays there until
+    // the other one commits -- a rule that flips every frame would strobe
+    if (this.a.busy() && !this.b.busy()) this.frontIx = 0;
+    else if (this.b.busy() && !this.a.busy()) this.frontIx = 1;
+    var order = this.frontIx ? [this.a, this.b] : [this.b, this.a];
+
     for (var i = 0; i < 2; i++) {
       var f = order[i];
-      var b = F.fighterBounds(f);
-      this.sh.begin(b.x0, b.y0, b.x1, b.y1);
+      // 20 world units is comfortably more than the body's own depth range
+      this.sh.zBias = i === 0 ? 20 : -20;
       F.drawFighter(this.sh, f);
       // motion arc: the working limb's recent path, additively. Free from a
       // solved pose; a sprite sheet would need extra art for every frame.
@@ -610,14 +855,19 @@ var FX = FX || {};
        * screen brighter than anything else in frame. */
       var tc = f.skin.tint;
       for (var g = 0; g < f.trail.length; g++) {
-        var seg = f.trail[g], al = 0.012 + g * 0.009;
+        // taper with age: the newest sample is wide and bright, the oldest
+        // is a thread. A uniform streak reads as a rendering artifact.
+        var seg = f.trail[g], age = (g + 1) / f.trail.length;
+        var al = 0.05 + 0.22 * age * age;
+        var wd = (0.9 + 2.0 * age) * S;
         surf.addStreak(seg[0][0] * S + pan, seg[0][1] * S + oy,
-          seg[1][0] * S + pan, seg[1][1] * S + oy, 3.0 * S, tc[0], tc[1], tc[2], al * 0.5);
+          seg[1][0] * S + pan, seg[1][1] * S + oy, wd, tc[0], tc[1], tc[2], al * 0.55);
         surf.addStreak(seg[1][0] * S + pan, seg[1][1] * S + oy,
-          seg[2][0] * S + pan, seg[2][1] * S + oy, 2.4 * S, tc[0], tc[1], tc[2], al);
+          seg[2][0] * S + pan, seg[2][1] * S + oy, wd * 0.8, tc[0], tc[1], tc[2], al);
       }
     }
 
+    this.sh.zBias = 0;
     this.fx.draw(surf, pan, oy);
     this.sh.ox = 0; this.sh.oy = 0;
     if (this.fx.flash > 0) {
@@ -631,23 +881,78 @@ var FX = FX || {};
   /* `ghost` is the chip bar: the damage you just took, draining a beat
    * behind the real value. Its absence was the most conspicuous thing
    * missing from the frame. */
-  function bar(surf, x, y, w, h, frac, r, g, b, flip, ghost) {
-    surf.fillRect(x - 3, y - 3, w + 6, h + 6, F.rgb(14, 12, 18));
-    surf.fillRect(x - 1, y - 1, w + 2, h + 2, F.rgb(74, 66, 74));
-    surf.fillRect(x, y, w, h, F.rgb(38, 32, 40));
-    var gw, gx;
-    if (ghost !== undefined && ghost > frac) {
-      gw = Math.max(0, Math.min(1, ghost)) * w;
-      gx = flip ? x + w - gw : x;
-      surf.fillRect(gx, y, gw, h, F.rgb(238, 214, 120));
+  /* A health bar.
+   *
+   * Drawn row by row with a horizontal shear, because a parallelogram is
+   * most of what makes a bar read as "fighting game" rather than "progress
+   * indicator" -- and it costs one add per row. The fill carries a vertical
+   * gradient and a specular line at a third height, which is the other half
+   * of the read: a flat rectangle of colour looks like debug output no
+   * matter how well the rest of the frame is lit.
+   */
+  function shearRect(surf, x, y, w, h, sk, cb) {
+    for (var yy = 0; yy < h; yy++) {
+      var off = sk * (h - 1 - yy);
+      cb(x + off, y + yy, w, yy / (h - 1 || 1));
     }
-    var fw = Math.max(0, Math.min(1, frac)) * w;
-    var bx = flip ? x + w - fw : x;
-    surf.fillRect(bx, y, fw, h, F.rgb(r, g, b));
-    surf.fillRect(bx, y, fw, h * 0.30,
-      F.rgb(Math.min(255, r + 70), Math.min(255, g + 70), Math.min(255, b + 60)));
-    surf.fillRect(bx, y + h - Math.max(1, h * 0.16), fw, Math.max(1, h * 0.16),
-      F.rgb(r * 0.55, g * 0.55, b * 0.55));
+  }
+
+  function bar(surf, x, y, w, h, frac, r, g, b, flip, ghost) {
+    var sk = h * 0.34 / h;                       // shear per row, ~19 degrees
+    var skp = flip ? -0.34 : 0.34;
+    // frame: an outer dark plate, then an inner bevel
+    shearRect(surf, x - 3, y - 3, w + 6, h + 6, skp, function (bx, by, bw) {
+      surf.fillRect(bx, by, bw, 1, F.rgb(12, 10, 15));
+    });
+    shearRect(surf, x - 1, y - 1, w + 2, h + 2, skp, function (bx, by, bw, t) {
+      surf.fillRect(bx, by, bw, 1, F.rgb(96 - t * 40, 86 - t * 36, 92 - t * 38));
+    });
+    shearRect(surf, x, y, w, h, skp, function (bx, by, bw) {
+      surf.fillRect(bx, by, bw, 1, F.rgb(30, 25, 32));
+    });
+
+    function fillBar(fr, cr, cg, cb2, spec) {
+      var fw = Math.max(0, Math.min(1, fr)) * w;
+      if (fw <= 0) return;
+      shearRect(surf, x, y, w, h, skp, function (bx, by, bw, t) {
+        var fx2 = flip ? bx + bw - fw : bx;
+        // vertical gradient, plus a bright line a third of the way down
+        var k = 1.02 - t * 0.46;
+        if (t > 0.24 && t < 0.34) k += 0.50;
+        surf.fillRect(fx2, by, fw, 1, F.rgb(Math.min(255, cr * k),
+          Math.min(255, cg * k), Math.min(255, cb2 * k)));
+      });
+    }
+    // the chip bar: damage just taken, draining a beat behind the real value
+    if (ghost !== undefined && ghost > frac) fillBar(ghost, 236, 206, 110);
+    fillBar(frac, r, g, b);
+  }
+
+  /* The super meter, in thirds. A continuous bar tells you nothing about
+   * whether you can act; segments tell you at a glance, and MAX has to
+   * announce itself. */
+  function meterBar(surf, x, y, w, h, frac, flip, t) {
+    var skp = flip ? -0.30 : 0.30;
+    var maxed = frac >= 0.999;
+    shearRect(surf, x - 2, y - 2, w + 4, h + 4, skp, function (bx, by, bw) {
+      surf.fillRect(bx, by, bw, 1, F.rgb(12, 10, 15));
+    });
+    for (var seg = 0; seg < 3; seg++) {
+      var sw = (w - 2 * 3) / 3;
+      var sx = x + seg * (sw + 3);
+      var lo = seg / 3, hi = (seg + 1) / 3;
+      var fr = Math.max(0, Math.min(1, (frac - lo) / (hi - lo)));
+      shearRect(surf, sx, y, sw, h, skp, function (bx, by, bw, tt) {
+        surf.fillRect(bx, by, bw, 1, F.rgb(24, 26, 36));
+        if (fr <= 0) return;
+        var fw = bw * fr;
+        var fx2 = flip ? bx + bw - fw : bx;
+        var pulse = maxed ? 0.55 + 0.45 * Math.sin(t * 0.22) : 0;
+        var k = (1.15 - tt * 0.35) + pulse * 0.6;
+        surf.fillRect(fx2, by, fw, 1, F.rgb(Math.min(255, (maxed ? 255 : 96) * k),
+          Math.min(255, (maxed ? 226 : 194) * k), Math.min(255, 255 * k)));
+      });
+    }
   }
 
   /* A 3x5 bitmap font written as rows, because the packed-hex version of
@@ -707,8 +1012,13 @@ var FX = FX || {};
     bar(surf, mg, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
     bar(surf, w - mg - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
     // super meters
-    bar(surf, mg, by + bh + 4 * S, bw * 0.58, 4 * S, this.a.meter / 100, 90, 190, 255, false);
-    bar(surf, w - mg - bw * 0.58, by + bh + 4 * S, bw * 0.58, 4 * S, this.b.meter / 100, 90, 190, 255, true);
+    meterBar(surf, mg + 4 * S, by + bh + 5 * S, bw * 0.56, 4.5 * S, this.a.meter / 100, false, this.tHud);
+    meterBar(surf, w - mg - 4 * S - bw * 0.56, by + bh + 5 * S, bw * 0.56, 4.5 * S,
+      this.b.meter / 100, true, this.tHud);
+    if (this.a.meter >= 100) text(surf, 'MAX', mg + 4 * S + bw * 0.56 + 5 * S, by + bh + 5 * S,
+      1.5 * S, F.rgb(255, 236, 170), F.rgb(20, 10, 8));
+    if (this.b.meter >= 100) text(surf, 'MAX', w - mg - 4 * S - bw * 0.56 - 5 * S - textW('MAX', 1.5 * S),
+      by + bh + 5 * S, 1.5 * S, F.rgb(255, 236, 170), F.rgb(20, 10, 8));
 
     var np = 1.5 * S;
     text(surf, this.a.name, mg, by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
@@ -726,9 +1036,16 @@ var FX = FX || {};
     // round pips
     for (var i = 0; i < 2; i++) {
       for (var k = 0; k < 2; k++) {
-        var px = i ? w - mg - 6 * S - k * 10 * S : mg + k * 10 * S;
+        var px = i ? w - mg - 7 * S - k * 11 * S : mg + k * 11 * S;
         var on = this.wins[i] > k;
-        surf.fillRect(px, by + bh + 19 * S, 6 * S, 6 * S, on ? F.rgb(255, 206, 90) : F.rgb(58, 50, 56));
+        var pyy = by + bh + 20 * S, rq = 3.6 * S;
+        // a diamond, and a warm glow behind it when the round is won
+        if (on) surf.addDisc(px + rq, pyy + rq, rq * 2.4, 255, 190, 90, 0.30);
+        for (var dq = -rq; dq <= rq; dq++) {
+          var hw = rq - Math.abs(dq);
+          surf.fillRect(px + rq - hw, pyy + rq + dq, hw * 2, 1,
+            on ? F.rgb(255, 214 - Math.abs(dq) / rq * 60, 110) : F.rgb(52, 45, 52));
+        }
       }
     }
 
@@ -765,10 +1082,12 @@ var FX = FX || {};
     var fixed = 1 / 60;
     var n = 0;
     while (this.acc >= fixed && n < 4) { this.step(fixed); this.acc -= fixed; n++; }
+    var t0 = (typeof performance !== 'undefined' ? performance : Date).now();
     this.render();
+    this.adaptScale((typeof performance !== 'undefined' ? performance : Date).now() - t0);
   };
 
   F.Match = Match;
   F.GROUND = GROUND;
-  F.WORLD = { W: W, H: H, SCALE: SCALE };
+  F.WORLD = { W: W, H: H, SCALE: SCALE };   // .SCALE is updated on each change
 })(FX);

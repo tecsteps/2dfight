@@ -10,6 +10,10 @@ const body  = shell.match(/<body>([\s\S]*?)<script src=/)[1].trim();
 const boot  = shell.match(/<script>\n([\s\S]*?)<\/script>\s*<\/body>/)[1];
 const code  = SRC.map(f => `/* ===== ${f} ===== */\n${read(f)}`).join('\n');
 const out = `<title>Iron Lantern</title>\n<style>\n${style}\n</style>\n${body}\n<script>\n${code}\n${boot}\n</script>\n`;
-fs.mkdirSync(path.join(ROOT,'dist'),{recursive:true});
-fs.writeFileSync(path.join(ROOT,'dist/fight.html'), out);
-console.log('dist/fight.html  ' + (out.length/1024).toFixed(1) + ' KB');
+/* An explicit output path lets a work-in-progress build be tested without
+ * disturbing dist/fight.html, which is what is published and what any
+ * external review is looking at. */
+const dest = process.argv[2] || 'dist/fight.html';
+fs.mkdirSync(path.join(ROOT, path.dirname(dest)), {recursive:true});
+fs.writeFileSync(path.join(ROOT, dest), out);
+console.log(dest + '  ' + (out.length/1024).toFixed(1) + ' KB');
