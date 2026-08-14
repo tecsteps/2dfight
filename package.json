@@ -7,7 +7,9 @@
     "test": "test"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "node tools/buildfight.mjs",
+    "shot": "node tools/shot.mjs"
   },
   "repository": {
     "type": "git",

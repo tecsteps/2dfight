@@ -108,7 +108,7 @@ var FX = FX || {};
     idle: { dur: 0, loop: true },
     walk: { dur: 0, loop: true },
     dash:      { dur: 0.24 },
-    backdash:  { dur: 0.30, inv: 1 },
+    backdash:  { dur: 0.30, inv: [0, 0.45] },
     crouch: { dur: 0, loop: true },
     block: { dur: 0, loop: true },
     blockLow: { dur: 0, loop: true },
@@ -119,25 +119,40 @@ var FX = FX || {};
      * launcher was exactly as safe as a jab -- there was no reason to ever
      * throw anything but the heaviest option. The heavies now carry their
      * cost: the same active frames sit earlier in a longer move. */
-    jab:       { dur: 0.24, hit: [0.36, 0.55], dmg: 4,  reach: 52, hy: 12,  arm: 0, push: 52,  hs: 0.16 },
-    cross:     { dur: 0.36, hit: [0.33, 0.52], dmg: 8,  reach: 58, hy: 10,  arm: 1, push: 132, hs: 0.24 },
-    hook:      { dur: 0.46, hit: [0.31, 0.46], dmg: 10, reach: 46, hy: 14,  arm: 1, push: 155, hs: 0.28, arc: 1 },
-    uppercut:  { dur: 0.56, hit: [0.27, 0.43], dmg: 13, reach: 40, hy: 36,  arm: 1, push: 120, hs: 0.34, launch: 250 },
-    lowKick:   { dur: 0.34, hit: [0.35, 0.55], dmg: 7,  reach: 50, hy: -30, leg: 1, push: 96,  hs: 0.22, low: 1 },
-    highKick:  { dur: 0.50, hit: [0.30, 0.47], dmg: 12, reach: 62, hy: 22,  leg: 1, push: 190, hs: 0.30 },
-    roundhouse:{ dur: 0.62, hit: [0.28, 0.44], dmg: 15, reach: 66, hy: 18,  leg: 1, push: 300, hs: 0.36, arc: 1.6, launch: 150 },
-    sweep:     { dur: 0.50, hit: [0.29, 0.45], dmg: 8,  reach: 52, hy: -40, leg: 1, push: 90,  hs: 0.26, low: 1, trip: 1 },
+    /* Two things are true of every window here now.
+     *
+     * First, the active frames sit on the plateau. strikeEnv holds full
+     * extension from p = 0.34 to 0.58, and every window used to open on the
+     * rising edge -- an air kick went active with the leg 23% extended, and
+     * the first frames of every heavy landed at two-thirds reach.
+     *
+     * Second, the reach numbers are honest. A leg is 60 units from the hip,
+     * so a head-height kick physically cannot travel 66 forward -- the
+     * authored figure was clamped away and the real reach was 46, which is
+     * how a 14-frame jab came to out-range a 37-frame roundhouse. The kicks
+     * are lower and longer; the punches are authored at what an arm reaches. */
+    jab:       { dur: 0.24, hit: [0.34, 0.56], dmg: 4,  reach: 46, hy: 12,  arm: 0, push: 52,  hs: 0.16 },
+    cross:     { dur: 0.36, hit: [0.34, 0.56], dmg: 8,  reach: 50, hy: 10,  arm: 1, push: 132, hs: 0.24 },
+    hook:      { dur: 0.46, hit: [0.34, 0.56], dmg: 10, reach: 44, hy: 14,  arm: 1, push: 155, hs: 0.28, arc: 1 },
+    uppercut:  { dur: 0.56, hit: [0.34, 0.56], dmg: 13, reach: 38, hy: 36,  arm: 1, push: 120, hs: 0.34, launch: 490 },
+    lowKick:   { dur: 0.34, hit: [0.34, 0.56], dmg: 7,  reach: 56, hy: -30, leg: 1, push: 96,  hs: 0.22, low: 1 },
+    highKick:  { dur: 0.50, hit: [0.34, 0.56], dmg: 12, reach: 60, hy: 8,   leg: 1, push: 190, hs: 0.30 },
+    roundhouse:{ dur: 0.62, hit: [0.34, 0.56], dmg: 15, reach: 62, hy: 4,   leg: 1, push: 300, hs: 0.36, arc: 1.6, launch: 380 },
+    sweep:     { dur: 0.50, hit: [0.34, 0.56], dmg: 8,  reach: 56, hy: -40, leg: 1, push: 90,  hs: 0.26, low: 1, trip: 1 },
 
     /* Air normals. Without them there is no jump-in, no air-to-air and no
      * cross-up -- roughly half the neutral game of any commercial fighter
      * was missing because every attack branch sat behind an onGround test. */
-    airPunch:  { dur: 0.34, hit: [0.26, 0.66], dmg: 7,  reach: 48, hy: -6, arm: 1, push: 90,  hs: 0.24, air: 1 },
-    airKick:   { dur: 0.40, hit: [0.24, 0.68], dmg: 11, reach: 58, hy: -18, leg: 1, push: 150, hs: 0.30, air: 1 },
+    airPunch:  { dur: 0.34, hit: [0.34, 0.70], dmg: 7,  reach: 46, hy: -6, arm: 1, push: 90,  hs: 0.24, air: 1 },
+    airKick:   { dur: 0.40, hit: [0.34, 0.70], dmg: 11, reach: 56, hy: -18, leg: 1, push: 150, hs: 0.30, air: 1 },
 
-    special:   { dur: 0.80, hit: [0.30, 0.52], dmg: 26, reach: 76, hy: 8, arm: 1,
-                 push: 560, hs: 0.5, launch: 300, super: 1 },
+    special:   { dur: 0.80, hit: [0.34, 0.58], dmg: 26, reach: 58, hy: 8, arm: 1,
+                 push: 560, hs: 0.5, launch: 560, super: 1 },
 
-    grab:      { dur: 0.34, hit: [0.24, 0.44], grab: 1, reach: 34, hy: 6 },
+    /* The grab reached 43 units and the two bodies were held 44 apart, so
+     * it missed by one unit, always -- about a 4% connect rate, entirely on
+     * frames where knockback happened to close the gap. */
+    grab:      { dur: 0.34, hit: [0.20, 0.52], grab: 1, reach: 50, hy: 6 },
     throw:     { dur: 0.85, dmg: 18 },
     thrown:    { dur: 0.85 },
 
@@ -145,8 +160,9 @@ var FX = FX || {};
     hitLow:    { dur: 0.30, stun: 1 },
     hitHeavy:  { dur: 0.45, stun: 1 },
     knockdown: { dur: 1.25, stun: 1 },
-    // wake-up is invulnerable, or getting knocked down is a loop
-    getup:     { dur: 0.55, inv: 1 },
+    // wake-up is invulnerable while getting up, then not -- whole-move
+    // invulnerability makes okizeme impossible by construction
+    getup:     { dur: 0.55, inv: [0, 0.42] },
     victory:   { dur: 0, loop: true },
     defeat:    { dur: 0, loop: true }
   };
@@ -158,6 +174,27 @@ var FX = FX || {};
    * moves never physically achieve -- a roundhouse claimed 87 units of range
    * against a foot that reached 48, so blows landed with a visible gap. The
    * drawn pose is the truth; this reads it. */
+  /* Distance from a point to a fighter's body, approximated as three
+   * capsules along the solved skeleton: head, torso, legs. Hit detection
+   * used a whole-body vertical band, which let an uppercut connect with the
+   * fist half a body height above the opponent's crown. */
+  function segDist(px, py, ax, ay, bx, by) {
+    var ex = bx - ax, ey = by - ay;
+    var l2 = ex * ex + ey * ey;
+    var t = l2 > 1e-6 ? ((px - ax) * ex + (py - ay) * ey) / l2 : 0;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    var qx = px - (ax + ex * t), qy = py - (ay + ey * t);
+    return Math.sqrt(qx * qx + qy * qy);
+  }
+  F.tipToBody = function (tip, f) {
+    var p = f.pose();
+    var lo = p.legs[0].ankle[1] > p.legs[1].ankle[1] ? p.legs[0].ankle : p.legs[1].ankle;
+    var d1 = segDist(tip[0], tip[1], p.headC[0], p.headC[1], p.neck[0], p.neck[1]) - 8;
+    var d2 = segDist(tip[0], tip[1], p.neck[0], p.neck[1], p.hip[0], p.hip[1]) - 11;
+    var d3 = segDist(tip[0], tip[1], p.hip[0], p.hip[1], lo[0], lo[1]) - 8;
+    return Math.min(d1, Math.min(d2, d3));
+  };
+
   F.limbTip = function (f) {
     var d = f.def(), p = f.pose();
     if (d.leg) return p.legs[1].ankle;
@@ -365,7 +402,7 @@ var FX = FX || {};
     var tw0 = 0;
     if (m === 'walk') lean = 8;
     if (m === 'dash' || m === 'backdash') lean = m === 'dash' ? 18 : -14;
-    if (crouching) lean = 16;
+    if (crouching) lean = 27;
     if (m === 'block' || m === 'blockLow') { lean = -3; tw0 = -16; }
     /* A kick throws the leg forward, so the torso has to go back or the
       * centre of mass leaves the support foot entirely. It used to lean
@@ -380,7 +417,7 @@ var FX = FX || {};
     /* Hip height. The bob used to come entirely from the 0.7 Hz breath
      * sine, which is unrelated to the 2 Hz step cadence -- so while walking
      * the torso floated over the legs instead of dropping onto each one. */
-    var hip = L.standHip - 26 * this.crouchS.v + br * 3.4;
+    var hip = L.standHip - 34 * this.crouchS.v + br * 3.4;
     if ((m === 'walk' || m === 'dash') && Math.abs(this.vx) > 4) {
       hip -= 2.8 * Math.abs(Math.sin(this.phase * TAU));
     }
@@ -394,6 +431,7 @@ var FX = FX || {};
       lean = -92 * kp;
       hip = L.standHip * (1 - 0.86 * kp) + 4;
       if (!this.kdHit && kp > 0.72) { this.kdHit = 1; if (this.onFloorHit) this.onFloorHit(); }
+      // (onFloorHit is assigned by the match, next to onLand)
       if (kp < 0.1) this.kdHit = 0;
     }
     if (m === 'thrown') {
@@ -702,7 +740,9 @@ var FX = FX || {};
     for (var i = 0; i < 2; i++) {
       var lx = this.hand[i].x.v, ly = this.hand[i].y.v;
       var hx = chest[0] + fw * lx, hy = chest[1] - ly;
-      var pole = (i === 0 ? 1 : 1) * fw;
+      // both branches used to return 1, so the rear elbow broke outward
+      // like the lead one instead of tucking in
+      var pole = (i === 0 ? -1 : 1) * fw;
       var elbow = ik2(shoulders[i][0], shoulders[i][1], hx, hy, L.uArm, L.lArm, -pole);
       hands.push([hx, hy]);
       arms.push({ sh: shoulders[i], elbow: elbow, wrist: [hx, hy] });

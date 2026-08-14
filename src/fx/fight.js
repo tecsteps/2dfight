@@ -38,7 +38,7 @@ var FX = FX || {};
   /* How high a launched fighter may go. A juggle that carries someone off
    * the top of the frame is not readable, and the headroom depends on the
    * framing above -- so it lives here with the framing, not in the fighter. */
-  var CEIL = GROUND - 72;
+  var CEIL = GROUND - 82;
 
   /* ---- stage ---------------------------------------------------------- */
 
@@ -368,6 +368,19 @@ var FX = FX || {};
       self.fx.dust(self.a.x, GROUND, n | 0, 1);
       if ((self.a.landV || 0) > 420) self.fx.shake = Math.max(self.fx.shake, 0.18);
     };
+    /* Hitting the floor after a knockdown. `onFloorHit` was called from the
+     * knockdown pose and assigned nowhere, so a body slamming into the stage
+     * raised no dust, no shake and no sound. */
+    this.a.onFloorHit = function () {
+      self.fx.dust(self.a.x, GROUND, 12, -self.a.facing);
+      self.fx.shake = Math.max(self.fx.shake, 0.24);
+      if (self.onSound) self.onSound('heavy');
+    };
+    this.b.onFloorHit = function () {
+      self.fx.dust(self.b.x, GROUND, 12, -self.b.facing);
+      self.fx.shake = Math.max(self.fx.shake, 0.24);
+      if (self.onSound) self.onSound('heavy');
+    };
     this.b.onLand = function () {
       var n = 5 + Math.min(14, (self.b.landV || 0) / 34);
       self.fx.dust(self.b.x, GROUND, n | 0, -1);
@@ -409,7 +422,14 @@ var FX = FX || {};
 
     // wake-up and backdash are invulnerable; the flags existed but nothing
     // ever read them, so neither option escaped anything
-    if (df.def().inv) return;
+    /* Invulnerability is a window, not a whole move. getup was 33 frames
+     * and backdash 18, both fully invulnerable end to end, which makes
+     * meaty setups and backdash punishes impossible by construction. */
+    var dinv = df.def().inv;
+    if (dinv) {
+      var pv = df.progress();
+      if (dinv === 1 || (pv >= dinv[0] && pv <= dinv[1])) return;
+    }
 
     /* Range comes from the limb, not from the move table.
      *
@@ -423,10 +443,16 @@ var FX = FX || {};
     var tipR = (tip[0] - at.x) * at.facing;
     if (dx < -14 || dx - HALF_W > tipR) return;
 
-    // vertical: the limb has to arrive somewhere on the body
+    /* Proximity to the victim's actual shape, not a whole-body band.
+     *
+     * The vertical gate used to accept anything between the crown and the
+     * floor, so an uppercut registered with the fist a clear head-and-
+     * shoulders above the opponent -- measured at 63.8 units, half a body
+     * height, with the spark hanging in empty sky. Three capsules built
+     * from the solved pose cost about nothing and mean the hit lands where
+     * the picture says it does. */
     var lowMove = !!d.low;
-    var ty = tip[1];
-    if (ty < df.y - 152 || ty > df.y + 8) return;
+    if (F.tipToBody(tip, df) > 16) return;
     // crouching ducks highs, and a low cannot catch an airborne fighter
     var dfCrouch = df.crouchS.v > 0.55;
     if (!lowMove && dfCrouch && !d.super) return;
@@ -457,8 +483,12 @@ var FX = FX || {};
       /* Blockstun. There was none at all, so blocking anything was a free
        * punish and there was no risk in throwing anything. The attacker eats
        * the larger share on a heavy, which is what makes it punishable. */
-      df.stun = Math.max(df.stun, 0.06 + d.hs * 0.28);
-      at.stun = Math.max(at.stun, 0.10 + d.hs * 0.55);
+      /* Frame advantage on block. The attacker used to eat more freeze than
+       * the defender on every single move -- jab was -5 and roundhouse -17 --
+       * so there was never a reason to press a button against a guard. Lights
+       * are now roughly neutral and heavies stay properly punishable. */
+      df.stun = Math.max(df.stun, 0.10 + d.hs * 0.42);
+      at.stun = Math.max(at.stun, d.hs * 0.30);
       this.fx.spark(hx, hy, 9, 0.5, [180, 220, 255], -at.facing, 0.3);
       this.fx.ring(hx, hy, 0.5, [170, 210, 255]);
       this.fx.shake = Math.max(this.fx.shake, d.hs * 0.4);
@@ -496,8 +526,19 @@ var FX = FX || {};
      * displacements of the pose springs, which then settle normally. */
     var imp = Math.min(1.7, 0.45 + d.dmg / 13);
     df.lean.v -= (lowMove ? -28 : 30) * imp;
-    df.headA.v -= 34 * imp;
+    // the head term was stacking ~100 degrees of rotation with the lean and
+    // reading as a snapped spine rather than a blow
+    df.headA.v -= 16 * imp;
     df.hipH.v -= 7 * imp;
+    /* And the feet. The impact wrote the torso, the head and both hands and
+     * nothing at all below the waist, so a body folded ninety degrees
+     * backward stood on two level, evenly weighted feet. */
+    if (df.onGround) {
+      df.feet[1].wx += at.facing * 10 * imp;
+      df.feet[0].wx += at.facing * 5 * imp;
+      df.feet[1].wy -= 3 * imp;
+      df.hipShift.v -= at.facing * df.facing * 4 * imp;
+    }
     df.twist.v += at.facing * df.facing * 24 * imp;
     df.hand[0].x.v -= 20 * imp; df.hand[1].x.v -= 26 * imp;
     df.hand[0].y.v += 10 * imp; df.hand[1].y.v += 15 * imp;
@@ -543,7 +584,10 @@ var FX = FX || {};
      * frames -- a jab and a roundhouse felt the same -- and 13.7% of the
      * match was frozen. Lower base, steeper slope: lighter lights, heavier
      * heavies, and about half the total freeze. */
-    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.30 : 0.035 + d.hs * 0.30);
+    /* Hitstop. Measured across five seeded rounds this was still freezing
+     * 12.5% of the match with only a 4.5-to-18 frame spread; add hitstun and
+     * knockdowns and nobody was fighting for 40% of the round. */
+    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.20 : 0.02 + d.hs * 0.16);
     if (d.super) this.fx.flash = 0.8;
     if (this.onSound) this.onSound(d.super ? 'super' : (d.dmg >= 10 ? 'heavy' : 'hit'));
   };
@@ -577,8 +621,11 @@ var FX = FX || {};
       if (f.launched || f.stun > 0) return;
       if (c.p) { f.start('airPunch'); return; }
       if (c.k) { f.start('airKick'); return; }
-      if (fwd) f.vx += f.facing * 9;
-      else if (back) f.vx -= f.facing * 9;
+      /* Air drift, deliberately small. At +/-9 a neutral jump could steer
+       * 98 units horizontally -- more than a committed forward jump travels
+       * -- so a jump was not a commitment, which is the whole point of one. */
+      if (fwd) f.vx += f.facing * 3;
+      else if (back) f.vx -= f.facing * 3;
       if (f.vx > 150) f.vx = 150; else if (f.vx < -150) f.vx = -150;
       return;
     }
@@ -605,7 +652,7 @@ var FX = FX || {};
     // `cross` sat in the move table with no input path to it at all
     if (c.p) { f.start(c.d ? 'uppercut' : (back ? 'hook' : (fwd ? 'cross' : 'jab'))); return; }
     if (c.k) { f.start(c.d ? 'sweep' : (back ? 'roundhouse' : (c.u ? 'highKick' : 'lowKick'))); return; }
-    if (c.u) { f.start('jump'); f.vy = -600; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
+    if (c.u) { f.start('jump'); f.vy = -840; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
       this.fx.dust(f.x, f.y, 7, 1); return; }
     if (c.d) { f.start(back ? 'blockLow' : 'crouch'); return; }
     if (back) { f.start('block'); f.vx = -f.facing * 78; return; }
@@ -623,7 +670,7 @@ var FX = FX || {};
     // react to an incoming attack
     var fd = foe.def();
     var incoming = fd.hit && foe.progress() < fd.hit[1] && dist < 96;
-    if (incoming && Math.random() < 0.6) {
+    if (incoming && Math.random() < (fd.low ? 0.86 : 0.6)) {
       c[away] = 1;
       if (fd.low) c.d = 1;
       return c;
@@ -640,7 +687,18 @@ var FX = FX || {};
     }
 
     if (f.meter >= 100 && dist < 90 && Math.random() < 0.5) { c.s = 1; this.aiT[i] = 0.9; this.aiHold[i] = c; return c; }
-    if (dist > 108) { c[toward] = 1; this.aiT[i] = 0.12 + Math.random() * 0.2; this.aiHold[i] = c; return c; }
+    if (dist > 108) {
+      /* Dash. The AI holds a direction across consecutive ticks, which
+       * latches tapHeld and means the double-tap detector can never fire
+       * from an AI command -- so it had literally never dashed. An explicit
+       * intent bypasses the tap decoder. */
+      if (dist > 150 && f.canAct() && f.onGround && Math.random() < 0.22) {
+        f.start('dash'); f.vx = f.facing * 300;
+        this.fx.dust(f.x, GROUND, 6, f.facing);
+        this.aiT[i] = 0.30; this.aiHold[i] = c; return c;
+      }
+      c[toward] = 1; this.aiT[i] = 0.12 + Math.random() * 0.2; this.aiHold[i] = c; return c;
+    }
     if (dist > 74) {
       var rf = Math.random();
       // at range: the long kicks, which need a direction held with the button
@@ -674,10 +732,19 @@ var FX = FX || {};
 
   Match.prototype.step = function (dt) {
     this.tick = (this.tick || 0) + 1;
-    /* Nothing ages during hitstop except the freeze itself and the screen
-     * flash. The shake used to decay right through it, so a jab's 1.7 frames
-     * of shake were entirely consumed inside 7.7 frames of freeze and there
-     * was none left when the world started moving again. */
+
+    /* Sample the player's buttons every tick, including frozen ones.
+     *
+     * step() returns early during hitstop, and hitstop is an eighth of the
+     * match -- so a press and release inside an 18-frame super freeze was
+     * simply never seen. Stamping the press here means the buffer below can
+     * replay it the moment the character can act. */
+    if (!this.demo) this.stamp(this.a, this.readInput());
+
+    /* Nothing else ages during hitstop except the freeze itself and the
+     * screen flash. The shake used to decay right through it, so a jab's
+     * 1.7 frames of shake were entirely consumed inside 7.7 frames of
+     * freeze and there was none left when the world started moving again. */
     if (this.fx.hitstop > 0) {
       this.fx.hitstop -= dt;
       if (this.fx.flash > 0) this.fx.flash = Math.max(0, this.fx.flash - dt * 6);
@@ -693,6 +760,8 @@ var FX = FX || {};
 
     var ca = this.over ? {} : (this.demo ? this.ai(this.a, this.b, 0, dt) : this.readInput());
     var cb = this.over ? {} : this.ai(this.b, this.a, 1, dt);
+    // a press made while busy comes out on the first actionable frame
+    if (!this.demo && this.a.canAct()) ca = this.unbuf(this.a, ca);
 
     this.drive(this.a, ca, this.b);
     this.drive(this.b, cb, this.a);
@@ -704,6 +773,17 @@ var FX = FX || {};
     this.resolve(this.a, this.b);
     this.resolve(this.b, this.a);
 
+    /* Time out the combo. Nothing ever cleared it, so twelve jabs three
+     * seconds apart counted as a twelve-hit combo: damage stayed permanently
+     * scaled to 55%, and the HUD read "20 HIT" over two idle fighters. */
+    for (var ci2 = 0; ci2 < 2; ci2++) {
+      var cf2 = ci2 ? this.b : this.a, vf = ci2 ? this.a : this.b;
+      if (cf2.combo > 0) {
+        cf2.comboIdle = (vf.stun > 0 || this.fx.hitstop > 0) ? 0 : (cf2.comboIdle || 0) + 1;
+        if (cf2.comboIdle > 34) { cf2.combo = 0; cf2.comboIdle = 0; }
+      }
+    }
+
 
     // walls and body separation
     [this.a, this.b].forEach(function (f) {
@@ -711,8 +791,8 @@ var FX = FX || {};
       if (f.x > WALL_R) { f.x = WALL_R; f.vx = Math.min(0, f.vx); }
     });
     var gap = this.b.x - this.a.x;
-    if (Math.abs(gap) < 44) {
-      var push = (44 - Math.abs(gap)) * 0.5 * Math.sign(gap || 1);
+    if (Math.abs(gap) < 40) {
+      var push = (40 - Math.abs(gap)) * 0.5 * Math.sign(gap || 1);
       this.a.x -= push; this.b.x += push;
     }
 
@@ -782,6 +862,32 @@ var FX = FX || {};
     }
   };
 
+  /* Remember an attack button pressed while the character is busy.
+   *
+   * Without this a four- or eight-frame tap during recovery was dropped
+   * outright -- only a button held continuously all the way through a move
+   * ever came out, and then a frame after the move had already ended. Every
+   * commercial fighter buffers; this is the cheap version of it. */
+  var BUF_TICKS = 6;
+  Match.prototype.stamp = function (f, c) {
+    var k = c.p ? 'p' : c.k ? 'k' : c.g ? 'g' : c.s ? 's' : c.u ? 'u' : null;
+    if (!k) { f.bufHeld = 0; return; }
+    if (f.bufHeld) return;                 // one stamp per press, not per frame
+    f.bufHeld = 1;
+    f.buf = { k: k, t: this.tick, l: c.l, r: c.r, d: c.d, u: c.u };
+  };
+  /* Fold a live buffered press back into this tick's command. */
+  Match.prototype.unbuf = function (f, c) {
+    var b = f.buf;
+    if (!b || this.tick - b.t > BUF_TICKS) return c;
+    f.buf = null;
+    var o = { l: b.l, r: b.r, u: b.u, d: b.d, p: 0, k: 0, s: 0, g: 0 };
+    o[b.k] = 1;
+    // keep the direction the player is holding *now* for movement
+    o.l = c.l || b.l; o.r = c.r || b.r;
+    return o;
+  };
+
   Match.prototype.readInput = function () {
     var i = this.input;
     return { l: i.l, r: i.r, u: i.u, d: i.d, p: i.p, k: i.k, s: i.s, g: i.g };
@@ -802,7 +908,9 @@ var FX = FX || {};
     /* Screen shake, as a decaying oscillation along the hit direction --
      * white noise reads as a rattle, a sine reads as an impact. */
     var ox = 0, oy = 0;
-    if (this.fx.shake > 0) {
+    // the oscillator advances only when the world does, or a "freeze" is
+    // nine to eighteen frames of vibration rather than a freeze
+    if (this.fx.shake > 0 && this.fx.hitstop <= 0) {
       /* Amplitude was 0.09%-0.9% of screen width where commercial fighters
        * run 1-4%, and squaring it made the light hits vanish entirely. */
       var k = this.fx.shake * 30 * S;
