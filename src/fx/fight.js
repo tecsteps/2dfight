@@ -15,10 +15,22 @@ var FX = FX || {};
 (function (F) {
   'use strict';
 
-  var W = 480, H = 270;               // world units
-  var SCALE = 2;                      // device pixels per world unit
-  var GROUND = 232;
-  var WALL_L = 34, WALL_R = W - 34;
+  /* Framing. The world is the camera's view in abstract units; SCALE turns
+   * it into device pixels. Tightening the view from 480x270 to 400x225 (at
+   * a matching scale, so the surface stays 1440x810) is a pure zoom: the
+   * fighters are ~150 units tall, which was 55% of frame height and is now
+   * two thirds -- the proportion a fighting game actually uses. Nothing
+   * about the characters changed, only how much room they are given. */
+  var W = 444, H = 250;               // world units
+  var SCALE = 3.24;                   // device pixels per world unit
+  var GROUND = 216;
+  var WALL_TOP = 118;                 // top of the temple wall, in world units
+  var WALL_L = 30, WALL_R = W - 30;
+  var BAY = 62;                       // pillar-to-pillar pitch, in world units
+  /* How high a launched fighter may go. A juggle that carries someone off
+   * the top of the frame is not readable, and the headroom depends on the
+   * framing above -- so it lives here with the framing, not in the fighter. */
+  var CEIL = GROUND - 72;
 
   /* ---- stage ---------------------------------------------------------- */
 
@@ -28,74 +40,151 @@ var FX = FX || {};
     return ((n ^ (n >> 16)) >>> 0) / 4294967296;
   }
 
+  /* Where the lanterns hang. The floor pools are placed from the same list,
+   * so the light on the ground always agrees with the light source. */
+  var LANTERNS = (function () {
+    var a = [];
+    for (var i = 0; i * BAY + 34 < W; i++) a.push(34 + i * BAY);
+    return a;
+  })();
+
+  /* The stage.
+   *
+   * The previous version failed on value structure: sky, wall and floor all
+   * sat in the same narrow band of dark purple-brown, so the frame read as
+   * one flat slab with two characters pasted on it. A stage needs its planes
+   * separated -- bright sky, dark mid-ground, mid floor -- and it needs
+   * light that visibly lands somewhere. Everything here is painted once into
+   * a backing surface and copied per frame, so detail is free at runtime.
+   */
   function paintStage(bg) {
     var S = SCALE, w = bg.w, h = bg.h;
-    // dusk sky
-    bg.gradientV(0, 0, w, GROUND * S, F.rgb(48, 36, 62), F.rgb(196, 118, 96));
-    // sun haze
-    bg.addDisc(w * 0.66, GROUND * S * 0.74, 190 * S / 2, 255, 176, 120, 0.5);
-    bg.addDisc(w * 0.66, GROUND * S * 0.74, 90 * S / 2, 255, 214, 160, 0.55);
-
-    // far mountains
+    var wallTop = WALL_TOP * S, fy = GROUND * S, wallH = fy - wallTop;
     var i, x, y;
+
+    /* ---- sky ---- */
+    bg.gradientV(0, 0, w, wallTop + 2, F.rgb(28, 24, 52), F.rgb(214, 132, 96));
+    // the sun, low and mostly behind the wall: a light source you can see
+    var sunX = w * 0.70, sunY = wallTop - 4 * S;
+    bg.addDisc(sunX, sunY, 62 * S, 255, 150, 92, 0.42);
+    bg.addDisc(sunX, sunY, 30 * S, 255, 190, 130, 0.55);
+    bg.addDisc(sunX, sunY, 15 * S, 255, 232, 196, 0.85);
+
+    /* ---- distant ranges, hazing toward the sky as they recede ---- */
     for (i = 0; i < 3; i++) {
-      var baseY = (GROUND - 44 - i * 9) * S;
-      var amp = (26 - i * 6) * S;
-      var col = F.rgb(52 + i * 12, 44 + i * 12, 70 + i * 10);
+      var baseY = (WALL_TOP - 2 - i * 11) * S;
+      var amp = (30 - i * 8) * S;
+      // nearer ranges are darker; the far one is nearly sky
+      var k = i / 2;
+      var col = F.rgb(44 + k * 74, 36 + k * 54, 62 + k * 40);
       for (x = 0; x < w; x++) {
         var t = x / w;
-        var yy = baseY - Math.abs(Math.sin(t * (5 + i * 3) + i)) * amp
+        var yy = baseY - Math.abs(Math.sin(t * (5 + i * 3) + i * 2.1)) * amp
           - Math.sin(t * (17 + i * 7)) * amp * 0.22;
-        bg.fillRect(x, yy, 1, baseY - yy + 6 * S, col);
+        bg.fillRect(x, yy, 1, baseY - yy + 8 * S, col);
       }
     }
 
-    // temple wall behind the arena
-    var wallTop = (GROUND - 132) * S, wallH = (GROUND - 6) * S - wallTop;
-    bg.gradientV(0, wallTop, w, wallH, F.rgb(74, 56, 62), F.rgb(44, 32, 40));
+    /* ---- temple wall ---- */
+    bg.gradientV(0, wallTop, w, wallH, F.rgb(62, 44, 52), F.rgb(26, 18, 24));
+    // recessed bays between the pillars: an inset plane with a lit lintel and
+    // a shadowed sill, which is what stops the wall reading as one surface
+    for (i = 0; i * BAY + 12 < W; i++) {
+      var bx = (12 + i * BAY) * S, bw2 = 44 * S;
+      var by = wallTop + 9 * S, bh2 = wallH - 20 * S;
+      bg.gradientV(bx, by, bw2, bh2, F.rgb(46, 33, 40), F.rgb(26, 19, 25));
+      bg.fillRect(bx, by, bw2, 1.4 * S, F.rgb(84, 62, 62));          // lit lintel
+      bg.fillRect(bx, by + bh2 - 1.4 * S, bw2, 1.4 * S, F.rgb(12, 8, 12));
+      // a lit window deep in the bay
+      bg.blendRect(bx + 15 * S, by + 12 * S, 14 * S, 20 * S, 226, 146, 78, 0.30);
+      bg.addDisc(bx + 22 * S, by + 22 * S, 16 * S, 255, 156, 74, 0.13);
+    }
     // pillars
-    for (i = 0; i < 7; i++) {
-      var px = (24 + i * 74) * S;
-      bg.gradientV(px, wallTop, 15 * S, wallH, F.rgb(96, 74, 78), F.rgb(52, 38, 46));
-      bg.fillRect(px, wallTop, 2 * S, wallH, F.rgb(126, 100, 100));
-      bg.fillRect(px + 13 * S, wallTop, 2 * S, wallH, F.rgb(34, 24, 30));
-      // capital
-      bg.fillRect(px - 3 * S, wallTop, 21 * S, 5 * S, F.rgb(108, 84, 86));
-      bg.fillRect(px - 3 * S, wallTop, 21 * S, 1.5 * S, F.rgb(148, 120, 116));
-    }
-    // hanging lanterns
-    for (i = 0; i < 6; i++) {
-      var lx = (52 + i * 76) * S, ly = (GROUND - 148) * S;
-      bg.fillRect(lx, wallTop - 22 * S, 1 * S, 22 * S, F.rgb(40, 30, 34));
-      bg.addDisc(lx, ly + 8 * S, 16 * S, 255, 150, 70, 0.30);
+    for (i = 0; i * BAY + 2 < W + BAY; i++) {
+      var px = (2 + i * BAY) * S, pw = 10 * S;
+      bg.gradientV(px, wallTop, pw, wallH, F.rgb(104, 78, 76), F.rgb(38, 27, 32));
+      bg.fillRect(px, wallTop, 1.6 * S, wallH, F.rgb(142, 112, 104));  // lit edge
+      bg.fillRect(px + pw - 1.6 * S, wallTop, 1.6 * S, wallH, F.rgb(20, 14, 18));
+      // capital and base
+      bg.fillRect(px - 2.4 * S, wallTop, pw + 4.8 * S, 4.5 * S, F.rgb(116, 88, 84));
+      bg.fillRect(px - 2.4 * S, wallTop, pw + 4.8 * S, 1.4 * S, F.rgb(164, 132, 120));
+      bg.fillRect(px - 2 * S, fy - 6 * S, pw + 4 * S, 6 * S, F.rgb(74, 55, 56));
+      bg.fillRect(px - 2 * S, fy - 6 * S, pw + 4 * S, 1.2 * S, F.rgb(112, 86, 80));
     }
 
-    // floor: a stone platform in perspective
-    var fy = GROUND * S;
-    bg.gradientV(0, fy, w, h - fy, F.rgb(92, 72, 68), F.rgb(30, 24, 26));
-    // boards converging slightly, plus grain
-    for (y = 0; y < h - fy; y++) {
-      var d = y / (h - fy);
-      var lineC = F.rgb(70 - d * 30, 54 - d * 22, 52 - d * 22);
-      if (y % Math.round(9 * S) === 0) bg.fillRect(0, fy + y, w, 1, lineC);
+    /* ---- spectators on the wall top ----
+     * Silhouettes against the bright sky. Nothing sells "this is a place
+     * where a fight is happening" like an audience, and against a light sky
+     * they cost one dark shape and one warm rim each. */
+    for (i = 0; i * 11.6 < W + 12; i++) {
+      var cx2 = (6 + i * 11.6 + hash(i, 21) * 5) * S;
+      var hh = (7 + hash(i, 5) * 3.5) * S;
+      var cy2 = wallTop - hh * 0.55;
+      var bob = hash(i, 9);
+      bg.blendDisc(cx2, cy2 - hh * 0.5, hh * 0.42, 16, 11, 20, 0.94);      // head
+      bg.blendDisc(cx2, cy2 + hh * 0.35, hh * 0.66, 16, 11, 20, 0.94);     // shoulders
+      // warm rim from the sky behind them
+      bg.blendDisc(cx2 - hh * 0.12, cy2 - hh * 0.62, hh * 0.3, 206, 128, 92, 0.22 + bob * 0.2);
     }
-    for (i = 0; i < 2600; i++) {
-      var gx = (hash(i, 7) * w) | 0, gy = (fy + hash(i, 11) * (h - fy)) | 0;
+    // the balustrade they stand behind
+    bg.fillRect(0, wallTop - 1.5 * S, w, 3.2 * S, F.rgb(92, 68, 68));
+    bg.fillRect(0, wallTop - 1.5 * S, w, 1.1 * S, F.rgb(140, 108, 98));
+
+    /* ---- lanterns ---- */
+    for (i = 0; i < LANTERNS.length; i++) {
+      var lx = LANTERNS[i] * S, ly = (WALL_TOP + 26) * S;
+      bg.fillRect(lx - 0.5 * S, wallTop + 3 * S, 1 * S, ly - wallTop - 3 * S, F.rgb(30, 22, 26));
+      // paper body, lit from inside
+      bg.blendRect(lx - 4 * S, ly, 8 * S, 11 * S, 236, 154, 84, 0.95);
+      bg.blendRect(lx - 4 * S, ly, 8 * S, 2 * S, 255, 206, 150, 0.9);
+      bg.fillRect(lx - 4.6 * S, ly - 1.4 * S, 9.2 * S, 1.6 * S, F.rgb(46, 32, 30));
+      bg.fillRect(lx - 4.6 * S, ly + 11 * S, 9.2 * S, 1.6 * S, F.rgb(46, 32, 30));
+      bg.addDisc(lx, ly + 5 * S, 26 * S, 255, 150, 66, 0.30);
+      bg.addDisc(lx, ly + 5 * S, 11 * S, 255, 200, 130, 0.42);
+    }
+
+    /* ---- floor ---- */
+    bg.gradientV(0, fy, w, h - fy, F.rgb(104, 80, 72), F.rgb(26, 20, 22));
+    var fh = h - fy;
+    for (y = 0; y < fh; y++) {
+      var d = y / fh;
+      if (y % Math.round(8 * S) === 0) {
+        bg.fillRect(0, fy + y, w, Math.max(1, 0.5 * S), F.rgb(74 - d * 34, 56 - d * 26, 52 - d * 24));
+      }
+    }
+    // the lanterns land on the floor: warm pools directly below each one
+    for (i = 0; i < LANTERNS.length; i++) {
+      var px2 = LANTERNS[i] * S;
+      for (var q = 0; q < 4; q++) {
+        var rr = (34 - q * 7) * S;
+        bg.addDisc(px2, fy + 9 * S, rr, 255, 152, 74, 0.055);
+        bg.addDisc(px2, fy + 9 * S, rr * 0.5, 255, 190, 120, 0.03);
+      }
+    }
+    // grain
+    for (i = 0; i < 3400; i++) {
+      var gx = (hash(i, 7) * w) | 0, gy = (fy + hash(i, 11) * fh) | 0;
       var v = hash(i, 3);
-      bg.blendPx(gx, gy, 210, 180, 150, 0.05 + v * 0.07);
+      bg.blendPx(gx, gy, 214, 186, 156, 0.04 + v * 0.07);
     }
-    // front edge highlight
-    bg.fillRect(0, fy, w, 1.5 * S, F.rgb(150, 120, 104));
-    bg.fillRect(0, fy - 1 * S, w, 1 * S, F.rgb(58, 42, 44));
+    // the lip of the platform -- a hard bright line is what reads as an edge
+    bg.fillRect(0, fy - 1.2 * S, w, 1.2 * S, F.rgb(46, 32, 34));
+    bg.fillRect(0, fy, w, 1.6 * S, F.rgb(178, 138, 108));
+    bg.fillRect(0, fy + 1.6 * S, w, 1.4 * S, F.rgb(96, 72, 62));
 
+    /* ---- atmosphere ---- */
+    // haze pooling at the base of the wall pushes it back behind the fighters
+    for (y = 0; y < 26 * S; y++) {
+      var t2 = 1 - y / (26 * S);
+      bg.blendRect(0, fy - y, w, 1, 150, 96, 96, 0.10 * t2 * t2);
+    }
     // vignette
     for (y = 0; y < h; y++) {
-      for (x = 0; x < w; x += 1) {
-        var dx = (x / w - 0.5) * 2, dy = (y / h - 0.5) * 2;
-        var r = dx * dx * 0.7 + dy * dy * 0.9;
-        if (r < 0.55) { x += 0; continue; }
-        var k = Math.min(0.62, (r - 0.55) * 0.85);
-        bg.blendPx(x, y, 8, 6, 14, k);
+      for (x = 0; x < w; x++) {
+        var vx = (x / w - 0.5) * 2, vy = (y / h - 0.5) * 2;
+        var r2 = vx * vx * 0.72 + vy * vy * 0.92;
+        if (r2 < 0.42) continue;
+        bg.blendPx(x, y, 6, 4, 12, Math.min(0.66, (r2 - 0.42) * 0.9));
       }
     }
   }
@@ -173,9 +262,9 @@ var FX = FX || {};
   /* ---- match ---------------------------------------------------------- */
 
   function Match(canvas) {
-    this.surf = new F.Surface(W * SCALE, H * SCALE);
+    this.surf = new F.Surface(Math.round(W * SCALE), Math.round(H * SCALE));
     this.surf.attach(canvas);
-    this.bg = new F.Surface(W * SCALE, H * SCALE);
+    this.bg = new F.Surface(Math.round(W * SCALE), Math.round(H * SCALE));
     paintStage(this.bg);
 
     this.sh = new F.Shader(this.surf);
@@ -426,6 +515,7 @@ var FX = FX || {};
     this.drive(this.b, cb, this.a);
 
     this.a.setGround(GROUND); this.b.setGround(GROUND);
+    this.a.ceilY = CEIL; this.b.ceilY = CEIL;
     this.a.update(dt, ca); this.b.update(dt, cb);
 
     this.resolve(this.a, this.b);
@@ -494,7 +584,7 @@ var FX = FX || {};
     /* Parallax: sky barely moves, the temple wall drifts, the floor tracks
      * the fighters exactly so their feet stay glued to it. */
     var cx = this.camX * S;
-    var skyY = (GROUND - 132) * S, flrY = GROUND * S;
+    var skyY = WALL_TOP * S, flrY = GROUND * S;
     surf.copyBand(this.bg, 0, skyY, ox - cx * 0.15);
     surf.copyBand(this.bg, skyY, flrY, ox - cx * 0.55);
     surf.copyBand(this.bg, flrY, surf.h, ox - cx);
@@ -514,13 +604,17 @@ var FX = FX || {};
       F.drawFighter(this.sh, f);
       // motion arc: the working limb's recent path, additively. Free from a
       // solved pose; a sprite sheet would need extra art for every frame.
+      /* Motion arc: the working limb's recent path. Additive streaks stack
+       * where the samples overlap, so the alpha has to be small -- at the
+       * old value a rising uppercut painted a solid white bar across the
+       * screen brighter than anything else in frame. */
       var tc = f.skin.tint;
       for (var g = 0; g < f.trail.length; g++) {
-        var seg = f.trail[g], al = 0.055 + g * 0.032;
+        var seg = f.trail[g], al = 0.012 + g * 0.009;
         surf.addStreak(seg[0][0] * S + pan, seg[0][1] * S + oy,
-          seg[1][0] * S + pan, seg[1][1] * S + oy, 5 * S, tc[0], tc[1], tc[2], al * 0.5);
+          seg[1][0] * S + pan, seg[1][1] * S + oy, 3.0 * S, tc[0], tc[1], tc[2], al * 0.5);
         surf.addStreak(seg[1][0] * S + pan, seg[1][1] * S + oy,
-          seg[2][0] * S + pan, seg[2][1] * S + oy, 4.5 * S, tc[0], tc[1], tc[2], al);
+          seg[2][0] * S + pan, seg[2][1] * S + oy, 2.4 * S, tc[0], tc[1], tc[2], al);
       }
     }
 
@@ -596,7 +690,7 @@ var FX = FX || {};
 
   Match.prototype.hud = function (surf) {
     var S = SCALE, w = surf.w;
-    var bw = 186 * S, bh = 13 * S, by = 14 * S;
+    var bw = 152 * S, bh = 11 * S, by = 12 * S, mg = 14 * S;
     // chip bars trail the real value
     if (this.ghostA === undefined) { this.ghostA = 1; this.ghostB = 1; }
     var ha = this.a.hp / this.a.maxHp, hb = this.b.hp / this.b.maxHp;
@@ -610,29 +704,31 @@ var FX = FX || {};
     }
     var ca = hc(ha, this.tHud || 0), cb2 = hc(hb, this.tHud || 0);
     this.tHud = (this.tHud || 0) + 1;
-    bar(surf, 20 * S, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
-    bar(surf, w - 20 * S - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
+    bar(surf, mg, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
+    bar(surf, w - mg - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
     // super meters
-    bar(surf, 20 * S, by + bh + 5 * S, bw * 0.62, 5 * S, this.a.meter / 100, 90, 190, 255, false);
-    bar(surf, w - 20 * S - bw * 0.62, by + bh + 5 * S, bw * 0.62, 5 * S, this.b.meter / 100, 90, 190, 255, true);
+    bar(surf, mg, by + bh + 4 * S, bw * 0.58, 4 * S, this.a.meter / 100, 90, 190, 255, false);
+    bar(surf, w - mg - bw * 0.58, by + bh + 4 * S, bw * 0.58, 4 * S, this.b.meter / 100, 90, 190, 255, true);
 
-    text(surf, this.a.name, 20 * S, by + bh + 13 * S, 1.6 * S, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+    var np = 1.5 * S;
+    text(surf, this.a.name, mg, by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
     var nb = this.b.name;
-    text(surf, nb, w - 20 * S - textW(nb, 1.6 * S), by + bh + 13 * S, 1.6 * S, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+    text(surf, nb, w - mg - textW(nb, np), by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
 
     // timer
     var ts = String(Math.max(0, Math.ceil(this.time)));
     if (ts.length < 2) ts = '0' + ts;
-    var tp = 4 * S;
-    surf.fillRect(w / 2 - 22 * S, by - 3 * S, 44 * S, 26 * S, F.rgb(18, 16, 22));
-    text(surf, ts, w / 2 - textW(ts, tp) / 2, by + 1 * S, tp, F.rgb(255, 236, 190), F.rgb(20, 10, 8));
+    var tp = 3.4 * S;
+    surf.fillRect(w / 2 - 19 * S, by - 3 * S, 38 * S, 23 * S, F.rgb(18, 16, 22));
+    surf.fillRect(w / 2 - 17 * S, by - 1 * S, 34 * S, 19 * S, F.rgb(10, 8, 12));
+    text(surf, ts, w / 2 - textW(ts, tp) / 2, by + 1.5 * S, tp, F.rgb(255, 236, 190), F.rgb(20, 10, 8));
 
     // round pips
     for (var i = 0; i < 2; i++) {
       for (var k = 0; k < 2; k++) {
-        var px = i ? w - 26 * S - k * 12 * S : 20 * S + k * 12 * S;
+        var px = i ? w - mg - 6 * S - k * 10 * S : mg + k * 10 * S;
         var on = this.wins[i] > k;
-        surf.fillRect(px, by + bh + 22 * S, 7 * S, 7 * S, on ? F.rgb(255, 206, 90) : F.rgb(58, 50, 56));
+        surf.fillRect(px, by + bh + 19 * S, 6 * S, 6 * S, on ? F.rgb(255, 206, 90) : F.rgb(58, 50, 56));
       }
     }
 
@@ -656,7 +752,7 @@ var FX = FX || {};
         F.rgb(255, 210, 120), F.rgb(20, 10, 8));
     }
     if (this.demo) {
-      text(surf, 'DEMO', w / 2 - textW('DEMO', 2 * S) / 2, surf.h - 16 * S, 2 * S,
+      text(surf, 'DEMO', w / 2 - textW('DEMO', 1.8 * S) / 2, surf.h - 13 * S, 1.8 * S,
         F.rgb(200, 190, 180), F.rgb(10, 8, 12));
     }
   };

@@ -47,9 +47,12 @@ page.on('pageerror', e => logs.push(`[pageerror] ${e.message}`));
 await page.goto(url, { waitUntil: 'load' });
 if (flags.wait) await page.waitForTimeout(+flags.wait);
 
-if (flags.eval) {
+/* --evalfile keeps probes in a file. The inline --eval strings grew past
+ * the point where shell quoting was the main source of bugs. */
+const probe = flags.evalfile ? fs.readFileSync(flags.evalfile, 'utf8') : flags.eval;
+if (probe) {
   try {
-    const r = await page.evaluate(flags.eval);
+    const r = await page.evaluate(probe);
     console.log('EVAL: ' + JSON.stringify(r));
   } catch (e) {
     console.log('EVAL ERROR: ' + e.message);

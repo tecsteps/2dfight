@@ -180,8 +180,14 @@ var FX = FX || {};
     this.blinkT = 0;
 
     // secondary motion
+    /* Hairstyle is per-character: the number of verlet points, how far apart
+     * they sit and how thick they are drawn. One shared four-point chain of
+     * fat segments gave both fighters the same heavy ponytail, and at this
+     * resolution it read as a blob rather than hair. */
+    this.hairStyle = (skin && skin.hairStyle) || { n: 3, seg: 3.6, r0: 3.4, taper: 0.8,
+      back: 0.78, up: 1.4, grav: 620 };
     this.hair = [];
-    for (var i = 0; i < 4; i++) this.hair.push({ x: 0, y: 0, vx: 0, vy: 0 });
+    for (var i = 0; i < this.hairStyle.n; i++) this.hair.push({ x: 0, y: 0, vx: 0, vy: 0 });
     this.belt = [{ x: 0, y: 0, vx: 0, vy: 0 }, { x: 0, y: 0, vx: 0, vy: 0 }];
     this.trail = [];
   }
@@ -245,8 +251,9 @@ var FX = FX || {};
     if (!this.onGround) {
       this.vy += 1800 * dt;
       this.y += this.vy * dt;
-      // ceiling, so a juggle cannot carry anyone out of frame
-      var ceil = this.groundY - 132;
+      // ceiling, so a juggle cannot carry anyone out of frame. The match
+      // sets ceilY from its own framing; this is only the fallback.
+      var ceil = this.ceilY !== undefined ? this.ceilY : this.groundY - 132;
       if (this.y < ceil) { this.y = ceil; if (this.vy < 0) this.vy = 0; }
       if (this.y >= this.groundY) {
         /* Capture the impact velocity and drive it into the hip spring, so
@@ -516,13 +523,16 @@ var FX = FX || {};
     var c = this.chest();
     var hipY = this.y - this.hipH.v;
     var pp = this.pose();
+    var st = this.hairStyle;
     var hb = (pp.headA + 90 * this.facing) * D2R;
-    var ax = pp.headC[0] - Math.cos(hb) * L.headRX * 0.85;
-    var ay = pp.headC[1] - Math.sin(hb) * L.headRX * 0.85 + 1.5;
-    var seg = 5.2;
+    var ha2 = pp.headA * D2R;
+    // anchor: behind the crown by `back` head-radii, raised by `up`
+    var ax = pp.headC[0] - Math.cos(hb) * L.headRX * st.back + Math.cos(ha2) * st.up;
+    var ay = pp.headC[1] - Math.sin(hb) * L.headRX * st.back + Math.sin(ha2) * st.up;
+    var seg = st.seg;
     for (var i = 0; i < this.hair.length; i++) {
       var h = this.hair[i];
-      h.vy += 620 * dt;
+      h.vy += st.grav * dt;
       h.vx *= 0.965; h.vy *= 0.965;
       h.x += h.vx * dt; h.y += h.vy * dt;
       var px = i === 0 ? ax : this.hair[i - 1].x;
@@ -531,8 +541,12 @@ var FX = FX || {};
       var d = Math.sqrt(dx * dx + dy * dy) || 0.0001;
       var k = (d - seg) / d;
       h.x -= dx * k; h.y -= dy * k;
-      h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.55;
-      h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.55;
+      /* Feed a fraction of the positional correction back as velocity, so
+       * the chain swings instead of snapping rigid. At 0.55 it fed in more
+       * energy than the damping removed and the tail hung out sideways
+       * forever instead of settling. */
+      h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.22;
+      h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.22;
     }
     var bx = this.x - this.facing * 3, by = hipY + 3;
     for (var j = 0; j < this.belt.length; j++) {

@@ -21,6 +21,17 @@
  * Everything here is forward-shaded straight into the surface with a depth
  * test, and silhouette pixels are coverage-blended, so edges are smooth
  * without a separate anti-aliasing pass.
+ *
+ * A note on the shape of the code. The shading maths appears three times:
+ * once as Shader.prototype.px, and again inlined into the capsule and
+ * ellipsoid loops. That duplication is deliberate. At the resolution this
+ * runs at, those two primitives shade well over a hundred thousand pixels a
+ * frame, and a nine-argument method call per pixel -- plus reloading a dozen
+ * light constants off `this` each time -- was a large fraction of the frame.
+ * Inlined, the constants are hoisted into the loop prologue and the inner
+ * loop is straight-line arithmetic. px() remains the reference version and
+ * the one every other primitive uses; when the lighting model changes, all
+ * three change together.
  */
 var FX = FX || {};
 (function (F) {
@@ -29,7 +40,10 @@ var FX = FX || {};
   /* Materials: base colour, how shiny, how much rim. Tuned to read as
    * cloth / skin / metal rather than as tinted plastic. */
   function mat(r, g, b, spec, gloss, rim, sss) {
-    return { r: r, g: g, b: b, spec: spec === undefined ? 0.12 : spec,
+    /* nr/ng/nb are the albedo pre-divided by 255. Doing that division three
+     * times inside the pixel loop was costing more than the specular. */
+    return { r: r, g: g, b: b, nr: r / 255, ng: g / 255, nb: b / 255,
+      spec: spec === undefined ? 0.12 : spec,
       gloss: gloss || 12, rim: rim === undefined ? 0.5 : rim, sss: sss || 0 };
   }
   F.mat = mat;
@@ -42,6 +56,13 @@ var FX = FX || {};
   // the viewer *toward this direction*, which is what makes a lit side and a
   // dark side instead of a uniform glowing outline
   var BX = 0.66, BY = -0.34, BZ = -0.67;
+
+  /* Highlight rolloff. A hard clamp at 255 turns every lit area brighter
+   * than white into one flat plateau -- a white gi under a key light lost
+   * its folds entirely and read as cut paper. Above the knee, compress
+   * toward an asymptote at 255 instead, so a bright surface keeps its
+   * gradient all the way up. KSH is 1/(255-KNEE). */
+  var KNEE = 188, KSH = 1 / 67;
 
   function Shader(surf) {
     this.s = surf;
@@ -56,7 +77,10 @@ var FX = FX || {};
     this.rimR = 190; this.rimG = 214; this.rimB = 255;
     this.tint = 0;                                     // 0..1 hit flash
     this.tintR = 255; this.tintG = 255; this.tintB = 255;
-    this.occ = []; this.nOcc = 0;
+    /* Occluders live in a flat array rather than as objects: five property
+     * loads per occluder per shaded pixel was measurable once the surface
+     * grew. Layout is x, y, r2, z, k. */
+    this.occ = new Float64Array(64 * 5); this.nOcc = 0;
     this.ox = 0; this.oy = 0;                          // screen shake
     this.ghost = 0;                                    // >0 draws an afterimage
 
@@ -74,10 +98,10 @@ var FX = FX || {};
    * chest. Six discs is enough to read as ambient occlusion. */
   Shader.prototype.clearOcc = function () { this.nOcc = 0; };
   Shader.prototype.addOcc = function (x, y, r, z, k) {
-    var S = this.S;
-    var o = this.occ[this.nOcc] || (this.occ[this.nOcc] = {});
-    o.x = x * S + this.ox; o.y = y * S + this.oy; o.r = r * S;
-    o.r2 = o.r * o.r; o.z = z * S; o.k = k === undefined ? 0.5 : k;
+    if (this.nOcc >= 64) return;
+    var S = this.S, o = this.occ, i = this.nOcc * 5, rr = r * S;
+    o[i] = x * S + this.ox; o[i + 1] = y * S + this.oy; o[i + 2] = rr * rr;
+    o[i + 3] = z * S; o[i + 4] = k === undefined ? 0.5 : k;
     this.nOcc++;
   };
 
@@ -91,7 +115,8 @@ var FX = FX || {};
     this.s.clearDepthRect(this.bx0, this.by0, this.bx1, this.by1);
   };
 
-  /* Shade one pixel given its normal and depth, with coverage for the edge. */
+  /* Shade one pixel given its normal and depth, with coverage for the edge.
+   * The reference implementation of the lighting model. */
   Shader.prototype.px = function (x, y, nx, ny, nz, z, m, cov, ao) {
     // callers already clip to the shader's box; re-testing here cost a
     // branch on every covered pixel
@@ -110,42 +135,50 @@ var FX = FX || {};
     f *= 0.34;
 
     // Blinn specular against the key light
-    var sp = nx * this.HX + ny * this.HY + nz * this.HZ;
-    if (sp < 0) sp = 0;
-    else if (m.spec > 0.001) {
-      // integer gloss by repeated squaring beats Math.pow per pixel
-      var e = m.gloss, acc = 1, base = sp;
-      while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
-      sp = acc * m.spec;
-    } else sp = 0;
+    var sp = 0;
+    if (m.spec > 0.001) {
+      sp = nx * this.HX + ny * this.HY + nz * this.HZ;
+      if (sp <= 0) sp = 0;
+      else {
+        // integer gloss by repeated squaring beats Math.pow per pixel
+        var e = m.gloss, acc = 1, base = sp;
+        while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+        sp = acc * m.spec;
+      }
+    }
 
     // rim, gated by direction
     var rb = nx * BX + ny * BY + nz * BZ;
-    if (rb < 0) rb = 0;
-    var rim = 1 - nz;
-    rim = rim * rim * rim * rb * m.rim * 2.0;
+    var rim = 0;
+    if (rb > 0) {
+      rim = 1 - nz;
+      rim = rim * rim * rim * rb * m.rim * 2.0;
+    }
 
     var occ = ao === undefined ? 1 : ao;
     // per-pixel ambient occlusion from the body's own masses
-    for (var oi = 0; oi < this.nOcc; oi++) {
-      var o = this.occ[oi];
-      if (z <= o.z) continue;                       // only occluders in front
-      var odx = x - o.x, ody = y - o.y;
-      var od2 = odx * odx + ody * ody;
-      if (od2 >= o.r2) continue;
-      var dz = z - o.z; if (dz > 16) dz = 16;
-      occ *= 1 - o.k * (1 - od2 / o.r2) * dz * 0.0625;
+    var oa = this.occ;
+    for (var oi = 0, on = this.nOcc * 5; oi < on; oi += 5) {
+      var oz = oa[oi + 3];
+      if (z <= oz) continue;                        // only occluders in front
+      var odx = x - oa[oi], ody = y - oa[oi + 1];
+      var od2 = odx * odx + ody * ody, or2 = oa[oi + 2];
+      if (od2 >= or2) continue;
+      var dz = z - oz; if (dz > 16) dz = 16;
+      occ -= occ * oa[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
     }
 
     // subsurface warmth on the terminator; without it the cold fill light
     // makes skin read dead
     var sss = m.sss ? m.sss * (1 - d) * (nz * 0.6 + 0.4) : 0;
 
-    var r = ((this.ambR + this.keyR * d) * m.r / 255 + this.fillR * f * m.r / 255
+    // radiance, with the albedo factored out of the ambient/key/fill sum --
+    // three divisions per pixel used to live here
+    var r = (m.nr * (this.ambR + this.keyR * d + this.fillR * f)
       + this.keyR * sp + this.rimR * rim + 62 * sss) * occ;
-    var g = ((this.ambG + this.keyG * d) * m.g / 255 + this.fillG * f * m.g / 255
+    var g = (m.ng * (this.ambG + this.keyG * d + this.fillG * f)
       + this.keyG * sp + this.rimG * rim + 26 * sss) * occ;
-    var b = ((this.ambB + this.keyB * d) * m.b / 255 + this.fillB * f * m.b / 255
+    var b = (m.nb * (this.ambB + this.keyB * d + this.fillB * f)
       + this.keyB * sp + this.rimB * rim + 14 * sss) * occ;
 
     if (this.tint > 0) {
@@ -154,7 +187,9 @@ var FX = FX || {};
       var t = this.tint * 0.62;
       r += this.tintR * t; g += this.tintG * t; b += this.tintB * t;
     }
-    if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+    if (r > KNEE) r = KNEE + (r - KNEE) / (1 + (r - KNEE) * KSH);
+    if (g > KNEE) g = KNEE + (g - KNEE) / (1 + (g - KNEE) * KSH);
+    if (b > KNEE) b = KNEE + (b - KNEE) / (1 + (b - KNEE) * KSH);
     if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
 
     if (cov >= 0.995) {
@@ -178,34 +213,108 @@ var FX = FX || {};
     r0 *= S; r1 *= S; zb *= S;
     var dx = bx - ax, dy = by - ay;
     var seg = Math.sqrt(dx * dx + dy * dy);
-    if (seg < 0.0001) { this.sphere(ax, ay, Math.max(r0, r1), zb, m, ao); return; }
+    if (seg < 0.0001) { this.sphere(ax / S, ay / S, Math.max(r0, r1) / S, zb / S, m, ao); return; }
     var ux = dx / seg, uy = dy / seg;
-    var px = -uy, py = ux;
+    var perpX = -uy, perpY = ux;
     var rmax = Math.max(r0, r1);
+    /* Interior pixels are fully covered, so their distance to the axis is
+     * never needed -- only the edge band has to take the square root. On a
+     * fat limb that is nine pixels in ten. */
+    var rmin = Math.min(r0, r1), rin = rmin - 0.5, rin2 = rin > 0 ? rin * rin : -1;
 
     var x0 = Math.floor(Math.min(ax, bx) - rmax - 1), x1 = Math.ceil(Math.max(ax, bx) + rmax + 1);
     var y0 = Math.floor(Math.min(ay, by) - rmax - 1), y1 = Math.ceil(Math.max(ay, by) + rmax + 1);
     if (x0 < this.bx0) x0 = this.bx0; if (y0 < this.by0) y0 = this.by0;
     if (x1 > this.bx1) x1 = this.bx1; if (y1 > this.by1) y1 = this.by1;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    /* ---- shading prologue: everything constant over the primitive ---- */
+    var s = this.s, sw = s.w, spx = s.px, sdep = s.depth;
+    var ambR = this.ambR, ambG = this.ambG, ambB = this.ambB;
+    var keyR = this.keyR, keyG = this.keyG, keyB = this.keyB;
+    var fillR = this.fillR, fillG = this.fillG, fillB = this.fillB;
+    var rimR = this.rimR, rimG = this.rimG, rimB = this.rimB;
+    var HX = this.HX, HY = this.HY, HZ = this.HZ;
+    var mnr = m.nr, mng = m.ng, mnb = m.nb;
+    var mspec = m.spec, mgloss = m.gloss, mrim = m.rim, msss = m.sss;
+    var occA = this.occ, nOcc5 = this.nOcc * 5;
+    var ghost = this.ghost;
+    var tt = this.tint > 0 ? this.tint * 0.62 : 0;
+    var tR = this.tintR * tt, tG = this.tintG * tt, tB = this.tintB * tt;
+    if (ao === undefined) ao = 1;
 
     for (var y = y0; y < y1; y++) {
+      var vy0 = y + 0.5 - ay;
       for (var x = x0; x < x1; x++) {
-        var vx = x + 0.5 - ax, vy = y + 0.5 - ay;
-        var t = (vx * ux + vy * uy) / seg;
+        var vx = x + 0.5 - ax;
+        var t = (vx * ux + vy0 * uy) / seg;
         if (t < 0) t = 0; else if (t > 1) t = 1;
-        var qx = ax + ux * seg * t, qy = ay + uy * seg * t;
         var r = r0 + (r1 - r0) * t;
-        var ex = x + 0.5 - qx, ey = y + 0.5 - qy;
+        var ex = vx - ux * seg * t, ey = vy0 - uy * seg * t;
         var d2 = ex * ex + ey * ey;
         var rlim = r + 0.75;
         if (d2 > rlim * rlim) continue;               // reject before the sqrt
-        var dist = Math.sqrt(d2);
-        var cov = r + 0.5 - dist;
-        if (cov > 1) cov = 1; else if (cov <= 0) continue;
-        var u = (ex * px + ey * py) / r;
+        var cov = 1;
+        if (d2 > rin2) {
+          cov = r + 0.5 - Math.sqrt(d2);
+          if (cov > 1) cov = 1; else if (cov <= 0) continue;
+        }
+        var u = (ex * perpX + ey * perpY) / r;
         if (u > 1) u = 1; else if (u < -1) u = -1;
         var nz = Math.sqrt(1 - u * u);
-        this.px(x, y, px * u, py * u, nz, zb - nz * r, m, cov, ao);
+        var nx = perpX * u, ny = perpY * u;
+        var z = zb - nz * r;
+
+        /* ---- inlined from px(); see the note at the top of the file ---- */
+        var i = y * sw + x;
+        if (z >= sdep[i]) continue;
+        var cv = cov;
+        if (ghost > 0) cv *= ghost;
+        else if (cv >= 0.995) sdep[i] = z;
+        var dd = nx * LX + ny * LY + nz * LZ;
+        if (dd < 0) dd = 0;
+        dd = dd * 0.82 + 0.18;
+        var ff = nx * FX2 + ny * FY2 + nz * FZ2;
+        if (ff < 0) ff = 0;
+        ff *= 0.34;
+        var sp = 0;
+        if (mspec > 0.001) {
+          sp = nx * HX + ny * HY + nz * HZ;
+          if (sp <= 0) sp = 0;
+          else {
+            var e = mgloss, acc = 1, base = sp;
+            while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+            sp = acc * mspec;
+          }
+        }
+        var rim = 0, rb = nx * BX + ny * BY + nz * BZ;
+        if (rb > 0) { rim = 1 - nz; rim = rim * rim * rim * rb * mrim * 2.0; }
+        var occ = ao;
+        for (var oi = 0; oi < nOcc5; oi += 5) {
+          var oz = occA[oi + 3];
+          if (z <= oz) continue;
+          var odx = x - occA[oi], ody = y - occA[oi + 1];
+          var od2 = odx * odx + ody * ody, or2 = occA[oi + 2];
+          if (od2 >= or2) continue;
+          var dz = z - oz; if (dz > 16) dz = 16;
+          occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
+        }
+        var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
+        if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
+        if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);
+        if (cv >= 0.995) {
+          spx[i] = 0xff000000 | ((cb | 0) << 16) | ((cg | 0) << 8) | (cr | 0);
+        } else {
+          var v = spx[i], ia = 1 - cv;
+          spx[i] = 0xff000000 |
+            (((((v >>> 16) & 255) * ia + cb * cv) | 0) << 16) |
+            (((((v >>> 8) & 255) * ia + cg * cv) | 0) << 8) |
+            ((((v & 255) * ia + cr * cv) | 0));
+        }
       }
     }
   };
@@ -225,33 +334,122 @@ var FX = FX || {};
     var y0 = Math.floor(cy - rr - 1), y1 = Math.ceil(cy + rr + 1);
     if (x0 < this.bx0) x0 = this.bx0; if (y0 < this.by0) y0 = this.by0;
     if (x1 > this.bx1) x1 = this.bx1; if (y1 > this.by1) y1 = this.by1;
+    if (x1 <= x0 || y1 <= y0) return;
     var rz = (rx + ry) * 0.5;
+    var irx = 1 / rx, iry = 1 / ry;
+    /* Interior test in q-space: inside this the pixel is fully covered and
+     * neither the square root nor the edge gradient is needed. */
+    var rmn = Math.min(rx, ry);
+    var qin = rmn > 1.2 ? (1 - 1 / rmn) * (1 - 1 / rmn) : -1;
+
+    /* ---- shading prologue ---- */
+    var s = this.s, sw = s.w, spx = s.px, sdep = s.depth;
+    var ambR = this.ambR, ambG = this.ambG, ambB = this.ambB;
+    var keyR = this.keyR, keyG = this.keyG, keyB = this.keyB;
+    var fillR = this.fillR, fillG = this.fillG, fillB = this.fillB;
+    var rimR = this.rimR, rimG = this.rimG, rimB = this.rimB;
+    var HX = this.HX, HY = this.HY, HZ = this.HZ;
+    var mnr = m.nr, mng = m.ng, mnb = m.nb;
+    var mspec = m.spec, mgloss = m.gloss, mrim = m.rim, msss = m.sss;
+    var occA = this.occ, nOcc5 = this.nOcc * 5;
+    var ghost = this.ghost;
+    var tt = this.tint > 0 ? this.tint * 0.62 : 0;
+    var tR = this.tintR * tt, tG = this.tintG * tt, tB = this.tintB * tt;
+    if (ao === undefined) ao = 1;
 
     for (var y = y0; y < y1; y++) {
+      var dy = y + 0.5 - cy;
       for (var x = x0; x < x1; x++) {
-        var dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+        var dx = x + 0.5 - cx;
         // into the ellipse's own frame
         var lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
-        var a = lx / rx, b = ly / ry;
+        var a = lx * irx, b = ly * iry;
         var q = a * a + b * b;
         if (q > 1.3) continue;
-        var dq = Math.sqrt(q);
-        var cov = (1 - dq) * Math.min(rx, ry) + 0.5;
-        if (cov > 1) cov = 1; else if (cov <= 0) continue;
-        var nzs = 1 - q;
-        var nz = nzs > 0 ? Math.sqrt(nzs) : 0;
-        // normal in world frame
-        var nlx = a, nly = b;
-        var nx = nlx * ca - nly * sa, ny = nlx * sa + nly * ca;
-        var il = 1 / Math.max(0.0001, Math.sqrt(nx * nx + ny * ny + nz * nz));
-        this.px(x, y, nx * il, ny * il, nz * il, zb - nz * rz, m, cov, ao);
+        var cov = 1;
+        if (q > qin) {
+          /* Coverage from the true distance to the ellipse, which is the
+           * implicit value divided by its own gradient. Scaling by min(rx,ry)
+           * instead -- the old shortcut -- made a wide-but-short ellipse fade
+           * out along its long sides and stay hard on its short ones. */
+          var dq = Math.sqrt(q);
+          var ga = a * irx, gb = b * iry;
+          var gl = Math.sqrt(ga * ga + gb * gb);
+          cov = gl > 1e-6 ? 0.5 + (1 - dq) * dq / gl : 1;
+          if (cov > 1) cov = 1; else if (cov <= 0) continue;
+        }
+        /* For q <= 1 the frame normal (a, b, sqrt(1-q)) is already unit
+         * length by construction; only the antialiased fringe outside the
+         * ellipse needs rescaling. */
+        var nzs = 1 - q, nx, ny, nz;
+        if (nzs > 0) {
+          nz = Math.sqrt(nzs);
+          nx = a * ca - b * sa; ny = a * sa + b * ca;
+        } else {
+          nz = 0;
+          var il = 1 / Math.sqrt(q);
+          var a2 = a * il, b2 = b * il;
+          nx = a2 * ca - b2 * sa; ny = a2 * sa + b2 * ca;
+        }
+        var z = zb - nz * rz;
+
+        /* ---- inlined from px(); see the note at the top of the file ---- */
+        var i = y * sw + x;
+        if (z >= sdep[i]) continue;
+        var cv = cov;
+        if (ghost > 0) cv *= ghost;
+        else if (cv >= 0.995) sdep[i] = z;
+        var dd = nx * LX + ny * LY + nz * LZ;
+        if (dd < 0) dd = 0;
+        dd = dd * 0.82 + 0.18;
+        var ff = nx * FX2 + ny * FY2 + nz * FZ2;
+        if (ff < 0) ff = 0;
+        ff *= 0.34;
+        var sp = 0;
+        if (mspec > 0.001) {
+          sp = nx * HX + ny * HY + nz * HZ;
+          if (sp <= 0) sp = 0;
+          else {
+            var e = mgloss, acc = 1, base = sp;
+            while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+            sp = acc * mspec;
+          }
+        }
+        var rim = 0, rb = nx * BX + ny * BY + nz * BZ;
+        if (rb > 0) { rim = 1 - nz; rim = rim * rim * rim * rb * mrim * 2.0; }
+        var occ = ao;
+        for (var oi = 0; oi < nOcc5; oi += 5) {
+          var oz = occA[oi + 3];
+          if (z <= oz) continue;
+          var odx = x - occA[oi], ody = y - occA[oi + 1];
+          var od2 = odx * odx + ody * ody, or2 = occA[oi + 2];
+          if (od2 >= or2) continue;
+          var dz = z - oz; if (dz > 16) dz = 16;
+          occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
+        }
+        var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
+        if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
+        if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);
+        if (cv >= 0.995) {
+          spx[i] = 0xff000000 | ((cb | 0) << 16) | ((cg | 0) << 8) | (cr | 0);
+        } else {
+          var v = spx[i], ia = 1 - cv;
+          spx[i] = 0xff000000 |
+            (((((v >>> 16) & 255) * ia + cb * cv) | 0) << 16) |
+            (((((v >>> 8) & 255) * ia + cg * cv) | 0) << 8) |
+            ((((v & 255) * ia + cr * cv) | 0));
+        }
       }
     }
   };
 
   /* A flat convex polygon, shaded as a slab facing the viewer with a soft
    * bevel toward its edges. Used for cloth panels and blades, where a tube
-   * would read wrong. */
+   * would read wrong. Coordinates are already in device space. */
   Shader.prototype.polySlab = function (pts, zb, m, bevel, ao) {
     var n = pts.length, i;
     var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;

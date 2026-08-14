@@ -292,6 +292,17 @@ var FX = FX || {};
  * Everything here is forward-shaded straight into the surface with a depth
  * test, and silhouette pixels are coverage-blended, so edges are smooth
  * without a separate anti-aliasing pass.
+ *
+ * A note on the shape of the code. The shading maths appears three times:
+ * once as Shader.prototype.px, and again inlined into the capsule and
+ * ellipsoid loops. That duplication is deliberate. At the resolution this
+ * runs at, those two primitives shade well over a hundred thousand pixels a
+ * frame, and a nine-argument method call per pixel -- plus reloading a dozen
+ * light constants off `this` each time -- was a large fraction of the frame.
+ * Inlined, the constants are hoisted into the loop prologue and the inner
+ * loop is straight-line arithmetic. px() remains the reference version and
+ * the one every other primitive uses; when the lighting model changes, all
+ * three change together.
  */
 var FX = FX || {};
 (function (F) {
@@ -300,7 +311,10 @@ var FX = FX || {};
   /* Materials: base colour, how shiny, how much rim. Tuned to read as
    * cloth / skin / metal rather than as tinted plastic. */
   function mat(r, g, b, spec, gloss, rim, sss) {
-    return { r: r, g: g, b: b, spec: spec === undefined ? 0.12 : spec,
+    /* nr/ng/nb are the albedo pre-divided by 255. Doing that division three
+     * times inside the pixel loop was costing more than the specular. */
+    return { r: r, g: g, b: b, nr: r / 255, ng: g / 255, nb: b / 255,
+      spec: spec === undefined ? 0.12 : spec,
       gloss: gloss || 12, rim: rim === undefined ? 0.5 : rim, sss: sss || 0 };
   }
   F.mat = mat;
@@ -313,6 +327,13 @@ var FX = FX || {};
   // the viewer *toward this direction*, which is what makes a lit side and a
   // dark side instead of a uniform glowing outline
   var BX = 0.66, BY = -0.34, BZ = -0.67;
+
+  /* Highlight rolloff. A hard clamp at 255 turns every lit area brighter
+   * than white into one flat plateau -- a white gi under a key light lost
+   * its folds entirely and read as cut paper. Above the knee, compress
+   * toward an asymptote at 255 instead, so a bright surface keeps its
+   * gradient all the way up. KSH is 1/(255-KNEE). */
+  var KNEE = 188, KSH = 1 / 67;
 
   function Shader(surf) {
     this.s = surf;
@@ -327,7 +348,10 @@ var FX = FX || {};
     this.rimR = 190; this.rimG = 214; this.rimB = 255;
     this.tint = 0;                                     // 0..1 hit flash
     this.tintR = 255; this.tintG = 255; this.tintB = 255;
-    this.occ = []; this.nOcc = 0;
+    /* Occluders live in a flat array rather than as objects: five property
+     * loads per occluder per shaded pixel was measurable once the surface
+     * grew. Layout is x, y, r2, z, k. */
+    this.occ = new Float64Array(64 * 5); this.nOcc = 0;
     this.ox = 0; this.oy = 0;                          // screen shake
     this.ghost = 0;                                    // >0 draws an afterimage
 
@@ -345,10 +369,10 @@ var FX = FX || {};
    * chest. Six discs is enough to read as ambient occlusion. */
   Shader.prototype.clearOcc = function () { this.nOcc = 0; };
   Shader.prototype.addOcc = function (x, y, r, z, k) {
-    var S = this.S;
-    var o = this.occ[this.nOcc] || (this.occ[this.nOcc] = {});
-    o.x = x * S + this.ox; o.y = y * S + this.oy; o.r = r * S;
-    o.r2 = o.r * o.r; o.z = z * S; o.k = k === undefined ? 0.5 : k;
+    if (this.nOcc >= 64) return;
+    var S = this.S, o = this.occ, i = this.nOcc * 5, rr = r * S;
+    o[i] = x * S + this.ox; o[i + 1] = y * S + this.oy; o[i + 2] = rr * rr;
+    o[i + 3] = z * S; o[i + 4] = k === undefined ? 0.5 : k;
     this.nOcc++;
   };
 
@@ -362,7 +386,8 @@ var FX = FX || {};
     this.s.clearDepthRect(this.bx0, this.by0, this.bx1, this.by1);
   };
 
-  /* Shade one pixel given its normal and depth, with coverage for the edge. */
+  /* Shade one pixel given its normal and depth, with coverage for the edge.
+   * The reference implementation of the lighting model. */
   Shader.prototype.px = function (x, y, nx, ny, nz, z, m, cov, ao) {
     // callers already clip to the shader's box; re-testing here cost a
     // branch on every covered pixel
@@ -381,42 +406,50 @@ var FX = FX || {};
     f *= 0.34;
 
     // Blinn specular against the key light
-    var sp = nx * this.HX + ny * this.HY + nz * this.HZ;
-    if (sp < 0) sp = 0;
-    else if (m.spec > 0.001) {
-      // integer gloss by repeated squaring beats Math.pow per pixel
-      var e = m.gloss, acc = 1, base = sp;
-      while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
-      sp = acc * m.spec;
-    } else sp = 0;
+    var sp = 0;
+    if (m.spec > 0.001) {
+      sp = nx * this.HX + ny * this.HY + nz * this.HZ;
+      if (sp <= 0) sp = 0;
+      else {
+        // integer gloss by repeated squaring beats Math.pow per pixel
+        var e = m.gloss, acc = 1, base = sp;
+        while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+        sp = acc * m.spec;
+      }
+    }
 
     // rim, gated by direction
     var rb = nx * BX + ny * BY + nz * BZ;
-    if (rb < 0) rb = 0;
-    var rim = 1 - nz;
-    rim = rim * rim * rim * rb * m.rim * 2.0;
+    var rim = 0;
+    if (rb > 0) {
+      rim = 1 - nz;
+      rim = rim * rim * rim * rb * m.rim * 2.0;
+    }
 
     var occ = ao === undefined ? 1 : ao;
     // per-pixel ambient occlusion from the body's own masses
-    for (var oi = 0; oi < this.nOcc; oi++) {
-      var o = this.occ[oi];
-      if (z <= o.z) continue;                       // only occluders in front
-      var odx = x - o.x, ody = y - o.y;
-      var od2 = odx * odx + ody * ody;
-      if (od2 >= o.r2) continue;
-      var dz = z - o.z; if (dz > 16) dz = 16;
-      occ *= 1 - o.k * (1 - od2 / o.r2) * dz * 0.0625;
+    var oa = this.occ;
+    for (var oi = 0, on = this.nOcc * 5; oi < on; oi += 5) {
+      var oz = oa[oi + 3];
+      if (z <= oz) continue;                        // only occluders in front
+      var odx = x - oa[oi], ody = y - oa[oi + 1];
+      var od2 = odx * odx + ody * ody, or2 = oa[oi + 2];
+      if (od2 >= or2) continue;
+      var dz = z - oz; if (dz > 16) dz = 16;
+      occ -= occ * oa[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
     }
 
     // subsurface warmth on the terminator; without it the cold fill light
     // makes skin read dead
     var sss = m.sss ? m.sss * (1 - d) * (nz * 0.6 + 0.4) : 0;
 
-    var r = ((this.ambR + this.keyR * d) * m.r / 255 + this.fillR * f * m.r / 255
+    // radiance, with the albedo factored out of the ambient/key/fill sum --
+    // three divisions per pixel used to live here
+    var r = (m.nr * (this.ambR + this.keyR * d + this.fillR * f)
       + this.keyR * sp + this.rimR * rim + 62 * sss) * occ;
-    var g = ((this.ambG + this.keyG * d) * m.g / 255 + this.fillG * f * m.g / 255
+    var g = (m.ng * (this.ambG + this.keyG * d + this.fillG * f)
       + this.keyG * sp + this.rimG * rim + 26 * sss) * occ;
-    var b = ((this.ambB + this.keyB * d) * m.b / 255 + this.fillB * f * m.b / 255
+    var b = (m.nb * (this.ambB + this.keyB * d + this.fillB * f)
       + this.keyB * sp + this.rimB * rim + 14 * sss) * occ;
 
     if (this.tint > 0) {
@@ -425,7 +458,9 @@ var FX = FX || {};
       var t = this.tint * 0.62;
       r += this.tintR * t; g += this.tintG * t; b += this.tintB * t;
     }
-    if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+    if (r > KNEE) r = KNEE + (r - KNEE) / (1 + (r - KNEE) * KSH);
+    if (g > KNEE) g = KNEE + (g - KNEE) / (1 + (g - KNEE) * KSH);
+    if (b > KNEE) b = KNEE + (b - KNEE) / (1 + (b - KNEE) * KSH);
     if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
 
     if (cov >= 0.995) {
@@ -449,34 +484,108 @@ var FX = FX || {};
     r0 *= S; r1 *= S; zb *= S;
     var dx = bx - ax, dy = by - ay;
     var seg = Math.sqrt(dx * dx + dy * dy);
-    if (seg < 0.0001) { this.sphere(ax, ay, Math.max(r0, r1), zb, m, ao); return; }
+    if (seg < 0.0001) { this.sphere(ax / S, ay / S, Math.max(r0, r1) / S, zb / S, m, ao); return; }
     var ux = dx / seg, uy = dy / seg;
-    var px = -uy, py = ux;
+    var perpX = -uy, perpY = ux;
     var rmax = Math.max(r0, r1);
+    /* Interior pixels are fully covered, so their distance to the axis is
+     * never needed -- only the edge band has to take the square root. On a
+     * fat limb that is nine pixels in ten. */
+    var rmin = Math.min(r0, r1), rin = rmin - 0.5, rin2 = rin > 0 ? rin * rin : -1;
 
     var x0 = Math.floor(Math.min(ax, bx) - rmax - 1), x1 = Math.ceil(Math.max(ax, bx) + rmax + 1);
     var y0 = Math.floor(Math.min(ay, by) - rmax - 1), y1 = Math.ceil(Math.max(ay, by) + rmax + 1);
     if (x0 < this.bx0) x0 = this.bx0; if (y0 < this.by0) y0 = this.by0;
     if (x1 > this.bx1) x1 = this.bx1; if (y1 > this.by1) y1 = this.by1;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    /* ---- shading prologue: everything constant over the primitive ---- */
+    var s = this.s, sw = s.w, spx = s.px, sdep = s.depth;
+    var ambR = this.ambR, ambG = this.ambG, ambB = this.ambB;
+    var keyR = this.keyR, keyG = this.keyG, keyB = this.keyB;
+    var fillR = this.fillR, fillG = this.fillG, fillB = this.fillB;
+    var rimR = this.rimR, rimG = this.rimG, rimB = this.rimB;
+    var HX = this.HX, HY = this.HY, HZ = this.HZ;
+    var mnr = m.nr, mng = m.ng, mnb = m.nb;
+    var mspec = m.spec, mgloss = m.gloss, mrim = m.rim, msss = m.sss;
+    var occA = this.occ, nOcc5 = this.nOcc * 5;
+    var ghost = this.ghost;
+    var tt = this.tint > 0 ? this.tint * 0.62 : 0;
+    var tR = this.tintR * tt, tG = this.tintG * tt, tB = this.tintB * tt;
+    if (ao === undefined) ao = 1;
 
     for (var y = y0; y < y1; y++) {
+      var vy0 = y + 0.5 - ay;
       for (var x = x0; x < x1; x++) {
-        var vx = x + 0.5 - ax, vy = y + 0.5 - ay;
-        var t = (vx * ux + vy * uy) / seg;
+        var vx = x + 0.5 - ax;
+        var t = (vx * ux + vy0 * uy) / seg;
         if (t < 0) t = 0; else if (t > 1) t = 1;
-        var qx = ax + ux * seg * t, qy = ay + uy * seg * t;
         var r = r0 + (r1 - r0) * t;
-        var ex = x + 0.5 - qx, ey = y + 0.5 - qy;
+        var ex = vx - ux * seg * t, ey = vy0 - uy * seg * t;
         var d2 = ex * ex + ey * ey;
         var rlim = r + 0.75;
         if (d2 > rlim * rlim) continue;               // reject before the sqrt
-        var dist = Math.sqrt(d2);
-        var cov = r + 0.5 - dist;
-        if (cov > 1) cov = 1; else if (cov <= 0) continue;
-        var u = (ex * px + ey * py) / r;
+        var cov = 1;
+        if (d2 > rin2) {
+          cov = r + 0.5 - Math.sqrt(d2);
+          if (cov > 1) cov = 1; else if (cov <= 0) continue;
+        }
+        var u = (ex * perpX + ey * perpY) / r;
         if (u > 1) u = 1; else if (u < -1) u = -1;
         var nz = Math.sqrt(1 - u * u);
-        this.px(x, y, px * u, py * u, nz, zb - nz * r, m, cov, ao);
+        var nx = perpX * u, ny = perpY * u;
+        var z = zb - nz * r;
+
+        /* ---- inlined from px(); see the note at the top of the file ---- */
+        var i = y * sw + x;
+        if (z >= sdep[i]) continue;
+        var cv = cov;
+        if (ghost > 0) cv *= ghost;
+        else if (cv >= 0.995) sdep[i] = z;
+        var dd = nx * LX + ny * LY + nz * LZ;
+        if (dd < 0) dd = 0;
+        dd = dd * 0.82 + 0.18;
+        var ff = nx * FX2 + ny * FY2 + nz * FZ2;
+        if (ff < 0) ff = 0;
+        ff *= 0.34;
+        var sp = 0;
+        if (mspec > 0.001) {
+          sp = nx * HX + ny * HY + nz * HZ;
+          if (sp <= 0) sp = 0;
+          else {
+            var e = mgloss, acc = 1, base = sp;
+            while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+            sp = acc * mspec;
+          }
+        }
+        var rim = 0, rb = nx * BX + ny * BY + nz * BZ;
+        if (rb > 0) { rim = 1 - nz; rim = rim * rim * rim * rb * mrim * 2.0; }
+        var occ = ao;
+        for (var oi = 0; oi < nOcc5; oi += 5) {
+          var oz = occA[oi + 3];
+          if (z <= oz) continue;
+          var odx = x - occA[oi], ody = y - occA[oi + 1];
+          var od2 = odx * odx + ody * ody, or2 = occA[oi + 2];
+          if (od2 >= or2) continue;
+          var dz = z - oz; if (dz > 16) dz = 16;
+          occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
+        }
+        var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
+        if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
+        if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);
+        if (cv >= 0.995) {
+          spx[i] = 0xff000000 | ((cb | 0) << 16) | ((cg | 0) << 8) | (cr | 0);
+        } else {
+          var v = spx[i], ia = 1 - cv;
+          spx[i] = 0xff000000 |
+            (((((v >>> 16) & 255) * ia + cb * cv) | 0) << 16) |
+            (((((v >>> 8) & 255) * ia + cg * cv) | 0) << 8) |
+            ((((v & 255) * ia + cr * cv) | 0));
+        }
       }
     }
   };
@@ -496,33 +605,122 @@ var FX = FX || {};
     var y0 = Math.floor(cy - rr - 1), y1 = Math.ceil(cy + rr + 1);
     if (x0 < this.bx0) x0 = this.bx0; if (y0 < this.by0) y0 = this.by0;
     if (x1 > this.bx1) x1 = this.bx1; if (y1 > this.by1) y1 = this.by1;
+    if (x1 <= x0 || y1 <= y0) return;
     var rz = (rx + ry) * 0.5;
+    var irx = 1 / rx, iry = 1 / ry;
+    /* Interior test in q-space: inside this the pixel is fully covered and
+     * neither the square root nor the edge gradient is needed. */
+    var rmn = Math.min(rx, ry);
+    var qin = rmn > 1.2 ? (1 - 1 / rmn) * (1 - 1 / rmn) : -1;
+
+    /* ---- shading prologue ---- */
+    var s = this.s, sw = s.w, spx = s.px, sdep = s.depth;
+    var ambR = this.ambR, ambG = this.ambG, ambB = this.ambB;
+    var keyR = this.keyR, keyG = this.keyG, keyB = this.keyB;
+    var fillR = this.fillR, fillG = this.fillG, fillB = this.fillB;
+    var rimR = this.rimR, rimG = this.rimG, rimB = this.rimB;
+    var HX = this.HX, HY = this.HY, HZ = this.HZ;
+    var mnr = m.nr, mng = m.ng, mnb = m.nb;
+    var mspec = m.spec, mgloss = m.gloss, mrim = m.rim, msss = m.sss;
+    var occA = this.occ, nOcc5 = this.nOcc * 5;
+    var ghost = this.ghost;
+    var tt = this.tint > 0 ? this.tint * 0.62 : 0;
+    var tR = this.tintR * tt, tG = this.tintG * tt, tB = this.tintB * tt;
+    if (ao === undefined) ao = 1;
 
     for (var y = y0; y < y1; y++) {
+      var dy = y + 0.5 - cy;
       for (var x = x0; x < x1; x++) {
-        var dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+        var dx = x + 0.5 - cx;
         // into the ellipse's own frame
         var lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
-        var a = lx / rx, b = ly / ry;
+        var a = lx * irx, b = ly * iry;
         var q = a * a + b * b;
         if (q > 1.3) continue;
-        var dq = Math.sqrt(q);
-        var cov = (1 - dq) * Math.min(rx, ry) + 0.5;
-        if (cov > 1) cov = 1; else if (cov <= 0) continue;
-        var nzs = 1 - q;
-        var nz = nzs > 0 ? Math.sqrt(nzs) : 0;
-        // normal in world frame
-        var nlx = a, nly = b;
-        var nx = nlx * ca - nly * sa, ny = nlx * sa + nly * ca;
-        var il = 1 / Math.max(0.0001, Math.sqrt(nx * nx + ny * ny + nz * nz));
-        this.px(x, y, nx * il, ny * il, nz * il, zb - nz * rz, m, cov, ao);
+        var cov = 1;
+        if (q > qin) {
+          /* Coverage from the true distance to the ellipse, which is the
+           * implicit value divided by its own gradient. Scaling by min(rx,ry)
+           * instead -- the old shortcut -- made a wide-but-short ellipse fade
+           * out along its long sides and stay hard on its short ones. */
+          var dq = Math.sqrt(q);
+          var ga = a * irx, gb = b * iry;
+          var gl = Math.sqrt(ga * ga + gb * gb);
+          cov = gl > 1e-6 ? 0.5 + (1 - dq) * dq / gl : 1;
+          if (cov > 1) cov = 1; else if (cov <= 0) continue;
+        }
+        /* For q <= 1 the frame normal (a, b, sqrt(1-q)) is already unit
+         * length by construction; only the antialiased fringe outside the
+         * ellipse needs rescaling. */
+        var nzs = 1 - q, nx, ny, nz;
+        if (nzs > 0) {
+          nz = Math.sqrt(nzs);
+          nx = a * ca - b * sa; ny = a * sa + b * ca;
+        } else {
+          nz = 0;
+          var il = 1 / Math.sqrt(q);
+          var a2 = a * il, b2 = b * il;
+          nx = a2 * ca - b2 * sa; ny = a2 * sa + b2 * ca;
+        }
+        var z = zb - nz * rz;
+
+        /* ---- inlined from px(); see the note at the top of the file ---- */
+        var i = y * sw + x;
+        if (z >= sdep[i]) continue;
+        var cv = cov;
+        if (ghost > 0) cv *= ghost;
+        else if (cv >= 0.995) sdep[i] = z;
+        var dd = nx * LX + ny * LY + nz * LZ;
+        if (dd < 0) dd = 0;
+        dd = dd * 0.82 + 0.18;
+        var ff = nx * FX2 + ny * FY2 + nz * FZ2;
+        if (ff < 0) ff = 0;
+        ff *= 0.34;
+        var sp = 0;
+        if (mspec > 0.001) {
+          sp = nx * HX + ny * HY + nz * HZ;
+          if (sp <= 0) sp = 0;
+          else {
+            var e = mgloss, acc = 1, base = sp;
+            while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+            sp = acc * mspec;
+          }
+        }
+        var rim = 0, rb = nx * BX + ny * BY + nz * BZ;
+        if (rb > 0) { rim = 1 - nz; rim = rim * rim * rim * rb * mrim * 2.0; }
+        var occ = ao;
+        for (var oi = 0; oi < nOcc5; oi += 5) {
+          var oz = occA[oi + 3];
+          if (z <= oz) continue;
+          var odx = x - occA[oi], ody = y - occA[oi + 1];
+          var od2 = odx * odx + ody * ody, or2 = occA[oi + 2];
+          if (od2 >= or2) continue;
+          var dz = z - oz; if (dz > 16) dz = 16;
+          occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
+        }
+        var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
+        if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
+        if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);
+        if (cv >= 0.995) {
+          spx[i] = 0xff000000 | ((cb | 0) << 16) | ((cg | 0) << 8) | (cr | 0);
+        } else {
+          var v = spx[i], ia = 1 - cv;
+          spx[i] = 0xff000000 |
+            (((((v >>> 16) & 255) * ia + cb * cv) | 0) << 16) |
+            (((((v >>> 8) & 255) * ia + cg * cv) | 0) << 8) |
+            ((((v & 255) * ia + cr * cv) | 0));
+        }
       }
     }
   };
 
   /* A flat convex polygon, shaded as a slab facing the viewer with a soft
    * bevel toward its edges. Used for cloth panels and blades, where a tube
-   * would read wrong. */
+   * would read wrong. Coordinates are already in device space. */
   Shader.prototype.polySlab = function (pts, zb, m, bevel, ao) {
     var n = pts.length, i;
     var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
@@ -748,8 +946,14 @@ var FX = FX || {};
     this.blinkT = 0;
 
     // secondary motion
+    /* Hairstyle is per-character: the number of verlet points, how far apart
+     * they sit and how thick they are drawn. One shared four-point chain of
+     * fat segments gave both fighters the same heavy ponytail, and at this
+     * resolution it read as a blob rather than hair. */
+    this.hairStyle = (skin && skin.hairStyle) || { n: 3, seg: 3.6, r0: 3.4, taper: 0.8,
+      back: 0.78, up: 1.4, grav: 620 };
     this.hair = [];
-    for (var i = 0; i < 4; i++) this.hair.push({ x: 0, y: 0, vx: 0, vy: 0 });
+    for (var i = 0; i < this.hairStyle.n; i++) this.hair.push({ x: 0, y: 0, vx: 0, vy: 0 });
     this.belt = [{ x: 0, y: 0, vx: 0, vy: 0 }, { x: 0, y: 0, vx: 0, vy: 0 }];
     this.trail = [];
   }
@@ -813,8 +1017,9 @@ var FX = FX || {};
     if (!this.onGround) {
       this.vy += 1800 * dt;
       this.y += this.vy * dt;
-      // ceiling, so a juggle cannot carry anyone out of frame
-      var ceil = this.groundY - 132;
+      // ceiling, so a juggle cannot carry anyone out of frame. The match
+      // sets ceilY from its own framing; this is only the fallback.
+      var ceil = this.ceilY !== undefined ? this.ceilY : this.groundY - 132;
       if (this.y < ceil) { this.y = ceil; if (this.vy < 0) this.vy = 0; }
       if (this.y >= this.groundY) {
         /* Capture the impact velocity and drive it into the hip spring, so
@@ -1084,13 +1289,16 @@ var FX = FX || {};
     var c = this.chest();
     var hipY = this.y - this.hipH.v;
     var pp = this.pose();
+    var st = this.hairStyle;
     var hb = (pp.headA + 90 * this.facing) * D2R;
-    var ax = pp.headC[0] - Math.cos(hb) * L.headRX * 0.85;
-    var ay = pp.headC[1] - Math.sin(hb) * L.headRX * 0.85 + 1.5;
-    var seg = 5.2;
+    var ha2 = pp.headA * D2R;
+    // anchor: behind the crown by `back` head-radii, raised by `up`
+    var ax = pp.headC[0] - Math.cos(hb) * L.headRX * st.back + Math.cos(ha2) * st.up;
+    var ay = pp.headC[1] - Math.sin(hb) * L.headRX * st.back + Math.sin(ha2) * st.up;
+    var seg = st.seg;
     for (var i = 0; i < this.hair.length; i++) {
       var h = this.hair[i];
-      h.vy += 620 * dt;
+      h.vy += st.grav * dt;
       h.vx *= 0.965; h.vy *= 0.965;
       h.x += h.vx * dt; h.y += h.vy * dt;
       var px = i === 0 ? ax : this.hair[i - 1].x;
@@ -1099,8 +1307,12 @@ var FX = FX || {};
       var d = Math.sqrt(dx * dx + dy * dy) || 0.0001;
       var k = (d - seg) / d;
       h.x -= dx * k; h.y -= dy * k;
-      h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.55;
-      h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.55;
+      /* Feed a fraction of the positional correction back as velocity, so
+       * the chain swings instead of snapping rigid. At 0.55 it fed in more
+       * energy than the damping removed and the tail hung out sideways
+       * forever instead of settling. */
+      h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.22;
+      h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.22;
     }
     var bx = this.x - this.facing * 3, by = hipY + 3;
     for (var j = 0; j < this.belt.length; j++) {
@@ -1212,29 +1424,67 @@ var FX = FX || {};
   var Z = { farLeg: 34, farArm: 28, hipD: 22, torso: 20, belt: 17, neck: 16,
     head: 12, hair: 10, nearLeg: 6, nearArm: 1 };
 
+  function shade(c, k) {
+    return [Math.min(255, c[0] * k), Math.min(255, c[1] * k), Math.min(255, c[2] * k)];
+  }
+
   function mkSkin(o) {
+    /* The face materials are derived from the skin rather than authored, so
+     * a new character only has to name one colour and still gets a socket
+     * that is the right hue of dark and a lip that is the right hue of red.
+     * They are built once: allocating them per frame inside drawHead was
+     * three objects per head per frame for no reason. */
+    var sk = o.skin;
+    var dark = shade(sk, 0.70), deep = shade(sk, 0.52);
+    var lit = shade(sk, 1.10);
+    var lip = [Math.min(255, sk[0] * 0.92), sk[1] * 0.70, sk[2] * 0.68];
     return {
-      skin: F.mat(o.skin[0], o.skin[1], o.skin[2], 0.22, 30, 0.5, 1.0),
+      skin: F.mat(sk[0], sk[1], sk[2], 0.22, 30, 0.5, 1.0),
+      // sockets, the underside of the jaw, the shadow beside the nose
+      skinDark: F.mat(dark[0], dark[1], dark[2], 0.16, 24, 0.4, 1.0),
+      skinDeep: F.mat(deep[0], deep[1], deep[2], 0.10, 18, 0.3, 0.9),
+      // the planes that catch light: nose bridge, cheekbone, brow
+      skinLit: F.mat(lit[0], lit[1], lit[2], 0.30, 34, 0.6, 1.0),
+      lip: F.mat(lip[0], lip[1], lip[2], 0.34, 26, 0.4, 0.8),
+      sclera: F.mat(232, 228, 232, 0.30, 26, 0.25),
+      iris: F.mat(46, 38, 52, 0.80, 64, 0.3),
       gi: F.mat(o.gi[0], o.gi[1], o.gi[2], 0.02, 4, 0.34),
       gi2: F.mat(o.gi2[0], o.gi2[1], o.gi2[2], 0.02, 4, 0.30),
       trim: F.mat(o.trim[0], o.trim[1], o.trim[2], 0.16, 20, 0.5),
-      hair: F.mat(o.hair[0], o.hair[1], o.hair[2], 0.34, 34, 0.7),
+      /* Hair used to be spec 0.34 / gloss 34, which at this resolution put a
+       * single hard highlight on the crown and made it read as moulded
+       * vinyl. Real hair scatters: broad and weak. */
+      hair: F.mat(o.hair[0], o.hair[1], o.hair[2], 0.10, 12, 0.62),
+      hairLit: F.mat(Math.min(255, o.hair[0] * 1.55 + 14), Math.min(255, o.hair[1] * 1.5 + 12),
+        Math.min(255, o.hair[2] * 1.45 + 16), 0.14, 14, 0.7),
       metal: F.mat(210, 218, 232, 0.75, 60, 1.0),
-      name: o.name, tint: o.tint || [255, 210, 120]
+      name: o.name, tint: o.tint || [255, 210, 120],
+      hairStyle: o.hairStyle,
+      // per-character face proportions, so the two heads are not one head
+      brow: o.brow || 1, jaw: o.jaw || 1, nose: o.nose || 1
     };
   }
   F.mkSkin = mkSkin;
 
   F.SKINS = {
+    /* KAI: white gi, red belt, short topknot. The gi is authored well below
+     * white -- at 238 the key light drove nearly the whole garment past
+     * clipping and every fold vanished. */
     kai: mkSkin({
       name: 'KAI',
-      skin: [232, 176, 138], gi: [238, 240, 246], gi2: [206, 210, 222],
-      trim: [206, 46, 62], hair: [38, 34, 44], tint: [255, 220, 150]
+      skin: [232, 176, 138], gi: [206, 202, 196], gi2: [158, 154, 152],
+      trim: [206, 46, 62], hair: [34, 30, 40], tint: [255, 220, 150],
+      hairStyle: { n: 3, seg: 3.0, r0: 3.2, taper: 0.72, back: 0.62, up: 3.2, grav: 520 },
+      brow: 1.15, jaw: 1.10, nose: 1.0
     }),
+    /* RYO: blue gi, gold belt, a long braid that swings. Narrower jaw and a
+     * lighter brow so the two silhouettes are not the same face. */
     ryo: mkSkin({
       name: 'RYO',
       skin: [206, 150, 112], gi: [58, 92, 168], gi2: [40, 66, 124],
-      trim: [242, 196, 72], hair: [58, 40, 30], tint: [150, 200, 255]
+      trim: [242, 196, 72], hair: [58, 40, 30], tint: [150, 200, 255],
+      hairStyle: { n: 4, seg: 4.2, r0: 2.9, taper: 0.5, back: 0.86, up: 0.4, grav: 700 },
+      brow: 0.86, jaw: 0.92, nose: 1.12
     })
   };
 
@@ -1377,53 +1627,132 @@ var FX = FX || {};
     }
   }
 
+  /* The head.
+   *
+   * The fighters face each other, so the head is always seen in near
+   * profile, and a profile is carried almost entirely by its silhouette:
+   * brow, nose, lips and chin have to *break the outline*, not sit painted
+   * on an egg. Everything below is placed in a head-local frame -- `fwd`
+   * runs toward the opponent, `up` runs toward the crown -- so the whole
+   * face follows the head's tilt for free.
+   *
+   * Depth is the delicate part. Each primitive is a solid whose surface
+   * bulges toward the viewer by its own mean radius, so a large volume can
+   * swallow a small one placed nearer in z. That is why the hair is built
+   * from masses that avoid the face rather than one cap laid over it: a cap
+   * wide enough to cover the cranium also bulges out over the eye, and the
+   * face went black behind it.
+   */
   function drawHead(sh, p, f, sk, fw) {
     var ha = p.headA * Math.PI / 180;
-    sh.capsule(p.neck[0], p.neck[1], p.headC[0] - Math.cos(ha) * L.headRY * 0.7,
-      p.headC[1] - Math.sin(ha) * L.headRY * 0.7, 4.6, 4.2, Z.neck, sk.skin, 0.88);
-    // skull and jaw
-    sh.ellipsoid(p.headC[0], p.headC[1], L.headRX, L.headRY, ha + Math.PI / 2, Z.head, sk.skin, 1);
-    var jaw = [p.headC[0] - Math.cos(ha) * 3.4 + Math.cos(ha + Math.PI / 2 * fw) * 2.6,
-      p.headC[1] - Math.sin(ha) * 3.4 + Math.sin(ha + Math.PI / 2 * fw) * 2.6];
-    sh.ellipsoid(jaw[0], jaw[1], 4.4, 4.0, ha, Z.head - 1, sk.skin, 0.99);
+    var fa = ha + Math.PI / 2 * fw;
+    var fx = Math.cos(fa), fy = Math.sin(fa);          // toward the opponent
+    var ux2 = Math.cos(ha), uy2 = Math.sin(ha);        // toward the crown
+    var hx = p.headC[0], hy = p.headC[1];
+    var R = L.headRX, RY = L.headRY;
+    var BR = sk.brow, JW = sk.jaw, NS = sk.nose;   // per-character proportions
 
-    // hair: a cap set back off the brow, plus the verlet tail
-    var bx = Math.cos(ha + Math.PI / 2 * fw), by = Math.sin(ha + Math.PI / 2 * fw);
-    sh.ellipsoid(p.headC[0] + Math.cos(ha) * 2.2 - bx * 1.5,
-      p.headC[1] + Math.sin(ha) * 2.2 - by * 1.5,
-      L.headRX * 0.98, L.headRY * 0.74, ha + Math.PI / 2, Z.hair, sk.hair, 1);
-    var prev = [p.headC[0] - Math.cos(ha + Math.PI / 2 * fw) * L.headRX * 0.7 + Math.cos(ha) * 2,
-      p.headC[1] - Math.sin(ha + Math.PI / 2 * fw) * L.headRX * 0.7 + Math.sin(ha) * 2];
+    function at(fwd, up) { return [hx + fx * fwd + ux2 * up, hy + fy * fwd + uy2 * up]; }
+
+    /* Both helpers take the depth of the feature's *front surface*, not the
+     * depth of its centre.
+     *
+     * This matters more than it sounds. A primitive's surface bulges toward
+     * the viewer by its own mean radius, so at equal centre depth a large
+     * volume comes forward and a small one does not. Layering the face by
+     * centre depth therefore buried every small feature inside the skull it
+     * was supposed to sit on: the eyelash was nominally two units in front
+     * of the eye white and rendered a unit behind it. Ordering by front
+     * surface is the thing the code actually means. */
+    function fp(fwd, up, rx, ry, rot, zf, m, a) {
+      sh.ellipsoid(hx + fx * fwd + ux2 * up, hy + fy * fwd + uy2 * up,
+        rx, ry, ha + rot, zf + (rx + ry) * 0.5, m, a === undefined ? 1 : a);
+    }
+    function fc(f0, u0, f1, u1, r0, r1, zf, m, a) {
+      sh.capsule(hx + fx * f0 + ux2 * u0, hy + fy * f0 + uy2 * u0,
+        hx + fx * f1 + ux2 * u1, hy + fy * f1 + uy2 * u1,
+        r0, r1, zf + (r0 > r1 ? r0 : r1), m, a === undefined ? 1 : a);
+    }
+    var HZ = Math.PI / 2;   // "upright in head space" for ellipsoid rotation
+    var FS = 4.4;           // front of the skull; everything else is relative
+
+    /* ---- neck ---- */
+    var nb = at(0, -RY * 0.66);
+    sh.capsule(p.neck[0], p.neck[1], nb[0], nb[1], 5.4, 4.9, Z.neck, sk.skin, 0.86);
+    // sternocleidomastoid: the cord from behind the ear to the collarbone.
+    // Without it the neck is a dowel.
+    fc(-1.4, -RY * 0.55, 2.4, -RY * 1.22, 1.6, 1.15, FS + 2.6, sk.skinLit, 0.9);
+    // the gi collar, so the neck meets the shoulders instead of vanishing
+    fc(-3.6, -RY * 1.28, 3.4, -RY * 1.34, 2.6, 2.2, FS + 3.4, sk.gi2, 0.86);
+
+    /* ---- skull and face masses ---- */
+    // cranium, set back: the brain case is behind the face, not centred on it
+    fp(-0.9, 1.5, R * 0.94, RY * 0.94, HZ, FS, sk.skin, 1);
+    // cheek / maxilla
+    fp(2.3, -1.0, R * 0.76, RY * 0.70, HZ, FS - 0.25, sk.skin, 1);
+    // jaw, and a chin that leaves the outline
+    fp(1.8, -5.2, 4.4 * JW, 3.1, HZ, FS - 0.35, sk.skin, 0.98);
+    fp(4.5, -4.9, 1.9 * JW, 1.7, HZ, FS - 0.55, sk.skinLit, 1);
+    // under-jaw shadow, sitting behind the jaw so it only shows at the edge
+    fc(-2.0, -6.0, 3.2, -6.8, 2.2, 1.8, FS + 0.4, sk.skinDeep, 0.72);
+    // cheekbone: the plane that catches light and gives the face structure
+    fc(0.6, 1.4, 4.6, 0.2, 2.0, 1.4, FS - 0.45, sk.skinLit, 1);
+
+    /* ---- brow, nose, mouth: the silhouette breakers ---- */
+    // brow ridge, lit on top, and the shadow it casts into the socket
+    fc(0.4, 3.4, 5.4, 2.9, 2.0 * BR, 1.5 * BR, FS - 0.65, sk.skinLit, 1);
+    fp(4.2, 1.5, 3.0, 1.7, HZ, FS - 0.50, sk.skinDark, 0.80);
+
+    // nose: bridge from between the brows out to a tip past the outline
+    fc(4.6, 3.0, R * 0.98 * NS, -0.5, 1.5, 1.9, FS - 0.95, sk.skinLit, 1);
+    fp(R * 1.02 * NS, -1.1, 2.0, 1.8, HZ, FS - 1.10, sk.skin, 1);
+    // the wing of the nostril, and the shadow under it
+    fp(R * 0.70 * NS, -2.1, 1.05, 0.8, HZ, FS - 0.85, sk.skinDark, 0.92);
+
+    // lips, and the crease between them
+    fp(R * 0.84, -3.4, 1.55, 0.85, HZ, FS - 0.80, sk.lip, 1);
+    fp(R * 0.78, -4.3, 1.6, 0.95, HZ, FS - 0.85, sk.lip, 1);
+    fc(R * 0.48, -3.82, R * 0.94, -3.94, 0.42, 0.34, FS - 1.05, sk.skinDeep, 0.9);
+
+    /* ---- eye ---- */
+    var open = f.blinkT % f.blink > 0.13 ? 1 : 0.12;
+    var ey = 0.4;
+    fp(4.8, ey, 2.25, 1.65 * open, HZ, FS - 0.70, sk.sclera, 1);
+    fp(5.6, ey - 0.1, 1.15, 1.35 * open, HZ, FS - 0.90, sk.iris, 1);
+    // catchlight -- one bright cluster is what makes an eye look alive
+    if (open > 0.5) fp(5.95, ey + 0.62, 0.5, 0.44, HZ, FS - 1.30, sk.sclera, 1.4);
+    // upper lid and lash line, which also give the eye an expression
+    fc(2.8, ey + 1.9, 6.5, ey + 1.35, 1.0, 0.78, FS - 0.80, sk.skin, 0.92);
+    fc(3.2, ey + 1.35, 6.5, ey + 0.9, 0.38, 0.30, FS - 1.05, sk.hair, 1);
+    // eyebrow
+    fc(2.0, ey + 3.3, 6.1, ey + 2.6, 0.78 * BR, 0.46 * BR, FS - 1.00, sk.hair, 1);
+
+    /* ---- ear ---- */
+    fp(-3.4, -0.6, 1.7, 2.5, HZ - 0.2 * fw, FS - 0.60, sk.skin, 0.94);
+    fp(-3.4, -0.8, 0.9, 1.5, HZ - 0.2 * fw, FS - 0.75, sk.skinDeep, 0.8);
+
+    /* ---- hair ----
+     * Built from masses that stop short of the face, so nothing has to be
+     * depth-tricked out of the way of the eye. */
+    fp(-2.9, 3.0, R * 0.82, RY * 0.78, HZ, FS - 0.20, sk.hair, 1);
+    fp(-4.8, -1.0, R * 0.50, RY * 0.62, HZ, FS - 0.05, sk.hair, 0.94);
+    // fringe over the forehead, swept back off the brow
+    fp(1.9, RY * 0.72, 4.6, 2.5, HZ + 0.26 * fw, FS - 0.55, sk.hair, 1);
+    // a lit strand across the crown, so the mass is not one flat silhouette
+    fc(-5.0, RY * 0.72, 2.2, RY * 0.90, 1.15, 0.85, FS - 0.75, sk.hairLit, 1);
+    // sideburn, in front of the ear
+    fc(-2.2, 2.2, -2.0, -2.4, 1.25, 0.85, FS - 0.68, sk.hair, 0.95);
+
+    /* The tail. Radii come from the hairstyle, so KAI's short topknot and
+     * RYO's braid are the same four lines of code and different silhouettes. */
+    var st = f.hairStyle, hr = st.r0;
+    var prev = at(-R * st.back, st.up);
     for (var i = 0; i < f.hair.length; i++) {
       var h = f.hair[i];
-      sh.capsule(prev[0], prev[1], h.x, h.y, 5.2 - i * 0.9, 4.4 - i * 0.9, Z.hair + 1, sk.hair, 0.95);
+      var ra = hr * Math.pow(st.taper, i), rb2 = hr * Math.pow(st.taper, i + 1);
+      sh.capsule(prev[0], prev[1], h.x, h.y, ra, rb2, FS + 0.2 + ra, sk.hair, 0.95);
       prev = [h.x, h.y];
     }
-
-    /* Face. At this size it is three marks -- brow, nose, mouth -- but
-     * without them the head is an egg and the character has no direction. */
-    var fx = Math.cos(ha + Math.PI / 2 * fw), fy = Math.sin(ha + Math.PI / 2 * fw);
-    var ux2 = Math.cos(ha), uy2 = Math.sin(ha);
-    function fp(fwd, up, r1, r2, rot, z, m, a) {
-      sh.ellipsoid(p.headC[0] + fx * fwd + ux2 * up, p.headC[1] + fy * fwd + uy2 * up,
-        r1, r2, rot, z, m, a === undefined ? 1 : a);
-    }
-    // nose
-    fp(L.headRX * 0.92, -0.4, 2.3, 1.9, ha, Z.head - 2, sk.skin, 1.04);
-    // brow shelf, in darkened skin -- drawing it in hair put a visor over
-    // the eye and the face read as a blank
-    fp(L.headRX * 0.60, 3.4, 2.6, 1.0, ha + Math.PI / 2, Z.head - 2, sk.skin, 0.66);
-    // eyebrow
-    fp(L.headRX * 0.62, 4.6, 2.3, 0.75, ha + Math.PI / 2, Z.head - 3, sk.hair, 1);
-    // eye: a sclera makes it read at this size; a dark dot never will
-    var open = f.blinkT % f.blink > 0.13 ? 1 : 0.16;
-    fp(L.headRX * 0.60, 0.9, 2.4, 1.9 * open, ha + Math.PI / 2, Z.head - 3,
-      F.mat(226, 222, 228, 0.3, 30, 0.25));
-    fp(L.headRX * 0.72, 0.9, 1.3, 1.5 * open, ha + Math.PI / 2, Z.head - 4,
-      F.mat(38, 30, 44, 0.6, 50, 0.2));
-    // mouth line
-    fp(L.headRX * 0.66, -3.4, 1.7, 0.75, ha + Math.PI / 2, Z.head - 3,
-      F.mat(150, 84, 78, 0.1, 10, 0.2));
   }
 
   F.Z = Z;
@@ -1504,10 +1833,22 @@ var FX = FX || {};
 (function (F) {
   'use strict';
 
-  var W = 480, H = 270;               // world units
-  var SCALE = 2;                      // device pixels per world unit
-  var GROUND = 232;
-  var WALL_L = 34, WALL_R = W - 34;
+  /* Framing. The world is the camera's view in abstract units; SCALE turns
+   * it into device pixels. Tightening the view from 480x270 to 400x225 (at
+   * a matching scale, so the surface stays 1440x810) is a pure zoom: the
+   * fighters are ~150 units tall, which was 55% of frame height and is now
+   * two thirds -- the proportion a fighting game actually uses. Nothing
+   * about the characters changed, only how much room they are given. */
+  var W = 444, H = 250;               // world units
+  var SCALE = 3.24;                   // device pixels per world unit
+  var GROUND = 216;
+  var WALL_TOP = 118;                 // top of the temple wall, in world units
+  var WALL_L = 30, WALL_R = W - 30;
+  var BAY = 62;                       // pillar-to-pillar pitch, in world units
+  /* How high a launched fighter may go. A juggle that carries someone off
+   * the top of the frame is not readable, and the headroom depends on the
+   * framing above -- so it lives here with the framing, not in the fighter. */
+  var CEIL = GROUND - 72;
 
   /* ---- stage ---------------------------------------------------------- */
 
@@ -1517,74 +1858,151 @@ var FX = FX || {};
     return ((n ^ (n >> 16)) >>> 0) / 4294967296;
   }
 
+  /* Where the lanterns hang. The floor pools are placed from the same list,
+   * so the light on the ground always agrees with the light source. */
+  var LANTERNS = (function () {
+    var a = [];
+    for (var i = 0; i * BAY + 34 < W; i++) a.push(34 + i * BAY);
+    return a;
+  })();
+
+  /* The stage.
+   *
+   * The previous version failed on value structure: sky, wall and floor all
+   * sat in the same narrow band of dark purple-brown, so the frame read as
+   * one flat slab with two characters pasted on it. A stage needs its planes
+   * separated -- bright sky, dark mid-ground, mid floor -- and it needs
+   * light that visibly lands somewhere. Everything here is painted once into
+   * a backing surface and copied per frame, so detail is free at runtime.
+   */
   function paintStage(bg) {
     var S = SCALE, w = bg.w, h = bg.h;
-    // dusk sky
-    bg.gradientV(0, 0, w, GROUND * S, F.rgb(48, 36, 62), F.rgb(196, 118, 96));
-    // sun haze
-    bg.addDisc(w * 0.66, GROUND * S * 0.74, 190 * S / 2, 255, 176, 120, 0.5);
-    bg.addDisc(w * 0.66, GROUND * S * 0.74, 90 * S / 2, 255, 214, 160, 0.55);
-
-    // far mountains
+    var wallTop = WALL_TOP * S, fy = GROUND * S, wallH = fy - wallTop;
     var i, x, y;
+
+    /* ---- sky ---- */
+    bg.gradientV(0, 0, w, wallTop + 2, F.rgb(28, 24, 52), F.rgb(214, 132, 96));
+    // the sun, low and mostly behind the wall: a light source you can see
+    var sunX = w * 0.70, sunY = wallTop - 4 * S;
+    bg.addDisc(sunX, sunY, 62 * S, 255, 150, 92, 0.42);
+    bg.addDisc(sunX, sunY, 30 * S, 255, 190, 130, 0.55);
+    bg.addDisc(sunX, sunY, 15 * S, 255, 232, 196, 0.85);
+
+    /* ---- distant ranges, hazing toward the sky as they recede ---- */
     for (i = 0; i < 3; i++) {
-      var baseY = (GROUND - 44 - i * 9) * S;
-      var amp = (26 - i * 6) * S;
-      var col = F.rgb(52 + i * 12, 44 + i * 12, 70 + i * 10);
+      var baseY = (WALL_TOP - 2 - i * 11) * S;
+      var amp = (30 - i * 8) * S;
+      // nearer ranges are darker; the far one is nearly sky
+      var k = i / 2;
+      var col = F.rgb(44 + k * 74, 36 + k * 54, 62 + k * 40);
       for (x = 0; x < w; x++) {
         var t = x / w;
-        var yy = baseY - Math.abs(Math.sin(t * (5 + i * 3) + i)) * amp
+        var yy = baseY - Math.abs(Math.sin(t * (5 + i * 3) + i * 2.1)) * amp
           - Math.sin(t * (17 + i * 7)) * amp * 0.22;
-        bg.fillRect(x, yy, 1, baseY - yy + 6 * S, col);
+        bg.fillRect(x, yy, 1, baseY - yy + 8 * S, col);
       }
     }
 
-    // temple wall behind the arena
-    var wallTop = (GROUND - 132) * S, wallH = (GROUND - 6) * S - wallTop;
-    bg.gradientV(0, wallTop, w, wallH, F.rgb(74, 56, 62), F.rgb(44, 32, 40));
+    /* ---- temple wall ---- */
+    bg.gradientV(0, wallTop, w, wallH, F.rgb(62, 44, 52), F.rgb(26, 18, 24));
+    // recessed bays between the pillars: an inset plane with a lit lintel and
+    // a shadowed sill, which is what stops the wall reading as one surface
+    for (i = 0; i * BAY + 12 < W; i++) {
+      var bx = (12 + i * BAY) * S, bw2 = 44 * S;
+      var by = wallTop + 9 * S, bh2 = wallH - 20 * S;
+      bg.gradientV(bx, by, bw2, bh2, F.rgb(46, 33, 40), F.rgb(26, 19, 25));
+      bg.fillRect(bx, by, bw2, 1.4 * S, F.rgb(84, 62, 62));          // lit lintel
+      bg.fillRect(bx, by + bh2 - 1.4 * S, bw2, 1.4 * S, F.rgb(12, 8, 12));
+      // a lit window deep in the bay
+      bg.blendRect(bx + 15 * S, by + 12 * S, 14 * S, 20 * S, 226, 146, 78, 0.30);
+      bg.addDisc(bx + 22 * S, by + 22 * S, 16 * S, 255, 156, 74, 0.13);
+    }
     // pillars
-    for (i = 0; i < 7; i++) {
-      var px = (24 + i * 74) * S;
-      bg.gradientV(px, wallTop, 15 * S, wallH, F.rgb(96, 74, 78), F.rgb(52, 38, 46));
-      bg.fillRect(px, wallTop, 2 * S, wallH, F.rgb(126, 100, 100));
-      bg.fillRect(px + 13 * S, wallTop, 2 * S, wallH, F.rgb(34, 24, 30));
-      // capital
-      bg.fillRect(px - 3 * S, wallTop, 21 * S, 5 * S, F.rgb(108, 84, 86));
-      bg.fillRect(px - 3 * S, wallTop, 21 * S, 1.5 * S, F.rgb(148, 120, 116));
-    }
-    // hanging lanterns
-    for (i = 0; i < 6; i++) {
-      var lx = (52 + i * 76) * S, ly = (GROUND - 148) * S;
-      bg.fillRect(lx, wallTop - 22 * S, 1 * S, 22 * S, F.rgb(40, 30, 34));
-      bg.addDisc(lx, ly + 8 * S, 16 * S, 255, 150, 70, 0.30);
+    for (i = 0; i * BAY + 2 < W + BAY; i++) {
+      var px = (2 + i * BAY) * S, pw = 10 * S;
+      bg.gradientV(px, wallTop, pw, wallH, F.rgb(104, 78, 76), F.rgb(38, 27, 32));
+      bg.fillRect(px, wallTop, 1.6 * S, wallH, F.rgb(142, 112, 104));  // lit edge
+      bg.fillRect(px + pw - 1.6 * S, wallTop, 1.6 * S, wallH, F.rgb(20, 14, 18));
+      // capital and base
+      bg.fillRect(px - 2.4 * S, wallTop, pw + 4.8 * S, 4.5 * S, F.rgb(116, 88, 84));
+      bg.fillRect(px - 2.4 * S, wallTop, pw + 4.8 * S, 1.4 * S, F.rgb(164, 132, 120));
+      bg.fillRect(px - 2 * S, fy - 6 * S, pw + 4 * S, 6 * S, F.rgb(74, 55, 56));
+      bg.fillRect(px - 2 * S, fy - 6 * S, pw + 4 * S, 1.2 * S, F.rgb(112, 86, 80));
     }
 
-    // floor: a stone platform in perspective
-    var fy = GROUND * S;
-    bg.gradientV(0, fy, w, h - fy, F.rgb(92, 72, 68), F.rgb(30, 24, 26));
-    // boards converging slightly, plus grain
-    for (y = 0; y < h - fy; y++) {
-      var d = y / (h - fy);
-      var lineC = F.rgb(70 - d * 30, 54 - d * 22, 52 - d * 22);
-      if (y % Math.round(9 * S) === 0) bg.fillRect(0, fy + y, w, 1, lineC);
+    /* ---- spectators on the wall top ----
+     * Silhouettes against the bright sky. Nothing sells "this is a place
+     * where a fight is happening" like an audience, and against a light sky
+     * they cost one dark shape and one warm rim each. */
+    for (i = 0; i * 11.6 < W + 12; i++) {
+      var cx2 = (6 + i * 11.6 + hash(i, 21) * 5) * S;
+      var hh = (7 + hash(i, 5) * 3.5) * S;
+      var cy2 = wallTop - hh * 0.55;
+      var bob = hash(i, 9);
+      bg.blendDisc(cx2, cy2 - hh * 0.5, hh * 0.42, 16, 11, 20, 0.94);      // head
+      bg.blendDisc(cx2, cy2 + hh * 0.35, hh * 0.66, 16, 11, 20, 0.94);     // shoulders
+      // warm rim from the sky behind them
+      bg.blendDisc(cx2 - hh * 0.12, cy2 - hh * 0.62, hh * 0.3, 206, 128, 92, 0.22 + bob * 0.2);
     }
-    for (i = 0; i < 2600; i++) {
-      var gx = (hash(i, 7) * w) | 0, gy = (fy + hash(i, 11) * (h - fy)) | 0;
+    // the balustrade they stand behind
+    bg.fillRect(0, wallTop - 1.5 * S, w, 3.2 * S, F.rgb(92, 68, 68));
+    bg.fillRect(0, wallTop - 1.5 * S, w, 1.1 * S, F.rgb(140, 108, 98));
+
+    /* ---- lanterns ---- */
+    for (i = 0; i < LANTERNS.length; i++) {
+      var lx = LANTERNS[i] * S, ly = (WALL_TOP + 26) * S;
+      bg.fillRect(lx - 0.5 * S, wallTop + 3 * S, 1 * S, ly - wallTop - 3 * S, F.rgb(30, 22, 26));
+      // paper body, lit from inside
+      bg.blendRect(lx - 4 * S, ly, 8 * S, 11 * S, 236, 154, 84, 0.95);
+      bg.blendRect(lx - 4 * S, ly, 8 * S, 2 * S, 255, 206, 150, 0.9);
+      bg.fillRect(lx - 4.6 * S, ly - 1.4 * S, 9.2 * S, 1.6 * S, F.rgb(46, 32, 30));
+      bg.fillRect(lx - 4.6 * S, ly + 11 * S, 9.2 * S, 1.6 * S, F.rgb(46, 32, 30));
+      bg.addDisc(lx, ly + 5 * S, 26 * S, 255, 150, 66, 0.30);
+      bg.addDisc(lx, ly + 5 * S, 11 * S, 255, 200, 130, 0.42);
+    }
+
+    /* ---- floor ---- */
+    bg.gradientV(0, fy, w, h - fy, F.rgb(104, 80, 72), F.rgb(26, 20, 22));
+    var fh = h - fy;
+    for (y = 0; y < fh; y++) {
+      var d = y / fh;
+      if (y % Math.round(8 * S) === 0) {
+        bg.fillRect(0, fy + y, w, Math.max(1, 0.5 * S), F.rgb(74 - d * 34, 56 - d * 26, 52 - d * 24));
+      }
+    }
+    // the lanterns land on the floor: warm pools directly below each one
+    for (i = 0; i < LANTERNS.length; i++) {
+      var px2 = LANTERNS[i] * S;
+      for (var q = 0; q < 4; q++) {
+        var rr = (34 - q * 7) * S;
+        bg.addDisc(px2, fy + 9 * S, rr, 255, 152, 74, 0.055);
+        bg.addDisc(px2, fy + 9 * S, rr * 0.5, 255, 190, 120, 0.03);
+      }
+    }
+    // grain
+    for (i = 0; i < 3400; i++) {
+      var gx = (hash(i, 7) * w) | 0, gy = (fy + hash(i, 11) * fh) | 0;
       var v = hash(i, 3);
-      bg.blendPx(gx, gy, 210, 180, 150, 0.05 + v * 0.07);
+      bg.blendPx(gx, gy, 214, 186, 156, 0.04 + v * 0.07);
     }
-    // front edge highlight
-    bg.fillRect(0, fy, w, 1.5 * S, F.rgb(150, 120, 104));
-    bg.fillRect(0, fy - 1 * S, w, 1 * S, F.rgb(58, 42, 44));
+    // the lip of the platform -- a hard bright line is what reads as an edge
+    bg.fillRect(0, fy - 1.2 * S, w, 1.2 * S, F.rgb(46, 32, 34));
+    bg.fillRect(0, fy, w, 1.6 * S, F.rgb(178, 138, 108));
+    bg.fillRect(0, fy + 1.6 * S, w, 1.4 * S, F.rgb(96, 72, 62));
 
+    /* ---- atmosphere ---- */
+    // haze pooling at the base of the wall pushes it back behind the fighters
+    for (y = 0; y < 26 * S; y++) {
+      var t2 = 1 - y / (26 * S);
+      bg.blendRect(0, fy - y, w, 1, 150, 96, 96, 0.10 * t2 * t2);
+    }
     // vignette
     for (y = 0; y < h; y++) {
-      for (x = 0; x < w; x += 1) {
-        var dx = (x / w - 0.5) * 2, dy = (y / h - 0.5) * 2;
-        var r = dx * dx * 0.7 + dy * dy * 0.9;
-        if (r < 0.55) { x += 0; continue; }
-        var k = Math.min(0.62, (r - 0.55) * 0.85);
-        bg.blendPx(x, y, 8, 6, 14, k);
+      for (x = 0; x < w; x++) {
+        var vx = (x / w - 0.5) * 2, vy = (y / h - 0.5) * 2;
+        var r2 = vx * vx * 0.72 + vy * vy * 0.92;
+        if (r2 < 0.42) continue;
+        bg.blendPx(x, y, 6, 4, 12, Math.min(0.66, (r2 - 0.42) * 0.9));
       }
     }
   }
@@ -1662,9 +2080,9 @@ var FX = FX || {};
   /* ---- match ---------------------------------------------------------- */
 
   function Match(canvas) {
-    this.surf = new F.Surface(W * SCALE, H * SCALE);
+    this.surf = new F.Surface(Math.round(W * SCALE), Math.round(H * SCALE));
     this.surf.attach(canvas);
-    this.bg = new F.Surface(W * SCALE, H * SCALE);
+    this.bg = new F.Surface(Math.round(W * SCALE), Math.round(H * SCALE));
     paintStage(this.bg);
 
     this.sh = new F.Shader(this.surf);
@@ -1915,6 +2333,7 @@ var FX = FX || {};
     this.drive(this.b, cb, this.a);
 
     this.a.setGround(GROUND); this.b.setGround(GROUND);
+    this.a.ceilY = CEIL; this.b.ceilY = CEIL;
     this.a.update(dt, ca); this.b.update(dt, cb);
 
     this.resolve(this.a, this.b);
@@ -1983,7 +2402,7 @@ var FX = FX || {};
     /* Parallax: sky barely moves, the temple wall drifts, the floor tracks
      * the fighters exactly so their feet stay glued to it. */
     var cx = this.camX * S;
-    var skyY = (GROUND - 132) * S, flrY = GROUND * S;
+    var skyY = WALL_TOP * S, flrY = GROUND * S;
     surf.copyBand(this.bg, 0, skyY, ox - cx * 0.15);
     surf.copyBand(this.bg, skyY, flrY, ox - cx * 0.55);
     surf.copyBand(this.bg, flrY, surf.h, ox - cx);
@@ -2003,13 +2422,17 @@ var FX = FX || {};
       F.drawFighter(this.sh, f);
       // motion arc: the working limb's recent path, additively. Free from a
       // solved pose; a sprite sheet would need extra art for every frame.
+      /* Motion arc: the working limb's recent path. Additive streaks stack
+       * where the samples overlap, so the alpha has to be small -- at the
+       * old value a rising uppercut painted a solid white bar across the
+       * screen brighter than anything else in frame. */
       var tc = f.skin.tint;
       for (var g = 0; g < f.trail.length; g++) {
-        var seg = f.trail[g], al = 0.055 + g * 0.032;
+        var seg = f.trail[g], al = 0.012 + g * 0.009;
         surf.addStreak(seg[0][0] * S + pan, seg[0][1] * S + oy,
-          seg[1][0] * S + pan, seg[1][1] * S + oy, 5 * S, tc[0], tc[1], tc[2], al * 0.5);
+          seg[1][0] * S + pan, seg[1][1] * S + oy, 3.0 * S, tc[0], tc[1], tc[2], al * 0.5);
         surf.addStreak(seg[1][0] * S + pan, seg[1][1] * S + oy,
-          seg[2][0] * S + pan, seg[2][1] * S + oy, 4.5 * S, tc[0], tc[1], tc[2], al);
+          seg[2][0] * S + pan, seg[2][1] * S + oy, 2.4 * S, tc[0], tc[1], tc[2], al);
       }
     }
 
@@ -2085,7 +2508,7 @@ var FX = FX || {};
 
   Match.prototype.hud = function (surf) {
     var S = SCALE, w = surf.w;
-    var bw = 186 * S, bh = 13 * S, by = 14 * S;
+    var bw = 152 * S, bh = 11 * S, by = 12 * S, mg = 14 * S;
     // chip bars trail the real value
     if (this.ghostA === undefined) { this.ghostA = 1; this.ghostB = 1; }
     var ha = this.a.hp / this.a.maxHp, hb = this.b.hp / this.b.maxHp;
@@ -2099,29 +2522,31 @@ var FX = FX || {};
     }
     var ca = hc(ha, this.tHud || 0), cb2 = hc(hb, this.tHud || 0);
     this.tHud = (this.tHud || 0) + 1;
-    bar(surf, 20 * S, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
-    bar(surf, w - 20 * S - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
+    bar(surf, mg, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
+    bar(surf, w - mg - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
     // super meters
-    bar(surf, 20 * S, by + bh + 5 * S, bw * 0.62, 5 * S, this.a.meter / 100, 90, 190, 255, false);
-    bar(surf, w - 20 * S - bw * 0.62, by + bh + 5 * S, bw * 0.62, 5 * S, this.b.meter / 100, 90, 190, 255, true);
+    bar(surf, mg, by + bh + 4 * S, bw * 0.58, 4 * S, this.a.meter / 100, 90, 190, 255, false);
+    bar(surf, w - mg - bw * 0.58, by + bh + 4 * S, bw * 0.58, 4 * S, this.b.meter / 100, 90, 190, 255, true);
 
-    text(surf, this.a.name, 20 * S, by + bh + 13 * S, 1.6 * S, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+    var np = 1.5 * S;
+    text(surf, this.a.name, mg, by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
     var nb = this.b.name;
-    text(surf, nb, w - 20 * S - textW(nb, 1.6 * S), by + bh + 13 * S, 1.6 * S, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+    text(surf, nb, w - mg - textW(nb, np), by + bh + 11 * S, np, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
 
     // timer
     var ts = String(Math.max(0, Math.ceil(this.time)));
     if (ts.length < 2) ts = '0' + ts;
-    var tp = 4 * S;
-    surf.fillRect(w / 2 - 22 * S, by - 3 * S, 44 * S, 26 * S, F.rgb(18, 16, 22));
-    text(surf, ts, w / 2 - textW(ts, tp) / 2, by + 1 * S, tp, F.rgb(255, 236, 190), F.rgb(20, 10, 8));
+    var tp = 3.4 * S;
+    surf.fillRect(w / 2 - 19 * S, by - 3 * S, 38 * S, 23 * S, F.rgb(18, 16, 22));
+    surf.fillRect(w / 2 - 17 * S, by - 1 * S, 34 * S, 19 * S, F.rgb(10, 8, 12));
+    text(surf, ts, w / 2 - textW(ts, tp) / 2, by + 1.5 * S, tp, F.rgb(255, 236, 190), F.rgb(20, 10, 8));
 
     // round pips
     for (var i = 0; i < 2; i++) {
       for (var k = 0; k < 2; k++) {
-        var px = i ? w - 26 * S - k * 12 * S : 20 * S + k * 12 * S;
+        var px = i ? w - mg - 6 * S - k * 10 * S : mg + k * 10 * S;
         var on = this.wins[i] > k;
-        surf.fillRect(px, by + bh + 22 * S, 7 * S, 7 * S, on ? F.rgb(255, 206, 90) : F.rgb(58, 50, 56));
+        surf.fillRect(px, by + bh + 19 * S, 6 * S, 6 * S, on ? F.rgb(255, 206, 90) : F.rgb(58, 50, 56));
       }
     }
 
@@ -2145,7 +2570,7 @@ var FX = FX || {};
         F.rgb(255, 210, 120), F.rgb(20, 10, 8));
     }
     if (this.demo) {
-      text(surf, 'DEMO', w / 2 - textW('DEMO', 2 * S) / 2, surf.h - 16 * S, 2 * S,
+      text(surf, 'DEMO', w / 2 - textW('DEMO', 1.8 * S) / 2, surf.h - 13 * S, 1.8 * S,
         F.rgb(200, 190, 180), F.rgb(10, 8, 12));
     }
   };
