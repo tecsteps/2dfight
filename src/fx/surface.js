@@ -60,12 +60,38 @@ var FX = FX || {};
       var sy = y - dy; if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
       var so = sy * W, dof = y * W;
       if (dx === 0) { dst.set(src.subarray(so, so + W), dof); continue; }
-      for (var x = 0; x < W; x++) {
-        var sx = x - dx; if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
-        dst[dof + x] = src[so + sx];
+      // the shifted span is one contiguous row copy; only the exposed edge
+      // needs filling, and it fills with the clamped edge pixel
+      if (dx > 0) {
+        dst.set(src.subarray(so, so + W - dx), dof + dx);
+        dst.fill(src[so], dof, dof + dx);
+      } else {
+        var n = W + dx;
+        dst.set(src.subarray(so - dx, so + W), dof);
+        dst.fill(src[so + W - 1], dof + n, dof + W);
       }
     }
   };
+  /* Copy a horizontal band with its own x offset. Parallax is just this,
+   * called once per depth layer. */
+  Surface.prototype.copyBand = function (other, y0, y1, dx) {
+    dx = Math.round(dx);
+    var W = this.w, src = other.px, dst = this.px;
+    y0 = Math.max(0, y0 | 0); y1 = Math.min(this.h, y1 | 0);
+    for (var y = y0; y < y1; y++) {
+      var so = y * W, dof = y * W;
+      if (dx === 0) { dst.set(src.subarray(so, so + W), dof); continue; }
+      if (dx > 0) {
+        dst.set(src.subarray(so, so + W - dx), dof + dx);
+        dst.fill(src[so], dof, dof + dx);
+      } else {
+        var n = W + dx;
+        dst.set(src.subarray(so - dx, so + W), dof);
+        dst.fill(src[so + W - 1], dof + n, dof + W);
+      }
+    }
+  };
+
   Surface.prototype.clearDepth = function () { this.depth.fill(1e9); };
 
   /* Clear only a rectangle of the depth buffer -- the characters occupy a
@@ -166,6 +192,33 @@ var FX = FX || {};
       var t = h <= 1 ? 0 : (yy - y) / (h - 1);
       var c = rgb(r0 + (r1 - r0) * t, g0 + (g1 - g0) * t, b0 + (b1 - b0) * t);
       this.fillRect(x, yy, w, 1, c);
+    }
+  };
+
+  /* Soft alpha disc -- dust and smoke. Drawing these as squares was
+   * leaving grey blocks on the floor. */
+  Surface.prototype.blendDisc = function (cx, cy, rad, r, g, b, a) {
+    var x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(this.w - 1, Math.ceil(cx + rad));
+    var y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(this.h - 1, Math.ceil(cy + rad));
+    var r2 = rad * rad;
+    for (var y = y0; y <= y1; y++) {
+      var dy = y - cy;
+      for (var x = x0; x <= x1; x++) {
+        var dx = x - cx, d2 = dx * dx + dy * dy;
+        if (d2 > r2) continue;
+        var f = 1 - d2 / r2;
+        this.blendPx(x, y, r, g, b, a * f);
+      }
+    }
+  };
+
+  /* A soft additive streak along a segment -- motion arcs, no shading. */
+  Surface.prototype.addStreak = function (ax, ay, bx, by, rad, r, g, b, a) {
+    var dx = bx - ax, dy = by - ay;
+    var n = Math.max(2, Math.min(22, Math.sqrt(dx * dx + dy * dy) / 3 | 0));
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      this.addDisc(ax + dx * t, ay + dy * t, rad, r, g, b, a);
     }
   };
 

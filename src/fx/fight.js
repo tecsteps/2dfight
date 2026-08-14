@@ -166,10 +166,7 @@ var FX = FX || {};
       var r = a.r * (a.add ? t : 1 + (1 - t) * 1.4) * S;
       var px2 = a.x * S + ox, py2 = a.y * S + oy;
       if (a.add) surf.addDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 1.5);
-      else {
-        var rr = Math.max(1, r) | 0;
-        surf.blendRect(px2 - rr, py2 - rr, rr * 2, rr * 2, a.c[0], a.c[1], a.c[2], t * 0.30);
-      }
+      else surf.blendDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 0.34);
     }
   };
 
@@ -207,6 +204,10 @@ var FX = FX || {};
     this.time = 99; this.round = 1; this.wins = [0, 0];
     this.over = 0; this.banner = ''; this.bannerT = 0;
     this.acc = 0; this.last = 0;
+    /* Camera. The stage never moved before, which is most of why the frame
+     * read as a diorama. Panning alone -- three bands at different rates --
+     * turns a backdrop into a place. */
+    this.camX = 0; this.camV = 0;
     this.aiT = [0, 0];
     this.aiHold = [null, null];
   }
@@ -288,10 +289,16 @@ var FX = FX || {};
     df.vx += at.facing * d.push;
     at.vx -= at.facing * d.push * 0.10;
     at.combo++;
+    at.comboT = 0;
     at.meter = Math.min(100, at.meter + (d.super ? -100 : dmg * 1.5));
 
     if (d.launch) {
-      df.vy = -d.launch; df.onGround = false;
+      /* Only launch from the floor, or from the top of an existing arc.
+       * Re-applying full launch velocity on every juggle hit walked the
+       * victim off the top of the screen. */
+      if (df.onGround) df.vy = -d.launch;
+      else df.vy = Math.max(df.vy - d.launch * 0.35, -d.launch * 0.8);
+      df.onGround = false;
       df.start('knockdown');
     } else if (d.trip) {
       df.start('knockdown');
@@ -334,6 +341,23 @@ var FX = FX || {};
     var back = f.facing > 0 ? c.l : c.r;
 
     if (!f.onGround) return;
+
+    // double-tap dash
+    var tapKey = fwd ? 'f' : (back ? 'b' : null);
+    if (tapKey) {
+      var lt = f.lastTap, now = this.tick || 0;
+      if (!f.tapHeld) {
+        if (lt && lt.k === tapKey && now - lt.t < 16) {
+          f.start(tapKey === 'f' ? 'dash' : 'backdash');
+          f.vx = f.facing * (tapKey === 'f' ? 300 : -260);
+          this.fx.dust(f.x, GROUND, 6, f.facing);
+          f.lastTap = null; f.tapHeld = 1;
+          return;
+        }
+        f.lastTap = { k: tapKey, t: now };
+      }
+      f.tapHeld = 1;
+    } else f.tapHeld = 0;
 
     if (c.s && f.meter >= 100) { f.start('special'); f.vx = f.facing * 40; return; }
     if (c.g) { f.start('grab'); return; }
@@ -385,6 +409,7 @@ var FX = FX || {};
   };
 
   Match.prototype.step = function (dt) {
+    this.tick = (this.tick || 0) + 1;
     this.fx.update(dt);
     if (this.fx.hitstop > 0) { this.fx.hitstop -= dt; return; }
 
@@ -450,6 +475,13 @@ var FX = FX || {};
   Match.prototype.render = function () {
     var surf = this.surf, S = SCALE;
 
+    // follow the midpoint, held back from the stage edges
+    var mid = (this.a.x + this.b.x) * 0.5 - W * 0.5;
+    var want = Math.max(-46, Math.min(46, mid));
+    this.camV += (want - this.camX) * 9 * (1 / 60);
+    this.camV *= 0.82;
+    this.camX += this.camV;
+
     /* Screen shake, as a decaying oscillation along the hit direction --
      * white noise reads as a rattle, a sine reads as an impact. */
     var ox = 0, oy = 0;
@@ -459,11 +491,19 @@ var FX = FX || {};
       ox = Math.sin(this.shakeT * 1.9) * k * (this.fx.shakeDir || 1);
       oy = Math.sin(this.shakeT * 2.7) * k * 0.45;
     }
-    surf.copyFromOffset(this.bg, ox, oy);
-    this.sh.ox = ox; this.sh.oy = oy;
+    /* Parallax: sky barely moves, the temple wall drifts, the floor tracks
+     * the fighters exactly so their feet stay glued to it. */
+    var cx = this.camX * S;
+    var skyY = (GROUND - 132) * S, flrY = GROUND * S;
+    surf.copyBand(this.bg, 0, skyY, ox - cx * 0.15);
+    surf.copyBand(this.bg, skyY, flrY, ox - cx * 0.55);
+    surf.copyBand(this.bg, flrY, surf.h, ox - cx);
 
-    F.drawShadow(surf, this.a, GROUND, S);
-    F.drawShadow(surf, this.b, GROUND, S);
+    var pan = ox - cx;
+    this.sh.ox = pan; this.sh.oy = oy;
+
+    F.drawShadowAt(surf, this.a, GROUND, S, pan, oy);
+    F.drawShadowAt(surf, this.b, GROUND, S, pan, oy);
 
     // far fighter first
     var order = this.a.y <= this.b.y ? [this.a, this.b] : [this.b, this.a];
@@ -472,9 +512,19 @@ var FX = FX || {};
       var b = F.fighterBounds(f);
       this.sh.begin(b.x0, b.y0, b.x1, b.y1);
       F.drawFighter(this.sh, f);
+      // motion arc: the working limb's recent path, additively. Free from a
+      // solved pose; a sprite sheet would need extra art for every frame.
+      var tc = f.skin.tint;
+      for (var g = 0; g < f.trail.length; g++) {
+        var seg = f.trail[g], al = 0.055 + g * 0.032;
+        surf.addStreak(seg[0][0] * S + pan, seg[0][1] * S + oy,
+          seg[1][0] * S + pan, seg[1][1] * S + oy, 5 * S, tc[0], tc[1], tc[2], al * 0.5);
+        surf.addStreak(seg[1][0] * S + pan, seg[1][1] * S + oy,
+          seg[2][0] * S + pan, seg[2][1] * S + oy, 4.5 * S, tc[0], tc[1], tc[2], al);
+      }
     }
 
-    this.fx.draw(surf, ox, oy);
+    this.fx.draw(surf, pan, oy);
     this.sh.ox = 0; this.sh.oy = 0;
     if (this.fx.flash > 0) {
       surf.blendRect(0, 0, surf.w, surf.h, 255, 244, 230, this.fx.flash * 0.5);
@@ -484,13 +534,26 @@ var FX = FX || {};
   };
 
   /* Chunky vector HUD, drawn with rectangles -- no font asset. */
-  function bar(surf, x, y, w, h, frac, r, g, b, flip) {
-    surf.fillRect(x - 2, y - 2, w + 4, h + 4, F.rgb(18, 16, 22));
-    surf.fillRect(x, y, w, h, F.rgb(46, 40, 48));
+  /* `ghost` is the chip bar: the damage you just took, draining a beat
+   * behind the real value. Its absence was the most conspicuous thing
+   * missing from the frame. */
+  function bar(surf, x, y, w, h, frac, r, g, b, flip, ghost) {
+    surf.fillRect(x - 3, y - 3, w + 6, h + 6, F.rgb(14, 12, 18));
+    surf.fillRect(x - 1, y - 1, w + 2, h + 2, F.rgb(74, 66, 74));
+    surf.fillRect(x, y, w, h, F.rgb(38, 32, 40));
+    var gw, gx;
+    if (ghost !== undefined && ghost > frac) {
+      gw = Math.max(0, Math.min(1, ghost)) * w;
+      gx = flip ? x + w - gw : x;
+      surf.fillRect(gx, y, gw, h, F.rgb(238, 214, 120));
+    }
     var fw = Math.max(0, Math.min(1, frac)) * w;
     var bx = flip ? x + w - fw : x;
     surf.fillRect(bx, y, fw, h, F.rgb(r, g, b));
-    surf.fillRect(bx, y, fw, h * 0.34, F.rgb(Math.min(255, r + 60), Math.min(255, g + 60), Math.min(255, b + 50)));
+    surf.fillRect(bx, y, fw, h * 0.30,
+      F.rgb(Math.min(255, r + 70), Math.min(255, g + 70), Math.min(255, b + 60)));
+    surf.fillRect(bx, y + h - Math.max(1, h * 0.16), fw, Math.max(1, h * 0.16),
+      F.rgb(r * 0.55, g * 0.55, b * 0.55));
   }
 
   /* A 3x5 bitmap font written as rows, because the packed-hex version of
@@ -534,8 +597,21 @@ var FX = FX || {};
   Match.prototype.hud = function (surf) {
     var S = SCALE, w = surf.w;
     var bw = 186 * S, bh = 13 * S, by = 14 * S;
-    bar(surf, 20 * S, by, bw, bh, this.a.hp / this.a.maxHp, 226, 72, 62, false);
-    bar(surf, w - 20 * S - bw, by, bw, bh, this.b.hp / this.b.maxHp, 226, 72, 62, true);
+    // chip bars trail the real value
+    if (this.ghostA === undefined) { this.ghostA = 1; this.ghostB = 1; }
+    var ha = this.a.hp / this.a.maxHp, hb = this.b.hp / this.b.maxHp;
+    this.ghostA += (ha - this.ghostA) * 0.055; if (this.ghostA < ha) this.ghostA = ha;
+    this.ghostB += (hb - this.ghostB) * 0.055; if (this.ghostB < hb) this.ghostB = hb;
+    // low health pulses toward white
+    function hc(fr, t) {
+      if (fr > 0.25) return [226, 72, 62];
+      var k = 0.5 + 0.5 * Math.sin(t * 0.42);
+      return [226 + 29 * k, 72 + 150 * k, 62 + 140 * k];
+    }
+    var ca = hc(ha, this.tHud || 0), cb2 = hc(hb, this.tHud || 0);
+    this.tHud = (this.tHud || 0) + 1;
+    bar(surf, 20 * S, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
+    bar(surf, w - 20 * S - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
     // super meters
     bar(surf, 20 * S, by + bh + 5 * S, bw * 0.62, 5 * S, this.a.meter / 100, 90, 190, 255, false);
     bar(surf, w - 20 * S - bw * 0.62, by + bh + 5 * S, bw * 0.62, 5 * S, this.b.meter / 100, 90, 190, 255, true);
@@ -561,17 +637,21 @@ var FX = FX || {};
     }
 
     if (this.bannerT > 0 && this.banner) {
-      var bp = 9 * S;
-      var bwid = textW(this.banner, bp);
       var a = Math.min(1, this.bannerT * 1.6);
-      var yy = 100 * S - (1 - a) * 12 * S;
-      text(surf, this.banner, w / 2 - bwid / 2, yy, bp, F.rgb(255, 232, 180), F.rgb(120, 20, 20));
+      var pop = 1 + 0.35 * Math.exp(-(2.4 - this.bannerT) * 7);
+      var bp = 6.4 * S * Math.min(1.28, pop);
+      var bwid = textW(this.banner, bp);
+      var yy = 56 * S;
+      // a scrim keeps the banner off the fighters' faces
+      surf.blendRect(0, yy - 7 * S, w, bp * 5 + 14 * S, 8, 4, 10, 0.40 * a);
+      text(surf, this.banner, w / 2 - bwid / 2, yy, bp, F.rgb(255, 234, 186), F.rgb(150, 24, 24));
     }
     for (var ci = 0; ci < 2; ci++) {
       var cf = ci ? this.b : this.a;
       if (cf.combo < 2) continue;
       var cs = cf.combo + ' HIT';
-      var cp = 2.6 * S;
+      var cp = 2.6 * S * (1 + 0.55 * Math.exp(-(cf.comboT || 0) * 0.35));
+      cf.comboT = (cf.comboT || 0) + 1;
       text(surf, cs, ci ? w - 26 * S - textW(cs, cp) : 26 * S, 64 * S, cp,
         F.rgb(255, 210, 120), F.rgb(20, 10, 8));
     }

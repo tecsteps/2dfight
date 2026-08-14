@@ -68,6 +68,14 @@ var FX = FX || {};
 
   /* The contact shadow. Cheap, and it is most of what glues a character to
    * the floor -- without it a fighter looks pasted on. */
+  F.drawShadowAt = function (surf, f, groundY, S, ox, oy) {
+    S = S || 1; ox = ox || 0; oy = oy || 0;
+    var lift = Math.max(0, groundY - f.y);
+    var k = Math.max(0.34, 1 - lift / 150);
+    surf.shadowEllipse((f.x + 4) * S + ox, (groundY + 2) * S + oy, 34 * k * S, 9 * k * S, 0.44 * k);
+    surf.shadowEllipse((f.x + 4) * S + ox, (groundY + 2) * S + oy, 15 * k * S, 4.2 * k * S, 0.58 * k);
+  };
+
   F.drawShadow = function (surf, f, groundY, S) {
     S = S || 1;
     var lift = Math.max(0, groundY - f.y);
@@ -78,10 +86,11 @@ var FX = FX || {};
     surf.shadowEllipse((f.x + 4) * S, (groundY + 2) * S, 15 * k * S, 4.2 * k * S, 0.58 * k);
   };
 
-  F.drawFighter = function (sh, f) {
-    var p = f.pose();
+  F.drawFighter = function (sh, f, poseOverride, ghost) {
+    var p = poseOverride || f.pose();
     var sk = f.skin;
     var fw = p.fw;
+    sh.ghost = ghost || 0;
 
     sh.tint = f.flash;
     sh.tintR = sk.tint[0]; sh.tintG = sk.tint[1]; sh.tintB = sk.tint[2];
@@ -103,6 +112,7 @@ var FX = FX || {};
 
     drawLeg(sh, p.legs[near], sk, Z.nearLeg, 1.0, fw);
     drawArm(sh, p.arms[near], sk, Z.nearArm, 1.0, fw);
+    sh.ghost = 0;
   };
 
   function drawLeg(sh, lg, sk, z, ao, fw) {

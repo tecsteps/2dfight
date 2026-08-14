@@ -101,12 +101,38 @@ var FX = FX || {};
       var sy = y - dy; if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
       var so = sy * W, dof = y * W;
       if (dx === 0) { dst.set(src.subarray(so, so + W), dof); continue; }
-      for (var x = 0; x < W; x++) {
-        var sx = x - dx; if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
-        dst[dof + x] = src[so + sx];
+      // the shifted span is one contiguous row copy; only the exposed edge
+      // needs filling, and it fills with the clamped edge pixel
+      if (dx > 0) {
+        dst.set(src.subarray(so, so + W - dx), dof + dx);
+        dst.fill(src[so], dof, dof + dx);
+      } else {
+        var n = W + dx;
+        dst.set(src.subarray(so - dx, so + W), dof);
+        dst.fill(src[so + W - 1], dof + n, dof + W);
       }
     }
   };
+  /* Copy a horizontal band with its own x offset. Parallax is just this,
+   * called once per depth layer. */
+  Surface.prototype.copyBand = function (other, y0, y1, dx) {
+    dx = Math.round(dx);
+    var W = this.w, src = other.px, dst = this.px;
+    y0 = Math.max(0, y0 | 0); y1 = Math.min(this.h, y1 | 0);
+    for (var y = y0; y < y1; y++) {
+      var so = y * W, dof = y * W;
+      if (dx === 0) { dst.set(src.subarray(so, so + W), dof); continue; }
+      if (dx > 0) {
+        dst.set(src.subarray(so, so + W - dx), dof + dx);
+        dst.fill(src[so], dof, dof + dx);
+      } else {
+        var n = W + dx;
+        dst.set(src.subarray(so - dx, so + W), dof);
+        dst.fill(src[so + W - 1], dof + n, dof + W);
+      }
+    }
+  };
+
   Surface.prototype.clearDepth = function () { this.depth.fill(1e9); };
 
   /* Clear only a rectangle of the depth buffer -- the characters occupy a
@@ -210,6 +236,33 @@ var FX = FX || {};
     }
   };
 
+  /* Soft alpha disc -- dust and smoke. Drawing these as squares was
+   * leaving grey blocks on the floor. */
+  Surface.prototype.blendDisc = function (cx, cy, rad, r, g, b, a) {
+    var x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(this.w - 1, Math.ceil(cx + rad));
+    var y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(this.h - 1, Math.ceil(cy + rad));
+    var r2 = rad * rad;
+    for (var y = y0; y <= y1; y++) {
+      var dy = y - cy;
+      for (var x = x0; x <= x1; x++) {
+        var dx = x - cx, d2 = dx * dx + dy * dy;
+        if (d2 > r2) continue;
+        var f = 1 - d2 / r2;
+        this.blendPx(x, y, r, g, b, a * f);
+      }
+    }
+  };
+
+  /* A soft additive streak along a segment -- motion arcs, no shading. */
+  Surface.prototype.addStreak = function (ax, ay, bx, by, rad, r, g, b, a) {
+    var dx = bx - ax, dy = by - ay;
+    var n = Math.max(2, Math.min(22, Math.sqrt(dx * dx + dy * dy) / 3 | 0));
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      this.addDisc(ax + dx * t, ay + dy * t, rad, r, g, b, a);
+    }
+  };
+
   F.Surface = Surface;
   F.rgb = rgb;
   F.rgba = rgba;
@@ -276,6 +329,14 @@ var FX = FX || {};
     this.tintR = 255; this.tintG = 255; this.tintB = 255;
     this.occ = []; this.nOcc = 0;
     this.ox = 0; this.oy = 0;                          // screen shake
+    this.ghost = 0;                                    // >0 draws an afterimage
+
+    /* The half-vector is a constant of the light rig, but it was being
+     * rebuilt -- including a reciprocal square root -- for every shaded
+     * pixel. Hoisted, it costs nothing. */
+    var hx = LX, hy = LY, hz = LZ + 1;
+    var hl = 1 / Math.sqrt(hx * hx + hy * hy + hz * hz);
+    this.HX = hx * hl; this.HY = hy * hl; this.HZ = hz * hl;
   }
 
   /* Occluders are a handful of body masses in device space. Anything drawn
@@ -303,10 +364,12 @@ var FX = FX || {};
 
   /* Shade one pixel given its normal and depth, with coverage for the edge. */
   Shader.prototype.px = function (x, y, nx, ny, nz, z, m, cov, ao) {
-    if (x < this.bx0 || y < this.by0 || x >= this.bx1 || y >= this.by1) return;
+    // callers already clip to the shader's box; re-testing here cost a
+    // branch on every covered pixel
     var s = this.s, i = y * s.w + x;
     if (z >= s.depth[i]) return;
-    if (cov >= 0.995) s.depth[i] = z;
+    if (this.ghost > 0) { cov *= this.ghost; }
+    else if (cov >= 0.995) s.depth[i] = z;
 
     var d = nx * LX + ny * LY + nz * LZ;
     if (d < 0) d = 0;
@@ -318,11 +381,14 @@ var FX = FX || {};
     f *= 0.34;
 
     // Blinn specular against the key light
-    var hx = LX, hy = LY, hz = LZ + 1;
-    var hl = 1 / Math.sqrt(hx * hx + hy * hy + hz * hz);
-    var sp = nx * hx * hl + ny * hy * hl + nz * hz * hl;
+    var sp = nx * this.HX + ny * this.HY + nz * this.HZ;
     if (sp < 0) sp = 0;
-    sp = Math.pow(sp, m.gloss) * m.spec;
+    else if (m.spec > 0.001) {
+      // integer gloss by repeated squaring beats Math.pow per pixel
+      var e = m.gloss, acc = 1, base = sp;
+      while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+      sp = acc * m.spec;
+    } else sp = 0;
 
     // rim, gated by direction
     var rb = nx * BX + ny * BY + nz * BZ;
@@ -334,11 +400,12 @@ var FX = FX || {};
     // per-pixel ambient occlusion from the body's own masses
     for (var oi = 0; oi < this.nOcc; oi++) {
       var o = this.occ[oi];
+      if (z <= o.z) continue;                       // only occluders in front
       var odx = x - o.x, ody = y - o.y;
       var od2 = odx * odx + ody * ody;
-      if (od2 > o.r2) continue;
-      if (z <= o.z) continue;                       // only occluders in front
-      occ *= 1 - o.k * (1 - Math.sqrt(od2) / o.r) * Math.min(1, (z - o.z) / 16);
+      if (od2 >= o.r2) continue;
+      var dz = z - o.z; if (dz > 16) dz = 16;
+      occ *= 1 - o.k * (1 - od2 / o.r2) * dz * 0.0625;
     }
 
     // subsurface warmth on the terminator; without it the cold fill light
@@ -400,8 +467,10 @@ var FX = FX || {};
         var qx = ax + ux * seg * t, qy = ay + uy * seg * t;
         var r = r0 + (r1 - r0) * t;
         var ex = x + 0.5 - qx, ey = y + 0.5 - qy;
-        var dist = Math.sqrt(ex * ex + ey * ey);
-        if (dist > r + 0.75) continue;
+        var d2 = ex * ex + ey * ey;
+        var rlim = r + 0.75;
+        if (d2 > rlim * rlim) continue;               // reject before the sqrt
+        var dist = Math.sqrt(d2);
         var cov = r + 0.5 - dist;
         if (cov > 1) cov = 1; else if (cov <= 0) continue;
         var u = (ex * px + ey * py) / r;
@@ -595,7 +664,8 @@ var FX = FX || {};
   var MOVES = {
     idle: { dur: 0, loop: true },
     walk: { dur: 0, loop: true },
-    dash: { dur: 0.34, recover: 0.1 },
+    dash:      { dur: 0.24 },
+    backdash:  { dur: 0.30, inv: 1 },
     crouch: { dur: 0, loop: true },
     block: { dur: 0, loop: true },
     blockLow: { dur: 0, loop: true },
@@ -743,6 +813,9 @@ var FX = FX || {};
     if (!this.onGround) {
       this.vy += 1800 * dt;
       this.y += this.vy * dt;
+      // ceiling, so a juggle cannot carry anyone out of frame
+      var ceil = this.groundY - 132;
+      if (this.y < ceil) { this.y = ceil; if (this.vy < 0) this.vy = 0; }
       if (this.y >= this.groundY) {
         /* Capture the impact velocity and drive it into the hip spring, so
          * the body compresses and rises back over ~20 frames. Previously the
@@ -763,6 +836,22 @@ var FX = FX || {};
     this.legs(dt, cmd);
     this.secondary(dt);
 
+    /* Afterimage history. A sprite-based fighter cannot do this without
+     * extra art; a solved pose is just numbers, so keeping the last few is
+     * nearly free. */
+    var dd = this.def();
+    var pr = this.progress();
+    if ((dd.arm !== undefined || dd.leg) && pr > 0.18 && pr < 0.74) {
+      var q = this.pose();
+      var ch = dd.leg ? q.legs[1] : q.arms[dd.arm];
+      this.trail.push(dd.leg
+        ? [ch.hip, ch.knee, ch.ankle]
+        : [ch.sh, ch.elbow, ch.wrist]);
+      if (this.trail.length > 5) this.trail.shift();
+    } else if (this.trail.length) {
+      this.trail.shift();
+    }
+
     this.hipH.step(dt); this.lean.step(dt); this.twist.step(dt);
     this.headA.step(dt); this.crouchS.step(dt); this.hipShift.step(dt);
     this.hand[0].x.step(dt); this.hand[0].y.step(dt);
@@ -777,36 +866,57 @@ var FX = FX || {};
 
     this.crouchS.t = crouching ? 1 : 0;
 
-    // breathing lifts the chest and rocks the shoulders a little
+    /* Lean first, then hip. The previous version assigned hipH.t before the
+     * knockdown and defeat branches had set `hip`, so a downed fighter never
+     * actually fell -- it bowed at the waist with its legs straight. */
+    var lean = 4 + br * 1.2;
+    var tw0 = 0;
+    if (m === 'walk') lean = 8;
+    if (m === 'dash' || m === 'backdash') lean = m === 'dash' ? 18 : -14;
+    if (crouching) lean = 16;
+    if (m === 'block' || m === 'blockLow') { lean = -3; tw0 = -16; }
+    if (d.arm || d.leg) lean = 6 + 18 * strikeEnv(p);
+    if (m === 'hitHigh' || m === 'hitHeavy') lean = -22 * Math.sin(Math.PI * p);
+    if (m === 'hitLow') lean = 22 * Math.sin(Math.PI * p);
+    if (m === 'victory') lean = -4 + br * 2;
+
+    // breathing lifts the chest and rocks the shoulders
     var hip = L.standHip - 22 * this.crouchS.v + br * 3.4;
     if (m === 'sweep') hip = L.standHip - 36 * Math.sin(Math.PI * p);
     if (!this.onGround) hip = L.standHip - 6;
+
+    /* Going down: the torso rotates flat AND the pelvis drops to the floor.
+     * Both, or it reads as a bow. */
+    if (m === 'knockdown') {
+      var kp = smooth(clamp01((p - 0.10) / 0.34));
+      lean = -92 * kp;
+      hip = L.standHip * (1 - 0.86 * kp) + 4;
+      if (!this.kdHit && kp > 0.72) { this.kdHit = 1; if (this.onFloorHit) this.onFloorHit(); }
+      if (kp < 0.1) this.kdHit = 0;
+    }
+    if (m === 'thrown') {
+      lean = -70 * smooth(clamp01(p * 2.2));
+      hip = L.standHip * (1 - 0.5 * smooth(clamp01(p * 2.2)));
+    }
+    if (m === 'defeat') { lean = -94; hip = 10; }
+    if (m === 'getup') {
+      var gp = smooth(p);
+      lean = -92 * (1 - gp) + 6 * gp;
+      hip = 10 + (L.standHip - 10) * gp;
+    }
+
+    this.lean.t = lean;
     this.hipH.t = hip;
 
-    var lean = 4 + br * 1.2;
-    if (m === 'walk') lean = 8;
-    if (m === 'dash') lean = 16;
-    if (crouching) lean = 16;
-    if (m === 'block' || m === 'blockLow') { lean = -3; tw0 = -16; }
-    if (d.arm || d.leg) lean = 6 + 16 * Math.sin(Math.PI * p);
-    if (m === 'hitHigh' || m === 'hitHeavy') lean = -18 * Math.sin(Math.PI * p);
-    if (m === 'hitLow') lean = 20 * Math.sin(Math.PI * p);
-    if (m === 'knockdown') { var kp = smooth(clamp01((p - 0.12) / 0.30)); lean = -88 * kp; hip = L.standHip * (1 - 0.80 * kp); }
-    if (m === 'defeat') { lean = -86; hip = L.standHip * 0.22; }
-    if (m === 'victory') lean = -4 + br * 2;
-    this.lean.t = lean;
-
     // shoulders counter-rotate against whichever limb is working
-    var tw0 = 0;
     var tw = br * 2.5;
     if (d.arm !== undefined) tw = (d.arm ? -1 : 1) * 40 * strikeEnv(p);
     if (d.leg) tw = 42 * strikeEnv(p);
     if (m === 'walk' || m === 'dash') tw = Math.sin(this.phase * TAU) * 9;
     this.twist.t = tw + tw0;
 
-    this.headA.t = (m === 'knockdown' || m === 'defeat') ? 26 : -br * 2.2 - this.lean.v * 0.25;
+    this.headA.t = (m === 'knockdown' || m === 'defeat') ? 30 : -br * 2.2 - this.lean.v * 0.25;
 
-    // idle weight shift: a slow drift from one foot to the other
     /* The weight shift used to switch off during every attack, so the
      * character became *more* static the moment it acted. */
     this.hipShift.t = Math.sin(this.sway) * ((m === 'idle' || m === 'block') ? 5.5 : 2.0);
@@ -954,8 +1064,8 @@ var FX = FX || {};
       want[1] = this.x + lead * 2;
       want[0] = this.x - lead * 5;
     }
-    if (m === 'knockdown' || m === 'defeat') {
-      want = [this.x - lead * 40, this.x - lead * 14];
+    if (m === 'knockdown' || m === 'defeat' || m === 'getup') {
+      want = [this.x - lead * 46, this.x - lead * 20];
     }
     for (var s = 0; s < 2; s++) {
       var fs = this.feet[s];
@@ -1151,6 +1261,14 @@ var FX = FX || {};
 
   /* The contact shadow. Cheap, and it is most of what glues a character to
    * the floor -- without it a fighter looks pasted on. */
+  F.drawShadowAt = function (surf, f, groundY, S, ox, oy) {
+    S = S || 1; ox = ox || 0; oy = oy || 0;
+    var lift = Math.max(0, groundY - f.y);
+    var k = Math.max(0.34, 1 - lift / 150);
+    surf.shadowEllipse((f.x + 4) * S + ox, (groundY + 2) * S + oy, 34 * k * S, 9 * k * S, 0.44 * k);
+    surf.shadowEllipse((f.x + 4) * S + ox, (groundY + 2) * S + oy, 15 * k * S, 4.2 * k * S, 0.58 * k);
+  };
+
   F.drawShadow = function (surf, f, groundY, S) {
     S = S || 1;
     var lift = Math.max(0, groundY - f.y);
@@ -1161,10 +1279,11 @@ var FX = FX || {};
     surf.shadowEllipse((f.x + 4) * S, (groundY + 2) * S, 15 * k * S, 4.2 * k * S, 0.58 * k);
   };
 
-  F.drawFighter = function (sh, f) {
-    var p = f.pose();
+  F.drawFighter = function (sh, f, poseOverride, ghost) {
+    var p = poseOverride || f.pose();
     var sk = f.skin;
     var fw = p.fw;
+    sh.ghost = ghost || 0;
 
     sh.tint = f.flash;
     sh.tintR = sk.tint[0]; sh.tintG = sk.tint[1]; sh.tintB = sk.tint[2];
@@ -1186,6 +1305,7 @@ var FX = FX || {};
 
     drawLeg(sh, p.legs[near], sk, Z.nearLeg, 1.0, fw);
     drawArm(sh, p.arms[near], sk, Z.nearArm, 1.0, fw);
+    sh.ghost = 0;
   };
 
   function drawLeg(sh, lg, sk, z, ao, fw) {
@@ -1535,10 +1655,7 @@ var FX = FX || {};
       var r = a.r * (a.add ? t : 1 + (1 - t) * 1.4) * S;
       var px2 = a.x * S + ox, py2 = a.y * S + oy;
       if (a.add) surf.addDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 1.5);
-      else {
-        var rr = Math.max(1, r) | 0;
-        surf.blendRect(px2 - rr, py2 - rr, rr * 2, rr * 2, a.c[0], a.c[1], a.c[2], t * 0.30);
-      }
+      else surf.blendDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 0.34);
     }
   };
 
@@ -1576,6 +1693,10 @@ var FX = FX || {};
     this.time = 99; this.round = 1; this.wins = [0, 0];
     this.over = 0; this.banner = ''; this.bannerT = 0;
     this.acc = 0; this.last = 0;
+    /* Camera. The stage never moved before, which is most of why the frame
+     * read as a diorama. Panning alone -- three bands at different rates --
+     * turns a backdrop into a place. */
+    this.camX = 0; this.camV = 0;
     this.aiT = [0, 0];
     this.aiHold = [null, null];
   }
@@ -1657,10 +1778,16 @@ var FX = FX || {};
     df.vx += at.facing * d.push;
     at.vx -= at.facing * d.push * 0.10;
     at.combo++;
+    at.comboT = 0;
     at.meter = Math.min(100, at.meter + (d.super ? -100 : dmg * 1.5));
 
     if (d.launch) {
-      df.vy = -d.launch; df.onGround = false;
+      /* Only launch from the floor, or from the top of an existing arc.
+       * Re-applying full launch velocity on every juggle hit walked the
+       * victim off the top of the screen. */
+      if (df.onGround) df.vy = -d.launch;
+      else df.vy = Math.max(df.vy - d.launch * 0.35, -d.launch * 0.8);
+      df.onGround = false;
       df.start('knockdown');
     } else if (d.trip) {
       df.start('knockdown');
@@ -1703,6 +1830,23 @@ var FX = FX || {};
     var back = f.facing > 0 ? c.l : c.r;
 
     if (!f.onGround) return;
+
+    // double-tap dash
+    var tapKey = fwd ? 'f' : (back ? 'b' : null);
+    if (tapKey) {
+      var lt = f.lastTap, now = this.tick || 0;
+      if (!f.tapHeld) {
+        if (lt && lt.k === tapKey && now - lt.t < 16) {
+          f.start(tapKey === 'f' ? 'dash' : 'backdash');
+          f.vx = f.facing * (tapKey === 'f' ? 300 : -260);
+          this.fx.dust(f.x, GROUND, 6, f.facing);
+          f.lastTap = null; f.tapHeld = 1;
+          return;
+        }
+        f.lastTap = { k: tapKey, t: now };
+      }
+      f.tapHeld = 1;
+    } else f.tapHeld = 0;
 
     if (c.s && f.meter >= 100) { f.start('special'); f.vx = f.facing * 40; return; }
     if (c.g) { f.start('grab'); return; }
@@ -1754,6 +1898,7 @@ var FX = FX || {};
   };
 
   Match.prototype.step = function (dt) {
+    this.tick = (this.tick || 0) + 1;
     this.fx.update(dt);
     if (this.fx.hitstop > 0) { this.fx.hitstop -= dt; return; }
 
@@ -1819,6 +1964,13 @@ var FX = FX || {};
   Match.prototype.render = function () {
     var surf = this.surf, S = SCALE;
 
+    // follow the midpoint, held back from the stage edges
+    var mid = (this.a.x + this.b.x) * 0.5 - W * 0.5;
+    var want = Math.max(-46, Math.min(46, mid));
+    this.camV += (want - this.camX) * 9 * (1 / 60);
+    this.camV *= 0.82;
+    this.camX += this.camV;
+
     /* Screen shake, as a decaying oscillation along the hit direction --
      * white noise reads as a rattle, a sine reads as an impact. */
     var ox = 0, oy = 0;
@@ -1828,11 +1980,19 @@ var FX = FX || {};
       ox = Math.sin(this.shakeT * 1.9) * k * (this.fx.shakeDir || 1);
       oy = Math.sin(this.shakeT * 2.7) * k * 0.45;
     }
-    surf.copyFromOffset(this.bg, ox, oy);
-    this.sh.ox = ox; this.sh.oy = oy;
+    /* Parallax: sky barely moves, the temple wall drifts, the floor tracks
+     * the fighters exactly so their feet stay glued to it. */
+    var cx = this.camX * S;
+    var skyY = (GROUND - 132) * S, flrY = GROUND * S;
+    surf.copyBand(this.bg, 0, skyY, ox - cx * 0.15);
+    surf.copyBand(this.bg, skyY, flrY, ox - cx * 0.55);
+    surf.copyBand(this.bg, flrY, surf.h, ox - cx);
 
-    F.drawShadow(surf, this.a, GROUND, S);
-    F.drawShadow(surf, this.b, GROUND, S);
+    var pan = ox - cx;
+    this.sh.ox = pan; this.sh.oy = oy;
+
+    F.drawShadowAt(surf, this.a, GROUND, S, pan, oy);
+    F.drawShadowAt(surf, this.b, GROUND, S, pan, oy);
 
     // far fighter first
     var order = this.a.y <= this.b.y ? [this.a, this.b] : [this.b, this.a];
@@ -1841,9 +2001,19 @@ var FX = FX || {};
       var b = F.fighterBounds(f);
       this.sh.begin(b.x0, b.y0, b.x1, b.y1);
       F.drawFighter(this.sh, f);
+      // motion arc: the working limb's recent path, additively. Free from a
+      // solved pose; a sprite sheet would need extra art for every frame.
+      var tc = f.skin.tint;
+      for (var g = 0; g < f.trail.length; g++) {
+        var seg = f.trail[g], al = 0.055 + g * 0.032;
+        surf.addStreak(seg[0][0] * S + pan, seg[0][1] * S + oy,
+          seg[1][0] * S + pan, seg[1][1] * S + oy, 5 * S, tc[0], tc[1], tc[2], al * 0.5);
+        surf.addStreak(seg[1][0] * S + pan, seg[1][1] * S + oy,
+          seg[2][0] * S + pan, seg[2][1] * S + oy, 4.5 * S, tc[0], tc[1], tc[2], al);
+      }
     }
 
-    this.fx.draw(surf, ox, oy);
+    this.fx.draw(surf, pan, oy);
     this.sh.ox = 0; this.sh.oy = 0;
     if (this.fx.flash > 0) {
       surf.blendRect(0, 0, surf.w, surf.h, 255, 244, 230, this.fx.flash * 0.5);
@@ -1853,13 +2023,26 @@ var FX = FX || {};
   };
 
   /* Chunky vector HUD, drawn with rectangles -- no font asset. */
-  function bar(surf, x, y, w, h, frac, r, g, b, flip) {
-    surf.fillRect(x - 2, y - 2, w + 4, h + 4, F.rgb(18, 16, 22));
-    surf.fillRect(x, y, w, h, F.rgb(46, 40, 48));
+  /* `ghost` is the chip bar: the damage you just took, draining a beat
+   * behind the real value. Its absence was the most conspicuous thing
+   * missing from the frame. */
+  function bar(surf, x, y, w, h, frac, r, g, b, flip, ghost) {
+    surf.fillRect(x - 3, y - 3, w + 6, h + 6, F.rgb(14, 12, 18));
+    surf.fillRect(x - 1, y - 1, w + 2, h + 2, F.rgb(74, 66, 74));
+    surf.fillRect(x, y, w, h, F.rgb(38, 32, 40));
+    var gw, gx;
+    if (ghost !== undefined && ghost > frac) {
+      gw = Math.max(0, Math.min(1, ghost)) * w;
+      gx = flip ? x + w - gw : x;
+      surf.fillRect(gx, y, gw, h, F.rgb(238, 214, 120));
+    }
     var fw = Math.max(0, Math.min(1, frac)) * w;
     var bx = flip ? x + w - fw : x;
     surf.fillRect(bx, y, fw, h, F.rgb(r, g, b));
-    surf.fillRect(bx, y, fw, h * 0.34, F.rgb(Math.min(255, r + 60), Math.min(255, g + 60), Math.min(255, b + 50)));
+    surf.fillRect(bx, y, fw, h * 0.30,
+      F.rgb(Math.min(255, r + 70), Math.min(255, g + 70), Math.min(255, b + 60)));
+    surf.fillRect(bx, y + h - Math.max(1, h * 0.16), fw, Math.max(1, h * 0.16),
+      F.rgb(r * 0.55, g * 0.55, b * 0.55));
   }
 
   /* A 3x5 bitmap font written as rows, because the packed-hex version of
@@ -1903,8 +2086,21 @@ var FX = FX || {};
   Match.prototype.hud = function (surf) {
     var S = SCALE, w = surf.w;
     var bw = 186 * S, bh = 13 * S, by = 14 * S;
-    bar(surf, 20 * S, by, bw, bh, this.a.hp / this.a.maxHp, 226, 72, 62, false);
-    bar(surf, w - 20 * S - bw, by, bw, bh, this.b.hp / this.b.maxHp, 226, 72, 62, true);
+    // chip bars trail the real value
+    if (this.ghostA === undefined) { this.ghostA = 1; this.ghostB = 1; }
+    var ha = this.a.hp / this.a.maxHp, hb = this.b.hp / this.b.maxHp;
+    this.ghostA += (ha - this.ghostA) * 0.055; if (this.ghostA < ha) this.ghostA = ha;
+    this.ghostB += (hb - this.ghostB) * 0.055; if (this.ghostB < hb) this.ghostB = hb;
+    // low health pulses toward white
+    function hc(fr, t) {
+      if (fr > 0.25) return [226, 72, 62];
+      var k = 0.5 + 0.5 * Math.sin(t * 0.42);
+      return [226 + 29 * k, 72 + 150 * k, 62 + 140 * k];
+    }
+    var ca = hc(ha, this.tHud || 0), cb2 = hc(hb, this.tHud || 0);
+    this.tHud = (this.tHud || 0) + 1;
+    bar(surf, 20 * S, by, bw, bh, ha, ca[0], ca[1], ca[2], false, this.ghostA);
+    bar(surf, w - 20 * S - bw, by, bw, bh, hb, cb2[0], cb2[1], cb2[2], true, this.ghostB);
     // super meters
     bar(surf, 20 * S, by + bh + 5 * S, bw * 0.62, 5 * S, this.a.meter / 100, 90, 190, 255, false);
     bar(surf, w - 20 * S - bw * 0.62, by + bh + 5 * S, bw * 0.62, 5 * S, this.b.meter / 100, 90, 190, 255, true);
@@ -1930,17 +2126,21 @@ var FX = FX || {};
     }
 
     if (this.bannerT > 0 && this.banner) {
-      var bp = 9 * S;
-      var bwid = textW(this.banner, bp);
       var a = Math.min(1, this.bannerT * 1.6);
-      var yy = 100 * S - (1 - a) * 12 * S;
-      text(surf, this.banner, w / 2 - bwid / 2, yy, bp, F.rgb(255, 232, 180), F.rgb(120, 20, 20));
+      var pop = 1 + 0.35 * Math.exp(-(2.4 - this.bannerT) * 7);
+      var bp = 6.4 * S * Math.min(1.28, pop);
+      var bwid = textW(this.banner, bp);
+      var yy = 56 * S;
+      // a scrim keeps the banner off the fighters' faces
+      surf.blendRect(0, yy - 7 * S, w, bp * 5 + 14 * S, 8, 4, 10, 0.40 * a);
+      text(surf, this.banner, w / 2 - bwid / 2, yy, bp, F.rgb(255, 234, 186), F.rgb(150, 24, 24));
     }
     for (var ci = 0; ci < 2; ci++) {
       var cf = ci ? this.b : this.a;
       if (cf.combo < 2) continue;
       var cs = cf.combo + ' HIT';
-      var cp = 2.6 * S;
+      var cp = 2.6 * S * (1 + 0.55 * Math.exp(-(cf.comboT || 0) * 0.35));
+      cf.comboT = (cf.comboT || 0) + 1;
       text(surf, cs, ci ? w - 26 * S - textW(cs, cp) : 26 * S, 64 * S, cp,
         F.rgb(255, 210, 120), F.rgb(20, 10, 8));
     }

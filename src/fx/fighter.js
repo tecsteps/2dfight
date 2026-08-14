@@ -96,7 +96,8 @@ var FX = FX || {};
   var MOVES = {
     idle: { dur: 0, loop: true },
     walk: { dur: 0, loop: true },
-    dash: { dur: 0.34, recover: 0.1 },
+    dash:      { dur: 0.24 },
+    backdash:  { dur: 0.30, inv: 1 },
     crouch: { dur: 0, loop: true },
     block: { dur: 0, loop: true },
     blockLow: { dur: 0, loop: true },
@@ -244,6 +245,9 @@ var FX = FX || {};
     if (!this.onGround) {
       this.vy += 1800 * dt;
       this.y += this.vy * dt;
+      // ceiling, so a juggle cannot carry anyone out of frame
+      var ceil = this.groundY - 132;
+      if (this.y < ceil) { this.y = ceil; if (this.vy < 0) this.vy = 0; }
       if (this.y >= this.groundY) {
         /* Capture the impact velocity and drive it into the hip spring, so
          * the body compresses and rises back over ~20 frames. Previously the
@@ -264,6 +268,22 @@ var FX = FX || {};
     this.legs(dt, cmd);
     this.secondary(dt);
 
+    /* Afterimage history. A sprite-based fighter cannot do this without
+     * extra art; a solved pose is just numbers, so keeping the last few is
+     * nearly free. */
+    var dd = this.def();
+    var pr = this.progress();
+    if ((dd.arm !== undefined || dd.leg) && pr > 0.18 && pr < 0.74) {
+      var q = this.pose();
+      var ch = dd.leg ? q.legs[1] : q.arms[dd.arm];
+      this.trail.push(dd.leg
+        ? [ch.hip, ch.knee, ch.ankle]
+        : [ch.sh, ch.elbow, ch.wrist]);
+      if (this.trail.length > 5) this.trail.shift();
+    } else if (this.trail.length) {
+      this.trail.shift();
+    }
+
     this.hipH.step(dt); this.lean.step(dt); this.twist.step(dt);
     this.headA.step(dt); this.crouchS.step(dt); this.hipShift.step(dt);
     this.hand[0].x.step(dt); this.hand[0].y.step(dt);
@@ -278,36 +298,57 @@ var FX = FX || {};
 
     this.crouchS.t = crouching ? 1 : 0;
 
-    // breathing lifts the chest and rocks the shoulders a little
+    /* Lean first, then hip. The previous version assigned hipH.t before the
+     * knockdown and defeat branches had set `hip`, so a downed fighter never
+     * actually fell -- it bowed at the waist with its legs straight. */
+    var lean = 4 + br * 1.2;
+    var tw0 = 0;
+    if (m === 'walk') lean = 8;
+    if (m === 'dash' || m === 'backdash') lean = m === 'dash' ? 18 : -14;
+    if (crouching) lean = 16;
+    if (m === 'block' || m === 'blockLow') { lean = -3; tw0 = -16; }
+    if (d.arm || d.leg) lean = 6 + 18 * strikeEnv(p);
+    if (m === 'hitHigh' || m === 'hitHeavy') lean = -22 * Math.sin(Math.PI * p);
+    if (m === 'hitLow') lean = 22 * Math.sin(Math.PI * p);
+    if (m === 'victory') lean = -4 + br * 2;
+
+    // breathing lifts the chest and rocks the shoulders
     var hip = L.standHip - 22 * this.crouchS.v + br * 3.4;
     if (m === 'sweep') hip = L.standHip - 36 * Math.sin(Math.PI * p);
     if (!this.onGround) hip = L.standHip - 6;
+
+    /* Going down: the torso rotates flat AND the pelvis drops to the floor.
+     * Both, or it reads as a bow. */
+    if (m === 'knockdown') {
+      var kp = smooth(clamp01((p - 0.10) / 0.34));
+      lean = -92 * kp;
+      hip = L.standHip * (1 - 0.86 * kp) + 4;
+      if (!this.kdHit && kp > 0.72) { this.kdHit = 1; if (this.onFloorHit) this.onFloorHit(); }
+      if (kp < 0.1) this.kdHit = 0;
+    }
+    if (m === 'thrown') {
+      lean = -70 * smooth(clamp01(p * 2.2));
+      hip = L.standHip * (1 - 0.5 * smooth(clamp01(p * 2.2)));
+    }
+    if (m === 'defeat') { lean = -94; hip = 10; }
+    if (m === 'getup') {
+      var gp = smooth(p);
+      lean = -92 * (1 - gp) + 6 * gp;
+      hip = 10 + (L.standHip - 10) * gp;
+    }
+
+    this.lean.t = lean;
     this.hipH.t = hip;
 
-    var lean = 4 + br * 1.2;
-    if (m === 'walk') lean = 8;
-    if (m === 'dash') lean = 16;
-    if (crouching) lean = 16;
-    if (m === 'block' || m === 'blockLow') { lean = -3; tw0 = -16; }
-    if (d.arm || d.leg) lean = 6 + 16 * Math.sin(Math.PI * p);
-    if (m === 'hitHigh' || m === 'hitHeavy') lean = -18 * Math.sin(Math.PI * p);
-    if (m === 'hitLow') lean = 20 * Math.sin(Math.PI * p);
-    if (m === 'knockdown') { var kp = smooth(clamp01((p - 0.12) / 0.30)); lean = -88 * kp; hip = L.standHip * (1 - 0.80 * kp); }
-    if (m === 'defeat') { lean = -86; hip = L.standHip * 0.22; }
-    if (m === 'victory') lean = -4 + br * 2;
-    this.lean.t = lean;
-
     // shoulders counter-rotate against whichever limb is working
-    var tw0 = 0;
     var tw = br * 2.5;
     if (d.arm !== undefined) tw = (d.arm ? -1 : 1) * 40 * strikeEnv(p);
     if (d.leg) tw = 42 * strikeEnv(p);
     if (m === 'walk' || m === 'dash') tw = Math.sin(this.phase * TAU) * 9;
     this.twist.t = tw + tw0;
 
-    this.headA.t = (m === 'knockdown' || m === 'defeat') ? 26 : -br * 2.2 - this.lean.v * 0.25;
+    this.headA.t = (m === 'knockdown' || m === 'defeat') ? 30 : -br * 2.2 - this.lean.v * 0.25;
 
-    // idle weight shift: a slow drift from one foot to the other
     /* The weight shift used to switch off during every attack, so the
      * character became *more* static the moment it acted. */
     this.hipShift.t = Math.sin(this.sway) * ((m === 'idle' || m === 'block') ? 5.5 : 2.0);
@@ -455,8 +496,8 @@ var FX = FX || {};
       want[1] = this.x + lead * 2;
       want[0] = this.x - lead * 5;
     }
-    if (m === 'knockdown' || m === 'defeat') {
-      want = [this.x - lead * 40, this.x - lead * 14];
+    if (m === 'knockdown' || m === 'defeat' || m === 'getup') {
+      want = [this.x - lead * 46, this.x - lead * 20];
     }
     for (var s = 0; s < 2; s++) {
       var fs = this.feet[s];

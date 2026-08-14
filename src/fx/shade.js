@@ -58,6 +58,14 @@ var FX = FX || {};
     this.tintR = 255; this.tintG = 255; this.tintB = 255;
     this.occ = []; this.nOcc = 0;
     this.ox = 0; this.oy = 0;                          // screen shake
+    this.ghost = 0;                                    // >0 draws an afterimage
+
+    /* The half-vector is a constant of the light rig, but it was being
+     * rebuilt -- including a reciprocal square root -- for every shaded
+     * pixel. Hoisted, it costs nothing. */
+    var hx = LX, hy = LY, hz = LZ + 1;
+    var hl = 1 / Math.sqrt(hx * hx + hy * hy + hz * hz);
+    this.HX = hx * hl; this.HY = hy * hl; this.HZ = hz * hl;
   }
 
   /* Occluders are a handful of body masses in device space. Anything drawn
@@ -85,10 +93,12 @@ var FX = FX || {};
 
   /* Shade one pixel given its normal and depth, with coverage for the edge. */
   Shader.prototype.px = function (x, y, nx, ny, nz, z, m, cov, ao) {
-    if (x < this.bx0 || y < this.by0 || x >= this.bx1 || y >= this.by1) return;
+    // callers already clip to the shader's box; re-testing here cost a
+    // branch on every covered pixel
     var s = this.s, i = y * s.w + x;
     if (z >= s.depth[i]) return;
-    if (cov >= 0.995) s.depth[i] = z;
+    if (this.ghost > 0) { cov *= this.ghost; }
+    else if (cov >= 0.995) s.depth[i] = z;
 
     var d = nx * LX + ny * LY + nz * LZ;
     if (d < 0) d = 0;
@@ -100,11 +110,14 @@ var FX = FX || {};
     f *= 0.34;
 
     // Blinn specular against the key light
-    var hx = LX, hy = LY, hz = LZ + 1;
-    var hl = 1 / Math.sqrt(hx * hx + hy * hy + hz * hz);
-    var sp = nx * hx * hl + ny * hy * hl + nz * hz * hl;
+    var sp = nx * this.HX + ny * this.HY + nz * this.HZ;
     if (sp < 0) sp = 0;
-    sp = Math.pow(sp, m.gloss) * m.spec;
+    else if (m.spec > 0.001) {
+      // integer gloss by repeated squaring beats Math.pow per pixel
+      var e = m.gloss, acc = 1, base = sp;
+      while (e > 0) { if (e & 1) acc *= base; base *= base; e >>= 1; }
+      sp = acc * m.spec;
+    } else sp = 0;
 
     // rim, gated by direction
     var rb = nx * BX + ny * BY + nz * BZ;
@@ -116,11 +129,12 @@ var FX = FX || {};
     // per-pixel ambient occlusion from the body's own masses
     for (var oi = 0; oi < this.nOcc; oi++) {
       var o = this.occ[oi];
+      if (z <= o.z) continue;                       // only occluders in front
       var odx = x - o.x, ody = y - o.y;
       var od2 = odx * odx + ody * ody;
-      if (od2 > o.r2) continue;
-      if (z <= o.z) continue;                       // only occluders in front
-      occ *= 1 - o.k * (1 - Math.sqrt(od2) / o.r) * Math.min(1, (z - o.z) / 16);
+      if (od2 >= o.r2) continue;
+      var dz = z - o.z; if (dz > 16) dz = 16;
+      occ *= 1 - o.k * (1 - od2 / o.r2) * dz * 0.0625;
     }
 
     // subsurface warmth on the terminator; without it the cold fill light
@@ -182,8 +196,10 @@ var FX = FX || {};
         var qx = ax + ux * seg * t, qy = ay + uy * seg * t;
         var r = r0 + (r1 - r0) * t;
         var ex = x + 0.5 - qx, ey = y + 0.5 - qy;
-        var dist = Math.sqrt(ex * ex + ey * ey);
-        if (dist > r + 0.75) continue;
+        var d2 = ex * ex + ey * ey;
+        var rlim = r + 0.75;
+        if (d2 > rlim * rlim) continue;               // reject before the sqrt
+        var dist = Math.sqrt(d2);
         var cov = r + 0.5 - dist;
         if (cov > 1) cov = 1; else if (cov <= 0) continue;
         var u = (ex * px + ey * py) / r;
