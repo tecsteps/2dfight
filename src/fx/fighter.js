@@ -34,9 +34,9 @@ var FX = FX || {};
   var L = {
     headRX: 7.4, headRY: 8.8, neck: 4.6,
     torso: 41,
-    chestD: 8.6, waistD: 7.0, hipD: 8.8,       // half-depth, front to back
+    chestD: 7.8, waistD: 5.8, hipD: 7.2,       // half-depth, front to back
     chestH: 12.5, waistH: 10.0, hipH2: 9.2,    // half-height of each mass
-    shoulderSep: 6.8, shoulderR: 7.0,
+    shoulderSep: 9.6, shoulderR: 8.2,
     uArm: 23, lArm: 20, hand: 4.6,
     uLeg: 32, lLeg: 29, foot: 13,
     standHip: 64
@@ -215,7 +215,7 @@ var FX = FX || {};
     this.breath += dt * (1.55 + (1 - this.hp / this.maxHp) * 1.5);
     this.sway += dt * 0.62;
     this.blinkT += dt;
-    if (this.flash > 0) this.flash = Math.max(0, this.flash - dt * 5);
+    if (this.flash > 0) this.flash = Math.max(0, this.flash - dt * 14);
     if (this.stun > 0) this.stun = Math.max(0, this.stun - dt);
 
     if (d.dur > 0) {

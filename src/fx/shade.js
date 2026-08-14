@@ -28,9 +28,9 @@ var FX = FX || {};
 
   /* Materials: base colour, how shiny, how much rim. Tuned to read as
    * cloth / skin / metal rather than as tinted plastic. */
-  function mat(r, g, b, spec, gloss, rim) {
+  function mat(r, g, b, spec, gloss, rim, sss) {
     return { r: r, g: g, b: b, spec: spec === undefined ? 0.12 : spec,
-      gloss: gloss || 12, rim: rim === undefined ? 0.5 : rim };
+      gloss: gloss || 12, rim: rim === undefined ? 0.5 : rim, sss: sss || 0 };
   }
   F.mat = mat;
 
@@ -38,6 +38,10 @@ var FX = FX || {};
   var LX = -0.36, LY = -0.66, LZ = 0.66;
   // a second, cooler fill from the opposite side keeps shadows from going flat
   var FX2 = 0.55, FY2 = -0.15, FZ2 = 0.82;
+  // back-left kicker: the rim only fires where the surface turns away from
+  // the viewer *toward this direction*, which is what makes a lit side and a
+  // dark side instead of a uniform glowing outline
+  var BX = 0.66, BY = -0.34, BZ = -0.67;
 
   function Shader(surf) {
     this.s = surf;
@@ -52,12 +56,28 @@ var FX = FX || {};
     this.rimR = 190; this.rimG = 214; this.rimB = 255;
     this.tint = 0;                                     // 0..1 hit flash
     this.tintR = 255; this.tintG = 255; this.tintB = 255;
+    this.occ = []; this.nOcc = 0;
+    this.ox = 0; this.oy = 0;                          // screen shake
   }
+
+  /* Occluders are a handful of body masses in device space. Anything drawn
+   * behind one darkens near it, which is what puts shadow in the armpit,
+   * under the chin, under the belt and where the near arm crosses the
+   * chest. Six discs is enough to read as ambient occlusion. */
+  Shader.prototype.clearOcc = function () { this.nOcc = 0; };
+  Shader.prototype.addOcc = function (x, y, r, z, k) {
+    var S = this.S;
+    var o = this.occ[this.nOcc] || (this.occ[this.nOcc] = {});
+    o.x = x * S + this.ox; o.y = y * S + this.oy; o.r = r * S;
+    o.r2 = o.r * o.r; o.z = z * S; o.k = k === undefined ? 0.5 : k;
+    this.nOcc++;
+  };
 
   /* Reserve a region: the depth buffer only needs clearing where we draw. */
   Shader.prototype.begin = function (x0, y0, x1, y1) {
     var S = this.S;
-    x0 *= S; y0 *= S; x1 *= S; y1 *= S;
+    x0 = x0 * S + this.ox; y0 = y0 * S + this.oy;
+    x1 = x1 * S + this.ox; y1 = y1 * S + this.oy;
     this.bx0 = Math.max(0, x0 | 0); this.by0 = Math.max(0, y0 | 0);
     this.bx1 = Math.min(this.s.w, x1 | 0); this.by1 = Math.min(this.s.h, y1 | 0);
     this.s.clearDepthRect(this.bx0, this.by0, this.bx1, this.by1);
@@ -86,21 +106,39 @@ var FX = FX || {};
     if (sp < 0) sp = 0;
     sp = Math.pow(sp, m.gloss) * m.spec;
 
-    // rim: strongest where the surface turns away from the viewer
+    // rim, gated by direction
+    var rb = nx * BX + ny * BY + nz * BZ;
+    if (rb < 0) rb = 0;
     var rim = 1 - nz;
-    rim = rim * rim * rim * m.rim;
+    rim = rim * rim * rim * rb * m.rim * 2.0;
 
     var occ = ao === undefined ? 1 : ao;
-    var r = (this.ambR + this.keyR * d) * m.r / 255 * occ + this.fillR * f * m.r / 255
-      + this.keyR * sp + this.rimR * rim;
-    var g = (this.ambG + this.keyG * d) * m.g / 255 * occ + this.fillG * f * m.g / 255
-      + this.keyG * sp + this.rimG * rim;
-    var b = (this.ambB + this.keyB * d) * m.b / 255 * occ + this.fillB * f * m.b / 255
-      + this.keyB * sp + this.rimB * rim;
+    // per-pixel ambient occlusion from the body's own masses
+    for (var oi = 0; oi < this.nOcc; oi++) {
+      var o = this.occ[oi];
+      var odx = x - o.x, ody = y - o.y;
+      var od2 = odx * odx + ody * ody;
+      if (od2 > o.r2) continue;
+      if (z <= o.z) continue;                       // only occluders in front
+      occ *= 1 - o.k * (1 - Math.sqrt(od2) / o.r) * Math.min(1, (z - o.z) / 16);
+    }
+
+    // subsurface warmth on the terminator; without it the cold fill light
+    // makes skin read dead
+    var sss = m.sss ? m.sss * (1 - d) * (nz * 0.6 + 0.4) : 0;
+
+    var r = ((this.ambR + this.keyR * d) * m.r / 255 + this.fillR * f * m.r / 255
+      + this.keyR * sp + this.rimR * rim + 62 * sss) * occ;
+    var g = ((this.ambG + this.keyG * d) * m.g / 255 + this.fillG * f * m.g / 255
+      + this.keyG * sp + this.rimG * rim + 26 * sss) * occ;
+    var b = ((this.ambB + this.keyB * d) * m.b / 255 + this.fillB * f * m.b / 255
+      + this.keyB * sp + this.rimB * rim + 14 * sss) * occ;
 
     if (this.tint > 0) {
-      var t = this.tint;
-      r += (this.tintR - r) * t; g += (this.tintG - g) * t; b += (this.tintB - b) * t;
+      // additive, clamped -- lerping to a flat colour turned the struck
+      // fighter into a paper cutout
+      var t = this.tint * 0.62;
+      r += this.tintR * t; g += this.tintG * t; b += this.tintB * t;
     }
     if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
     if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
@@ -121,7 +159,9 @@ var FX = FX || {};
    * limbs sort correctly. */
   Shader.prototype.capsule = function (ax, ay, bx, by, r0, r1, zb, m, ao) {
     var S = this.S;
-    if (S !== 1) { ax *= S; ay *= S; bx *= S; by *= S; r0 *= S; r1 *= S; zb *= S; }
+    ax = ax * S + this.ox; ay = ay * S + this.oy;
+    bx = bx * S + this.ox; by = by * S + this.oy;
+    r0 *= S; r1 *= S; zb *= S;
     var dx = bx - ax, dy = by - ay;
     var seg = Math.sqrt(dx * dx + dy * dy);
     if (seg < 0.0001) { this.sphere(ax, ay, Math.max(r0, r1), zb, m, ao); return; }
@@ -161,7 +201,8 @@ var FX = FX || {};
   /* An ellipsoid, optionally rotated -- heads, shoulders, torso masses. */
   Shader.prototype.ellipsoid = function (cx, cy, rx, ry, rot, zb, m, ao) {
     var S = this.S;
-    if (S !== 1) { cx *= S; cy *= S; rx *= S; ry *= S; zb *= S; }
+    cx = cx * S + this.ox; cy = cy * S + this.oy;
+    rx *= S; ry *= S; zb *= S;
     var ca = Math.cos(rot), sa = Math.sin(rot);
     var rr = Math.max(rx, ry);
     var x0 = Math.floor(cx - rr - 1), x1 = Math.ceil(cx + rr + 1);

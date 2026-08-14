@@ -275,10 +275,13 @@ var FX = FX || {};
       df.start(d.dmg >= 10 ? 'hitHeavy' : (lowMove ? 'hitLow' : 'hitHigh'));
     }
 
-    this.fx.spark(hx, hy, d.super ? 46 : 16 + d.dmg, d.super ? 2.0 : 0.6 + d.dmg / 24,
+    this.fx.spark(hx, hy, d.super ? 70 : 28 + d.dmg * 2, d.super ? 2.4 : 0.8 + d.dmg / 20,
       d.super ? [255, 190, 255] : [255, 228, 150]);
+    if (d.dmg >= 10) this.fx.dust(hx, GROUND, 7, at.facing);
+    this.fx.flash = Math.max(this.fx.flash, d.super ? 0.8 : 0.22);
     this.fx.ring(hx, hy, d.super ? 2.2 : 0.6 + d.dmg / 20, d.super ? [255, 170, 255] : null);
     this.fx.shake = Math.max(this.fx.shake, d.hs);
+    this.fx.shakeDir = at.facing;
     this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.18 : 0.05 + d.hs * 0.12);
     if (d.super) this.fx.flash = 0.8;
     if (this.onSound) this.onSound(d.super ? 'super' : (d.dmg >= 10 ? 'heavy' : 'hit'));
@@ -417,16 +420,21 @@ var FX = FX || {};
 
   Match.prototype.render = function () {
     var surf = this.surf, S = SCALE;
-    surf.copyFrom(this.bg);
 
+    /* Screen shake, as a decaying oscillation along the hit direction --
+     * white noise reads as a rattle, a sine reads as an impact. */
     var ox = 0, oy = 0;
     if (this.fx.shake > 0) {
-      var k = this.fx.shake * this.fx.shake * 13;
-      ox = (Math.random() - 0.5) * k * S; oy = (Math.random() - 0.5) * k * S;
+      var k = this.fx.shake * this.fx.shake * 16 * S;
+      this.shakeT = (this.shakeT || 0) + 1;
+      ox = Math.sin(this.shakeT * 1.9) * k * (this.fx.shakeDir || 1);
+      oy = Math.sin(this.shakeT * 2.7) * k * 0.45;
     }
+    surf.copyFromOffset(this.bg, ox, oy);
+    this.sh.ox = ox; this.sh.oy = oy;
 
-    F.drawShadow(surf, this.a, GROUND * 1);
-    F.drawShadow(surf, this.b, GROUND * 1);
+    F.drawShadow(surf, this.a, GROUND, S);
+    F.drawShadow(surf, this.b, GROUND, S);
 
     // far fighter first
     var order = this.a.y <= this.b.y ? [this.a, this.b] : [this.b, this.a];
@@ -438,6 +446,7 @@ var FX = FX || {};
     }
 
     this.fx.draw(surf, ox, oy);
+    this.sh.ox = 0; this.sh.oy = 0;
     if (this.fx.flash > 0) {
       surf.blendRect(0, 0, surf.w, surf.h, 255, 244, 230, this.fx.flash * 0.5);
     }

@@ -21,11 +21,11 @@ var FX = FX || {};
 
   function mkSkin(o) {
     return {
-      skin: F.mat(o.skin[0], o.skin[1], o.skin[2], 0.16, 16, 0.55),
-      gi: F.mat(o.gi[0], o.gi[1], o.gi[2], 0.07, 8, 0.68),
-      gi2: F.mat(o.gi2[0], o.gi2[1], o.gi2[2], 0.07, 8, 0.6),
-      trim: F.mat(o.trim[0], o.trim[1], o.trim[2], 0.20, 22, 0.7),
-      hair: F.mat(o.hair[0], o.hair[1], o.hair[2], 0.28, 26, 0.8),
+      skin: F.mat(o.skin[0], o.skin[1], o.skin[2], 0.22, 30, 0.5, 1.0),
+      gi: F.mat(o.gi[0], o.gi[1], o.gi[2], 0.02, 4, 0.34),
+      gi2: F.mat(o.gi2[0], o.gi2[1], o.gi2[2], 0.02, 4, 0.30),
+      trim: F.mat(o.trim[0], o.trim[1], o.trim[2], 0.16, 20, 0.5),
+      hair: F.mat(o.hair[0], o.hair[1], o.hair[2], 0.34, 34, 0.7),
       metal: F.mat(210, 218, 232, 0.75, 60, 1.0),
       name: o.name, tint: o.tint || [255, 210, 120]
     };
@@ -68,10 +68,14 @@ var FX = FX || {};
 
   /* The contact shadow. Cheap, and it is most of what glues a character to
    * the floor -- without it a fighter looks pasted on. */
-  F.drawShadow = function (surf, f, groundY) {
+  F.drawShadow = function (surf, f, groundY, S) {
+    S = S || 1;
     var lift = Math.max(0, groundY - f.y);
-    var k = Math.max(0.16, 1 - lift / 150);
-    surf.shadowEllipse(f.x + 6, groundY + 2, 30 * k, 8.5 * k, 0.62 * k);
+    var k = Math.max(0.34, 1 - lift / 150);
+    // broad soft pool, then a tight dark core under the weight -- the core
+    // is what actually glues a figure to the floor
+    surf.shadowEllipse((f.x + 4) * S, (groundY + 2) * S, 34 * k * S, 9 * k * S, 0.44 * k);
+    surf.shadowEllipse((f.x + 4) * S, (groundY + 2) * S, 15 * k * S, 4.2 * k * S, 0.58 * k);
   };
 
   F.drawFighter = function (sh, f) {
@@ -81,6 +85,14 @@ var FX = FX || {};
 
     sh.tint = f.flash;
     sh.tintR = sk.tint[0]; sh.tintG = sk.tint[1]; sh.tintB = sk.tint[2];
+
+    sh.clearOcc();
+    sh.addOcc(p.chest[0], p.chest[1], L.chestD * 1.7, Z.torso, 0.55);
+    sh.addOcc(p.waist[0], p.waist[1], L.waistD * 1.7, Z.torso, 0.5);
+    sh.addOcc(p.hip[0], p.hip[1], L.hipD * 1.7, Z.torso, 0.5);
+    sh.addOcc(p.headC[0], p.headC[1], L.headRX * 1.5, Z.head, 0.5);
+    sh.addOcc(p.shoulders[1][0], p.shoulders[1][1], L.shoulderR * 1.4, Z.torso - 2, 0.45);
+    sh.addOcc(p.arms[1].wrist[0], p.arms[1].wrist[1], 9, Z.nearArm, 0.4);
 
     var far = 0, near = 1;                    // arm/leg indices
     drawLeg(sh, p.legs[far], sk, Z.farLeg, 0.72, fw);
@@ -110,7 +122,10 @@ var FX = FX || {};
   }
 
   function drawArm(sh, a, sk, z, ao, fw) {
-    sh.sphere(a.sh[0], a.sh[1], L.shoulderR, z + 1, sk.gi, ao);
+    // deltoid: a cap angled down the upper arm, not a ball stuck on the
+    // chest. The ball read unmistakably as a breast on both fighters.
+    var delt = lerp(a.sh, a.elbow, 0.30);
+    sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 7.0, 5.2, z + 1, sk.gi, ao);
     var sleeve = lerp(a.sh, a.elbow, 0.60);
     sh.capsule(a.sh[0], a.sh[1], sleeve[0], sleeve[1], 6.4, 5.2, z, sk.gi, ao);
     sh.capsule(sleeve[0], sleeve[1], a.elbow[0], a.elbow[1], 4.8, 4.2, z + 0.6, sk.skin, ao);
@@ -126,16 +141,26 @@ var FX = FX || {};
   function drawTorso(sh, p, f, sk, fw) {
     var la = p.leanA * Math.PI / 180;
     // pelvis, abdomen, chest -- three masses give the taper a real body has
-    sh.ellipsoid(p.hip[0], p.hip[1], L.hipD, L.hipH2, la + Math.PI / 2, Z.hipD, sk.gi, 0.95);
+    sh.ellipsoid(p.hip[0], p.hip[1], L.hipD, L.hipH2, la + Math.PI / 2, Z.torso, sk.gi, 0.95);
     sh.ellipsoid(p.waist[0], p.waist[1], L.waistD, L.waistH, la + Math.PI / 2, Z.torso, sk.gi, 0.98);
-    sh.ellipsoid(p.chest[0], p.chest[1], L.chestD, L.chestH, la + Math.PI / 2, Z.torso - 1, sk.gi, 1);
-    // the yoke across the shoulders -- this is what gives the V
-    sh.capsule(p.shoulders[0][0], p.shoulders[0][1], p.shoulders[1][0], p.shoulders[1][1],
-      7.6, 7.6, Z.torso - 2, sk.gi, 1);
+    sh.ellipsoid(p.chest[0], p.chest[1], L.chestD, L.chestH, la + Math.PI / 2, Z.torso, sk.gi, 1);
+    // trapezius: neck out to each shoulder, so the head stops sitting on a
+    // flat shelf
+    for (var t2 = 0; t2 < 2; t2++) {
+      sh.capsule(p.neck[0], p.neck[1], p.shoulders[t2][0], p.shoulders[t2][1],
+        5.2, 7.4, Z.torso - 2, sk.gi, 1);
+    }
+    // latissimus: shoulder down to the waist. This is the V, and it fills
+    // the armpit that was previously a hole.
+    for (var t3 = 0; t3 < 2; t3++) {
+      var top3 = lerp(p.shoulders[t3], p.waist, 0.22);
+      sh.capsule(top3[0], top3[1], p.waist[0], p.waist[1],
+        4.8, 3.0, Z.torso + 3, sk.gi, 0.9);
+    }
 
     // the gi's open front: a darker panel down the centreline
     var top = lerp(p.chest, p.neck, 0.42), bot = lerp(p.hip, p.waist, 0.5);
-    sh.capsule(top[0] + fw * 3.0, top[1], bot[0] + fw * 2.0, bot[1], 4.2, 5.2, Z.torso - 3, sk.gi2, 1);
+    sh.capsule(top[0] + fw * 2.6, top[1], bot[0] + fw * 1.6, bot[1], 3.2, 4.4, Z.torso - 3, sk.gi2, 1);
 
     // belt
     var b0 = lerp(p.hip, p.waist, 0.62);
@@ -155,9 +180,9 @@ var FX = FX || {};
       p.headC[1] - Math.sin(ha) * L.headRY * 0.7, 4.6, 4.2, Z.neck, sk.skin, 0.88);
     // skull and jaw
     sh.ellipsoid(p.headC[0], p.headC[1], L.headRX, L.headRY, ha + Math.PI / 2, Z.head, sk.skin, 1);
-    var jaw = [p.headC[0] - Math.cos(ha) * 3.0 + Math.cos(ha + Math.PI / 2 * fw) * 2.0,
-      p.headC[1] - Math.sin(ha) * 3.0 + Math.sin(ha + Math.PI / 2 * fw) * 2.0];
-    sh.ellipsoid(jaw[0], jaw[1], 5.4, 5.0, ha, Z.head - 1, sk.skin, 0.97);
+    var jaw = [p.headC[0] - Math.cos(ha) * 3.4 + Math.cos(ha + Math.PI / 2 * fw) * 2.6,
+      p.headC[1] - Math.sin(ha) * 3.4 + Math.sin(ha + Math.PI / 2 * fw) * 2.6];
+    sh.ellipsoid(jaw[0], jaw[1], 4.4, 4.0, ha, Z.head - 1, sk.skin, 0.99);
 
     // hair: a cap set back off the brow, plus the verlet tail
     var bx = Math.cos(ha + Math.PI / 2 * fw), by = Math.sin(ha + Math.PI / 2 * fw);
@@ -182,12 +207,17 @@ var FX = FX || {};
     }
     // nose
     fp(L.headRX * 0.92, -0.4, 2.3, 1.9, ha, Z.head - 2, sk.skin, 1.04);
-    // brow shelf
-    fp(L.headRX * 0.62, 2.2, 3.0, 1.5, ha + Math.PI / 2, Z.head - 2, sk.hair, 0.9);
-    // eye
+    // brow shelf, in darkened skin -- drawing it in hair put a visor over
+    // the eye and the face read as a blank
+    fp(L.headRX * 0.60, 3.4, 2.6, 1.0, ha + Math.PI / 2, Z.head - 2, sk.skin, 0.66);
+    // eyebrow
+    fp(L.headRX * 0.62, 4.6, 2.3, 0.75, ha + Math.PI / 2, Z.head - 3, sk.hair, 1);
+    // eye: a sclera makes it read at this size; a dark dot never will
     var open = f.blinkT % f.blink > 0.13 ? 1 : 0.16;
-    fp(L.headRX * 0.60, 0.5, 1.9, 1.7 * open, ha + Math.PI / 2, Z.head - 3,
-      F.mat(24, 20, 28, 0.55, 45, 0.3));
+    fp(L.headRX * 0.60, 0.9, 2.4, 1.9 * open, ha + Math.PI / 2, Z.head - 3,
+      F.mat(226, 222, 228, 0.3, 30, 0.25));
+    fp(L.headRX * 0.72, 0.9, 1.3, 1.5 * open, ha + Math.PI / 2, Z.head - 4,
+      F.mat(38, 30, 44, 0.6, 50, 0.2));
     // mouth line
     fp(L.headRX * 0.66, -3.4, 1.7, 0.75, ha + Math.PI / 2, Z.head - 3,
       F.mat(150, 84, 78, 0.1, 10, 0.2));

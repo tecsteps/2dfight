@@ -49,6 +49,23 @@ var FX = FX || {};
 
   Surface.prototype.clear = function (c) { this.px.fill(c >>> 0); };
   Surface.prototype.copyFrom = function (other) { this.px.set(other.px); };
+
+  /* Copy with an offset, for screen shake and parallax. Rows outside the
+   * source are clamped rather than left blank. */
+  Surface.prototype.copyFromOffset = function (other, dx, dy) {
+    dx = dx | 0; dy = dy | 0;
+    if (dx === 0 && dy === 0) { this.px.set(other.px); return; }
+    var W = this.w, H = this.h, src = other.px, dst = this.px;
+    for (var y = 0; y < H; y++) {
+      var sy = y - dy; if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
+      var so = sy * W, dof = y * W;
+      if (dx === 0) { dst.set(src.subarray(so, so + W), dof); continue; }
+      for (var x = 0; x < W; x++) {
+        var sx = x - dx; if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
+        dst[dof + x] = src[so + sx];
+      }
+    }
+  };
   Surface.prototype.clearDepth = function () { this.depth.fill(1e9); };
 
   /* Clear only a rectangle of the depth buffer -- the characters occupy a
