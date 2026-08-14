@@ -71,6 +71,23 @@ var FX = FX || {};
   function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
   function smooth(t) { return t * t * (3 - 2 * t); }
 
+  /* The strike envelope: anticipate, snap, HOLD, drag back.
+   *
+   * The first version was a symmetric bell -- ease out to a peak, ease back.
+   * Measured, that peaked at p~0.6, after the move's own hit window had
+   * already closed, and reached only ~84% of the authored extension because
+   * the limb spring could not catch a target that was already retreating.
+   * So the hitstop freeze landed on a half-extended arm and nothing read as
+   * a blow. A fighting game wants a plateau: the limb arrives early, locks
+   * out, and *stays* there through the active frames. */
+  function strikeEnv(p) {
+    return p < 0.14 ? -0.20 * smooth(p / 0.14)
+      : p < 0.34 ? -0.20 + 1.20 * smooth((p - 0.14) / 0.20)
+        : p < 0.58 ? 1
+          : 1 - smooth((p - 0.58) / 0.42);
+  }
+  F.strikeEnv = strikeEnv;
+
   /* ---- move definitions ---------------------------------------------
    * Each move is a duration, a set of phase markers, and a function that
    * writes targets. `p` is normalised progress. Targets are in body-local
@@ -85,17 +102,17 @@ var FX = FX || {};
     blockLow: { dur: 0, loop: true },
     jump: { dur: 0, loop: true },
 
-    jab:       { dur: 0.26, hit: [0.30, 0.48], dmg: 4,  reach: 46, hy: 12,  arm: 0, push: 26, hs: 0.16 },
-    cross:     { dur: 0.36, hit: [0.34, 0.54], dmg: 8,  reach: 52, hy: 10,  arm: 1, push: 46, hs: 0.24 },
-    hook:      { dur: 0.42, hit: [0.40, 0.58], dmg: 10, reach: 40, hy: 14,  arm: 1, push: 54, hs: 0.28, arc: 1 },
-    uppercut:  { dur: 0.50, hit: [0.36, 0.56], dmg: 13, reach: 34, hy: 26,  arm: 1, push: 40, hs: 0.34, launch: 210 },
-    lowKick:   { dur: 0.40, hit: [0.34, 0.54], dmg: 7,  reach: 50, hy: -30, leg: 1, push: 40, hs: 0.22, low: 1 },
-    highKick:  { dur: 0.50, hit: [0.38, 0.58], dmg: 12, reach: 56, hy: 22,  leg: 1, push: 62, hs: 0.30 },
-    roundhouse:{ dur: 0.58, hit: [0.44, 0.62], dmg: 15, reach: 58, hy: 6,   leg: 1, push: 78, hs: 0.36, arc: 1, launch: 120 },
-    sweep:     { dur: 0.46, hit: [0.36, 0.56], dmg: 8,  reach: 52, hy: -40, leg: 1, push: 24, hs: 0.26, low: 1, trip: 1 },
+    jab:       { dur: 0.22, hit: [0.40, 0.60], dmg: 4,  reach: 52, hy: 12,  arm: 0, push: 52,  hs: 0.16 },
+    cross:     { dur: 0.30, hit: [0.40, 0.62], dmg: 8,  reach: 58, hy: 10,  arm: 1, push: 132, hs: 0.24 },
+    hook:      { dur: 0.34, hit: [0.42, 0.62], dmg: 10, reach: 46, hy: 14,  arm: 1, push: 155, hs: 0.28, arc: 1 },
+    uppercut:  { dur: 0.40, hit: [0.38, 0.60], dmg: 13, reach: 40, hy: 36,  arm: 1, push: 120, hs: 0.34, launch: 250 },
+    lowKick:   { dur: 0.30, hit: [0.40, 0.62], dmg: 7,  reach: 50, hy: -30, leg: 1, push: 96,  hs: 0.22, low: 1 },
+    highKick:  { dur: 0.38, hit: [0.40, 0.62], dmg: 12, reach: 62, hy: 22,  leg: 1, push: 190, hs: 0.30 },
+    roundhouse:{ dur: 0.44, hit: [0.40, 0.62], dmg: 15, reach: 66, hy: 18,  leg: 1, push: 300, hs: 0.36, arc: 1.6, launch: 150 },
+    sweep:     { dur: 0.36, hit: [0.40, 0.62], dmg: 8,  reach: 52, hy: -40, leg: 1, push: 90,  hs: 0.26, low: 1, trip: 1 },
 
-    special:   { dur: 0.90, hit: [0.40, 0.70], dmg: 26, reach: 66, hy: 8, arm: 1,
-                 push: 130, hs: 0.5, launch: 260, super: 1 },
+    special:   { dur: 0.62, hit: [0.38, 0.66], dmg: 26, reach: 76, hy: 8, arm: 1,
+                 push: 560, hs: 0.5, launch: 300, super: 1 },
 
     grab:      { dur: 0.34, hit: [0.24, 0.44], grab: 1, reach: 34, hy: 6 },
     throw:     { dur: 0.85, dmg: 18 },
@@ -144,7 +161,7 @@ var FX = FX || {};
     this.lean = new Spring(0, 11);           // degrees, + = forward
     this.twist = new Spring(0, 13);          // shoulder counter-rotation
     this.headA = new Spring(0, 9);
-    this.crouchS = new Spring(0, 16);
+    this.crouchS = new Spring(0, 34);
     this.hipShift = new Spring(0, 7);        // weight on which foot
 
     // hands live as sprung points in body-local space
@@ -212,8 +229,8 @@ var FX = FX || {};
     cmd = cmd || {};
     var d = this.def();
 
-    this.breath += dt * (1.55 + (1 - this.hp / this.maxHp) * 1.5);
-    this.sway += dt * 0.62;
+    this.breath += dt * (4.4 + (1 - this.hp / this.maxHp) * 2.2);
+    this.sway += dt * 2.6;
     this.blinkT += dt;
     if (this.flash > 0) this.flash = Math.max(0, this.flash - dt * 14);
     if (this.stun > 0) this.stun = Math.max(0, this.stun - dt);
@@ -225,10 +242,17 @@ var FX = FX || {};
 
     // gravity and ground
     if (!this.onGround) {
-      this.vy += 780 * dt;
+      this.vy += 1800 * dt;
       this.y += this.vy * dt;
       if (this.y >= this.groundY) {
+        /* Capture the impact velocity and drive it into the hip spring, so
+         * the body compresses and rises back over ~20 frames. Previously the
+         * hip actually rose on landing and the character read as a decal. */
+        var iv = this.vy;
         this.y = this.groundY; this.vy = 0; this.onGround = true;
+        this.hipH.v -= Math.min(20, iv * 0.045); this.hipH.d = 0;
+        this.lean.v += Math.min(14, iv * 0.03);
+        this.landV = iv;
         if (this.onLand) this.onLand();
       }
     }
@@ -255,7 +279,8 @@ var FX = FX || {};
     this.crouchS.t = crouching ? 1 : 0;
 
     // breathing lifts the chest and rocks the shoulders a little
-    var hip = L.standHip - 22 * this.crouchS.v + br * 0.9;
+    var hip = L.standHip - 22 * this.crouchS.v + br * 3.4;
+    if (m === 'sweep') hip = L.standHip - 36 * Math.sin(Math.PI * p);
     if (!this.onGround) hip = L.standHip - 6;
     this.hipH.t = hip;
 
@@ -263,26 +288,37 @@ var FX = FX || {};
     if (m === 'walk') lean = 8;
     if (m === 'dash') lean = 16;
     if (crouching) lean = 16;
-    if (m === 'block' || m === 'blockLow') lean = -3;
+    if (m === 'block' || m === 'blockLow') { lean = -3; tw0 = -16; }
     if (d.arm || d.leg) lean = 6 + 16 * Math.sin(Math.PI * p);
     if (m === 'hitHigh' || m === 'hitHeavy') lean = -18 * Math.sin(Math.PI * p);
     if (m === 'hitLow') lean = 20 * Math.sin(Math.PI * p);
-    if (m === 'knockdown') lean = -70 * smooth(clamp01(p * 2));
-    if (m === 'defeat') lean = -60;
+    if (m === 'knockdown') { var kp = smooth(clamp01((p - 0.12) / 0.30)); lean = -88 * kp; hip = L.standHip * (1 - 0.80 * kp); }
+    if (m === 'defeat') { lean = -86; hip = L.standHip * 0.22; }
     if (m === 'victory') lean = -4 + br * 2;
     this.lean.t = lean;
 
     // shoulders counter-rotate against whichever limb is working
+    var tw0 = 0;
     var tw = br * 2.5;
-    if (d.arm !== undefined) tw = (d.arm ? -1 : 1) * 22 * Math.sin(Math.PI * p);
-    if (d.leg) tw = 26 * Math.sin(Math.PI * p);
+    if (d.arm !== undefined) tw = (d.arm ? -1 : 1) * 40 * strikeEnv(p);
+    if (d.leg) tw = 42 * strikeEnv(p);
     if (m === 'walk' || m === 'dash') tw = Math.sin(this.phase * TAU) * 9;
-    this.twist.t = tw;
+    this.twist.t = tw + tw0;
 
     this.headA.t = (m === 'knockdown' || m === 'defeat') ? 26 : -br * 2.2 - this.lean.v * 0.25;
 
     // idle weight shift: a slow drift from one foot to the other
-    this.hipShift.t = (m === 'idle' || m === 'block') ? Math.sin(this.sway) * 2.4 : 0;
+    /* The weight shift used to switch off during every attack, so the
+     * character became *more* static the moment it acted. */
+    this.hipShift.t = Math.sin(this.sway) * ((m === 'idle' || m === 'block') ? 5.5 : 2.0);
+
+    // a periodic shoulder roll: real idles are not pure sinusoids
+    var beat = (this.breath * 0.23) % (Math.PI * 2);
+    if (beat < 0.9) {
+      var bk = Math.sin(beat / 0.9 * Math.PI);
+      this.twist.t += 5 * bk;
+      this.headA.t += 3 * bk;
+    }
   };
 
   /* Hand targets in body-local space. Every move writes here; the springs
@@ -291,13 +327,14 @@ var FX = FX || {};
     var m = this.move, p = this.progress(), d = this.def();
     var br = Math.sin(this.breath), br2 = Math.sin(this.breath * 2);
     // guard stance: lead hand up and forward, rear hand by the chin
-    var g = [[8 + br * 0.9, 7 + br2 * 0.8], [17 + br * 1.2, 11 + br2 * 0.9]];
+    var brA = Math.sin(this.breath + 0.6);
+    var g = [[8 + br * 2.6, 7 + br2 * 2.2], [17 + brA * 3.0, 11 + br2 * 2.4]];
 
-    if (m === 'block') { g = [[11, 14], [16, 16]]; }
+    if (m === 'block') { g = [[14, 17], [7, 19]]; }
     else if (m === 'blockLow') { g = [[9, -2], [13, 1]]; }
     else if (m === 'crouch') { g = [[6, -4], [12, -1]]; }
     else if (m === 'walk') { g = [[7 + Math.sin(this.phase * TAU) * 3, 1], [16, 5]]; }
-    else if (m === 'jump') { g = [[2, 12], [10, 14]]; }
+    else if (m === 'jump') { g = [[-4, 2], [13, 15]]; }
     else if (m === 'hitHigh' || m === 'hitHeavy') {
       var k = Math.sin(Math.PI * p);
       g = [[7 - 9 * k, 1 + 10 * k], [14 - 12 * k, 5 + 12 * k]];
@@ -310,12 +347,16 @@ var FX = FX || {};
     } else if (m === 'throw') {
       var tp = smooth(p);
       g = [[8 + 16 * Math.sin(Math.PI * tp), 4 + 22 * tp], [16 + 14 * Math.sin(Math.PI * tp), 8 + 20 * tp]];
+    } else if (d.leg) {
+      // half a kick's readability is the arm counter-swing
+      var ke = strikeEnv(p);
+      g = [[8 - 18 * ke, 7 + 12 * ke], [17 - 8 * ke, 11 - 16 * ke]];
     } else if (d.arm !== undefined) {
       /* A strike: the working hand runs out to reach and back. `arc` swings
        * it wide instead of straight, which is what separates a hook from a
        * cross without a second animation. */
       var i = d.arm;
-      var ex = p < 0.45 ? smooth(p / 0.45) : 1 - smooth((p - 0.45) / 0.55);
+      var ex = strikeEnv(p);
       var reach = d.reach, hy = d.hy;
       var hx2 = 8 + (reach - 8) * ex;
       var hy2 = 7 + (hy - 7) * ex;
@@ -332,7 +373,7 @@ var FX = FX || {};
     }
 
     for (var h = 0; h < 2; h++) {
-      var stiff = (d.arm !== undefined && h === d.arm) ? 42 : 16;
+      var stiff = (d.arm !== undefined && h === d.arm) ? (p < 0.58 ? 130 : 45) : 16;
       this.hand[h].x.w = stiff; this.hand[h].y.w = stiff;
       this.hand[h].x.t = g[h][0];
       this.hand[h].y.t = g[h][1];
@@ -345,7 +386,7 @@ var FX = FX || {};
 
     // kicking foot target
     if (d.leg) {
-      var ex = p < 0.45 ? smooth(p / 0.45) : 1 - smooth((p - 0.45) / 0.55);
+      var ex = strikeEnv(p);
       var kx = 4 + (d.reach - 4) * ex;
       var ky = -34 + (d.hy + 34) * ex;
       if (d.arc) {
@@ -354,7 +395,7 @@ var FX = FX || {};
         ky = d.hy * ex + Math.cos(a) * 16 * ex;
       }
       this.kick.on = 1; this.kick.leg = 1;
-      this.kick.x.w = 40; this.kick.y.w = 40;
+      this.kick.x.w = this.kick.y.w = (p < 0.58 ? 110 : 40);
       this.kick.x.t = kx; this.kick.y.t = ky;
     } else {
       this.kick.on = 0;
@@ -415,7 +456,7 @@ var FX = FX || {};
       want[0] = this.x - lead * 5;
     }
     if (m === 'knockdown' || m === 'defeat') {
-      want = [this.x - lead * 26, this.x - lead * 6];
+      want = [this.x - lead * 40, this.x - lead * 14];
     }
     for (var s = 0; s < 2; s++) {
       var fs = this.feet[s];
@@ -423,7 +464,8 @@ var FX = FX || {};
       var rate = (m === 'dash' || this.kick.on) ? 18 : 7;
       fs.wx += (want[s] - fs.wx) * Math.min(1, dt * rate);
       fs.wy += (gy - fs.wy) * Math.min(1, dt * 14);
-      fs.angle += ((s === 0 ? -12 : 4) - fs.angle) * Math.min(1, dt * 7);
+      // a heel that breathes is the cheapest sign of life there is
+      fs.angle += ((s === 0 ? -12 + Math.sin(this.breath) * 7 : 4) - fs.angle) * Math.min(1, dt * 7);
     }
   };
 
@@ -440,7 +482,7 @@ var FX = FX || {};
     for (var i = 0; i < this.hair.length; i++) {
       var h = this.hair[i];
       h.vy += 620 * dt;
-      h.vx *= 0.90; h.vy *= 0.90;
+      h.vx *= 0.965; h.vy *= 0.965;
       h.x += h.vx * dt; h.y += h.vy * dt;
       var px = i === 0 ? ax : this.hair[i - 1].x;
       var py = i === 0 ? ay : this.hair[i - 1].y;
@@ -448,14 +490,14 @@ var FX = FX || {};
       var d = Math.sqrt(dx * dx + dy * dy) || 0.0001;
       var k = (d - seg) / d;
       h.x -= dx * k; h.y -= dy * k;
-      h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.30;
-      h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.30;
+      h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.55;
+      h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.55;
     }
     var bx = this.x - this.facing * 3, by = hipY + 3;
     for (var j = 0; j < this.belt.length; j++) {
       var b = this.belt[j];
       b.vy += 700 * dt;
-      b.vx *= 0.88; b.vy *= 0.88;
+      b.vx *= 0.955; b.vy *= 0.955;
       b.x += b.vx * dt; b.y += b.vy * dt;
       var qx = j === 0 ? bx : this.belt[j - 1].x;
       var qy = j === 0 ? by : this.belt[j - 1].y;
@@ -463,8 +505,8 @@ var FX = FX || {};
       var e = Math.sqrt(ex * ex + ey * ey) || 0.0001;
       var kk = (e - 9) / e;
       b.x -= ex * kk; b.y -= ey * kk;
-      b.vx += (-ex * kk) / Math.max(dt, 0.0001) * 0.30;
-      b.vy += (-ey * kk) / Math.max(dt, 0.0001) * 0.30;
+      b.vx += (-ex * kk) / Math.max(dt, 0.0001) * 0.55;
+      b.vy += (-ey * kk) / Math.max(dt, 0.0001) * 0.55;
     }
   };
 

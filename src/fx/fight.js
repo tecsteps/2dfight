@@ -190,12 +190,25 @@ var FX = FX || {};
     this.a.name = 'KAI'; this.b.name = 'RYO';
     this.reset();
 
+    var self = this;
+    this.a.onLand = function () {
+      var n = 5 + Math.min(14, (self.a.landV || 0) / 34);
+      self.fx.dust(self.a.x, GROUND, n | 0, 1);
+      if ((self.a.landV || 0) > 420) self.fx.shake = Math.max(self.fx.shake, 0.18);
+    };
+    this.b.onLand = function () {
+      var n = 5 + Math.min(14, (self.b.landV || 0) / 34);
+      self.fx.dust(self.b.x, GROUND, n | 0, -1);
+      if ((self.b.landV || 0) > 420) self.fx.shake = Math.max(self.fx.shake, 0.18);
+    };
+
     this.input = { l: 0, r: 0, u: 0, d: 0, p: 0, k: 0, s: 0, g: 0 };
     this.demo = true;
     this.time = 99; this.round = 1; this.wins = [0, 0];
     this.over = 0; this.banner = ''; this.bannerT = 0;
     this.acc = 0; this.last = 0;
     this.aiT = [0, 0];
+    this.aiHold = [null, null];
   }
 
   Match.prototype.reset = function () {
@@ -242,18 +255,27 @@ var FX = FX || {};
       df.vx += at.facing * d.push * 0.45;
       at.vx -= at.facing * 22;
       df.flash = 0.5;
+      df.lean.v -= 6; df.hand[1].x.v -= 5;
       this.fx.spark(hx, hy, 9, 0.5, [180, 220, 255]);
       this.fx.ring(hx, hy, 0.5, [170, 210, 255]);
       this.fx.shake = Math.max(this.fx.shake, d.hs * 0.4);
-      this.fx.hitstop = Math.max(this.fx.hitstop, 0.045);
+      this.fx.hitstop = Math.max(this.fx.hitstop, 0.075);
       at.combo = 0;
       if (this.onSound) this.onSound('block');
       return;
     }
 
     if (d.grab) {
+      var td = F.MOVES.throw.dmg;
+      df.hp = Math.max(0, df.hp - td);
       df.start('thrown'); df.stun = 0.9;
+      df.vx = at.facing * 240; df.vy = -260; df.onGround = false;
+      df.flash = 0.85;
       at.start('throw');
+      at.meter = Math.min(100, at.meter + td * 1.5);
+      this.fx.spark(hx, hy, 22, 0.9, [255, 210, 160]);
+      this.fx.shake = Math.max(this.fx.shake, 0.3);
+      this.fx.shakeDir = at.facing;
       if (this.onSound) this.onSound('grab');
       return;
     }
@@ -261,8 +283,9 @@ var FX = FX || {};
     var dmg = d.dmg * (1 - Math.min(0.45, at.combo * 0.07));
     df.hp = Math.max(0, df.hp - dmg);
     df.flash = 1;
-    df.stun = d.super ? 0.7 : 0.26 + d.hs * 0.5;
+    df.stun = (d.super ? 0.7 : 0.26 + d.hs * 0.5) * (1 - Math.min(0.40, at.combo * 0.06));
     df.vx += at.facing * d.push;
+    at.vx -= at.facing * d.push * 0.10;
     at.combo++;
     at.meter = Math.min(100, at.meter + (d.super ? -100 : dmg * 1.5));
 
@@ -282,20 +305,29 @@ var FX = FX || {};
     this.fx.ring(hx, hy, d.super ? 2.2 : 0.6 + d.dmg / 20, d.super ? [255, 170, 255] : null);
     this.fx.shake = Math.max(this.fx.shake, d.hs);
     this.fx.shakeDir = at.facing;
-    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.18 : 0.05 + d.hs * 0.12);
+    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.36 : 0.09 + d.hs * 0.24);
     if (d.super) this.fx.flash = 0.8;
     if (this.onSound) this.onSound(d.super ? 'super' : (d.dmg >= 10 ? 'heavy' : 'hit'));
   };
 
   /* Translate a control struct into a move. */
   Match.prototype.drive = function (f, c, foe) {
-    f.facing = foe.x >= f.x ? 1 : -1;
+    if (f.canAct() && f.onGround) f.facing = foe.x >= f.x ? 1 : -1;
     if (f.hp <= 0) { if (f.move !== 'defeat' && f.onGround) f.start('defeat'); return; }
-    if (f.move === 'defeat' || f.move === 'thrown') return;
+    if (f.move === 'defeat') return;
+    // nothing ever transitioned out of `thrown`: a successful grab locked the
+    // victim out of the match permanently
+    if (f.move === 'thrown') { if (f.moveDone && f.onGround) f.start('getup'); return; }
 
     if (f.move === 'knockdown' && f.moveDone && f.onGround) { f.start('getup'); return; }
     if (f.move === 'throw' && f.moveDone) { f.start('idle'); return; }
-    if (!f.canAct()) return;
+    /* Hit-confirm cancel. The whole reason moves are sprung trajectories is
+     * that they cross-fade; without a cancel window no player could ever
+     * see it. Light moves that connected may cancel after their active
+     * frames. */
+    var d0 = f.def();
+    var canCancel = f.hitLanded && d0.hit && f.progress() > d0.hit[1] && d0.dmg <= 10;
+    if (!f.canAct() && !canCancel) return;
 
     var fwd = f.facing > 0 ? c.r : c.l;
     var back = f.facing > 0 ? c.l : c.r;
@@ -306,7 +338,7 @@ var FX = FX || {};
     if (c.g) { f.start('grab'); return; }
     if (c.p) { f.start(c.d ? 'uppercut' : (back ? 'hook' : 'jab')); return; }
     if (c.k) { f.start(c.d ? 'sweep' : (back ? 'roundhouse' : (c.u ? 'highKick' : 'lowKick'))); return; }
-    if (c.u) { f.start('jump'); f.vy = -395; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
+    if (c.u) { f.start('jump'); f.vy = -600; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
       this.fx.dust(f.x, f.y, 7, 1); return; }
     if (c.d) { f.start(back ? 'blockLow' : 'crouch'); return; }
     if (back) { f.start('block'); f.vx = -f.facing * 78; return; }
@@ -329,10 +361,10 @@ var FX = FX || {};
       if (fd.low) c.d = 1;
       return c;
     }
-    if (this.aiT[i] > 0) return this.aiHold || c;
+    if (this.aiT[i] > 0) return this.aiHold[i] || c;
 
-    if (f.meter >= 100 && dist < 90 && Math.random() < 0.5) { c.s = 1; this.aiT[i] = 0.9; return c; }
-    if (dist > 108) { c[toward] = 1; this.aiT[i] = 0.12 + Math.random() * 0.2; return c; }
+    if (f.meter >= 100 && dist < 90 && Math.random() < 0.5) { c.s = 1; this.aiT[i] = 0.9; this.aiHold[i] = c; return c; }
+    if (dist > 108) { c[toward] = 1; this.aiT[i] = 0.12 + Math.random() * 0.2; this.aiHold[i] = c; return c; }
     if (dist > 74) {
       if (Math.random() < 0.42) { c.k = 1; c.u = Math.random() < 0.4 ? 1 : 0; }
       else c[toward] = 1;
@@ -373,10 +405,6 @@ var FX = FX || {};
     this.resolve(this.a, this.b);
     this.resolve(this.b, this.a);
 
-    // landing dust
-    var self = this;
-    this.a.onLand = function () { self.fx.dust(self.a.x, GROUND, 8, 1); };
-    this.b.onLand = function () { self.fx.dust(self.b.x, GROUND, 8, -1); };
 
     // walls and body separation
     [this.a, this.b].forEach(function (f) {
@@ -538,8 +566,13 @@ var FX = FX || {};
       var yy = 100 * S - (1 - a) * 12 * S;
       text(surf, this.banner, w / 2 - bwid / 2, yy, bp, F.rgb(255, 232, 180), F.rgb(120, 20, 20));
     }
-    if (this.a.combo > 1) {
-      text(surf, this.a.combo + ' HIT', 26 * S, 64 * S, 2.6 * S, F.rgb(255, 210, 120), F.rgb(20, 10, 8));
+    for (var ci = 0; ci < 2; ci++) {
+      var cf = ci ? this.b : this.a;
+      if (cf.combo < 2) continue;
+      var cs = cf.combo + ' HIT';
+      var cp = 2.6 * S;
+      text(surf, cs, ci ? w - 26 * S - textW(cs, cp) : 26 * S, 64 * S, cp,
+        F.rgb(255, 210, 120), F.rgb(20, 10, 8));
     }
     if (this.demo) {
       text(surf, 'DEMO', w / 2 - textW('DEMO', 2 * S) / 2, surf.h - 16 * S, 2 * S,
