@@ -1,0 +1,63 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>shaded fighter</title>
+<style>body{background:#08090c;margin:0}canvas{width:100%;display:block}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script src="../src/fx/surface.js"></script>
+<script src="../src/fx/shade.js"></script>
+<script src="../src/fx/fighter.js"></script>
+<script src="../src/fx/draw.js"></script>
+<script>
+var Q = new URLSearchParams(location.search);
+var MOVES = (Q.get('m') || 'idle,walk,jab,cross,hook,uppercut,highKick,roundhouse').split(',');
+var AT = +(Q.get('at') || 0.5);          // progress through the move to sample
+var CELL_W = 190, CELL_H = 210;
+var COLS = Math.min(MOVES.length, +(Q.get('cols') || 8));
+var ROWS = Math.ceil(MOVES.length / COLS);
+
+var surf = new FX.Surface(CELL_W * COLS, CELL_H * ROWS);
+surf.attach(document.getElementById('c'));
+
+// a neutral studio backdrop so the lighting is what you are judging
+surf.gradientV(0, 0, surf.w, surf.h, FX.rgb(38, 42, 56), FX.rgb(16, 18, 26));
+
+var sh = new FX.Shader(surf);
+var t0 = performance.now(), n = 0;
+
+for (var i = 0; i < MOVES.length; i++) {
+  var col = i % COLS, row = (i / COLS) | 0;
+  var cx = col * CELL_W + CELL_W * 0.42;
+  var gy = row * CELL_H + CELL_H - 34;
+
+  var f = new FX.Fighter(FX.SKINS[i % 2 ? 'ryo' : 'kai']);
+  f.place(cx, gy, 1);
+  f.setGround(gy);
+
+  // settle the springs, then run the move to the sample point
+  var dt = 1 / 120;
+  for (var w = 0; w < 180; w++) f.update(dt, {});
+  var name = MOVES[i];
+  if (name === 'walk') { f.start('walk'); f.vx = 90; for (var k = 0; k < 90; k++) { f.update(dt, {}); f.x = cx; f.feet[0].wx -= 0; } }
+  else if (name !== 'idle') {
+    f.start(name);
+    var d = FX.MOVES[name];
+    var steps = Math.max(1, Math.round((d.dur * AT) / dt));
+    for (var s = 0; s < steps; s++) f.update(dt, {});
+  }
+
+  // floor line + contact shadow
+  surf.fillRect(col * CELL_W, gy + 1, CELL_W, 1, FX.rgb(70, 76, 96));
+  FX.drawShadow(surf, f, gy);
+
+  var b = FX.fighterBounds(f);
+  sh.begin(b.x0, b.y0, b.x1, b.y1);
+  FX.drawFighter(sh, f);
+  n++;
+}
+
+var ms = performance.now() - t0;
+surf.present();
+window.__stats = { drawn: n, totalMs: Math.round(ms), msEach: +(ms / n).toFixed(2) };
+document.title = n + ' fighters shaded live';
+</script>
+</body></html>

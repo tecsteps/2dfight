@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Iron Lantern — software-rendered fighting game</title>
+<style>
+  :root { --ink:#efe4d2; --bg:#07080b; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; overflow:hidden;
+    overscroll-behavior:none; touch-action:none; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #wrap { display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#000; box-shadow:0 10px 60px rgba(0,0,0,.75); }
+  #pad { display:none; width:100%; padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+    gap:8px; justify-content:space-between; align-items:flex-end; }
+  .cl { display:flex; gap:7px; }
+  .btn { width:52px; height:48px; border-radius:10px; border:1px solid #4a4048;
+    background:rgba(28,24,30,.9); color:var(--ink); font-size:15px; font-weight:700;
+    display:flex; align-items:center; justify-content:center; user-select:none; }
+  .btn.on { background:#7a6250; border-color:#c8a888; }
+  .btn.big { width:58px; height:54px; }
+  #hint { font-size:11px; opacity:.42; padding:5px; text-align:center; letter-spacing:.05em; }
+  @media (pointer:coarse), (max-width:820px) { #pad { display:flex; } #hint { display:none; } }
+</style>
+</head>
+<body>
+  <div id="wrap"><canvas id="screen"></canvas></div>
+  <div id="hint">&larr;&rarr; move &nbsp;·&nbsp; &uarr; jump &nbsp;·&nbsp; &darr; duck &nbsp;·&nbsp; A punch &nbsp;·&nbsp; S kick &nbsp;·&nbsp; D throw &nbsp;·&nbsp; F super &nbsp;·&nbsp; back to block</div>
+  <div id="pad">
+    <div class="cl">
+      <div class="btn" data-k="l">&#9664;</div>
+      <div class="btn" data-k="d">&#9660;</div>
+      <div class="btn" data-k="u">&#9650;</div>
+      <div class="btn" data-k="r">&#9654;</div>
+    </div>
+    <div class="cl">
+      <div class="btn big" data-k="g">THR</div>
+      <div class="btn big" data-k="s">SUP</div>
+      <div class="btn big" data-k="k">KICK</div>
+      <div class="btn big" data-k="p">PUN</div>
+    </div>
+  </div>
+
+  <script src="src/fx/surface.js"></script>
+  <script src="src/fx/shade.js"></script>
+  <script src="src/fx/fighter.js"></script>
+  <script src="src/fx/draw.js"></script>
+  <script src="src/fx/sound.js"></script>
+  <script src="src/fx/fight.js"></script>
+  <script>
+  (function () {
+    var canvas = document.getElementById('screen');
+    var m = new FX.Match(canvas);
+    window.__match = m;
+
+    var snd = new FX.Sound();
+    m.onSound = function (k) { snd.play(k); };
+
+    var KEYS = { ArrowLeft:'l', ArrowRight:'r', ArrowUp:'u', ArrowDown:'d',
+      KeyA:'l', KeyD:'r', KeyW:'u', KeyS:'d',
+      KeyJ:'p', KeyK:'k', KeyL:'g', Semicolon:'s',
+      KeyZ:'p', KeyX:'k', KeyC:'g', KeyV:'s' };
+    // the hint uses A/S/D/F for attacks; map those too without breaking WASD
+    KEYS.KeyF = 's';
+    function takeOver() { if (m.demo) { m.demo = false; m.say('FIGHT', 1.2); } snd.enable(); }
+    window.addEventListener('keydown', function (e) {
+      var k = KEYS[e.code];
+      if (e.code === 'KeyA' || e.code === 'KeyS' || e.code === 'KeyD') {
+        // A/S/D double as attacks once the player has taken control
+        k = e.code === 'KeyA' ? 'p' : e.code === 'KeyS' ? 'k' : 'g';
+      }
+      if (!k) return;
+      e.preventDefault(); takeOver(); m.input[k] = 1;
+    }, { passive:false });
+    window.addEventListener('keyup', function (e) {
+      var k = KEYS[e.code];
+      if (e.code === 'KeyA') k = 'p'; if (e.code === 'KeyS') k = 'k'; if (e.code === 'KeyD') k = 'g';
+      if (!k) return; e.preventDefault(); m.input[k] = 0;
+    }, { passive:false });
+
+    var pad = document.getElementById('pad');
+    if (pad) {
+      var btns = pad.querySelectorAll('[data-k]');
+      for (var i = 0; i < btns.length; i++) (function (el) {
+        var k = el.getAttribute('data-k');
+        function dn(e) { e.preventDefault(); takeOver(); m.input[k] = 1; el.classList.add('on'); }
+        function up(e) { e.preventDefault(); m.input[k] = 0; el.classList.remove('on'); }
+        el.addEventListener('touchstart', dn, { passive:false });
+        el.addEventListener('touchend', up, { passive:false });
+        el.addEventListener('touchcancel', up, { passive:false });
+        el.addEventListener('mousedown', dn); el.addEventListener('mouseup', up);
+        el.addEventListener('mouseleave', up);
+      })(btns[i]);
+    }
+    canvas.addEventListener('pointerdown', takeOver);
+
+    function fit() {
+      var padEl = document.getElementById('pad');
+      var ph = padEl && getComputedStyle(padEl).display !== 'none' ? padEl.offsetHeight : 0;
+      var hintEl = document.getElementById('hint');
+      var hh = hintEl && getComputedStyle(hintEl).display !== 'none' ? hintEl.offsetHeight : 0;
+      var aw = window.innerWidth - 6, ah = window.innerHeight - ph - hh - 6;
+      var sc = Math.min(aw / canvas.width, ah / canvas.height);
+      canvas.style.width = Math.round(canvas.width * sc) + 'px';
+      canvas.style.height = Math.round(canvas.height * sc) + 'px';
+    }
+    window.addEventListener('resize', fit);
+    window.addEventListener('orientationchange', function () { setTimeout(fit, 120); });
+    fit();
+
+    m.say('ROUND 1', 1.6);
+    function loop(t) { m.frame(t); requestAnimationFrame(loop); }
+    requestAnimationFrame(loop);
+  })();
+  </script>
+</body>
+</html>

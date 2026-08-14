@@ -1,0 +1,1861 @@
+<title>Iron Lantern</title>
+<style>
+
+  :root { --ink:#efe4d2; --bg:#07080b; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; overflow:hidden;
+    overscroll-behavior:none; touch-action:none; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #wrap { display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#000; box-shadow:0 10px 60px rgba(0,0,0,.75); }
+  #pad { display:none; width:100%; padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+    gap:8px; justify-content:space-between; align-items:flex-end; }
+  .cl { display:flex; gap:7px; }
+  .btn { width:52px; height:48px; border-radius:10px; border:1px solid #4a4048;
+    background:rgba(28,24,30,.9); color:var(--ink); font-size:15px; font-weight:700;
+    display:flex; align-items:center; justify-content:center; user-select:none; }
+  .btn.on { background:#7a6250; border-color:#c8a888; }
+  .btn.big { width:58px; height:54px; }
+  #hint { font-size:11px; opacity:.42; padding:5px; text-align:center; letter-spacing:.05em; }
+  @media (pointer:coarse), (max-width:820px) { #pad { display:flex; } #hint { display:none; } }
+
+</style>
+<div id="wrap"><canvas id="screen"></canvas></div>
+  <div id="hint">&larr;&rarr; move &nbsp;·&nbsp; &uarr; jump &nbsp;·&nbsp; &darr; duck &nbsp;·&nbsp; A punch &nbsp;·&nbsp; S kick &nbsp;·&nbsp; D throw &nbsp;·&nbsp; F super &nbsp;·&nbsp; back to block</div>
+  <div id="pad">
+    <div class="cl">
+      <div class="btn" data-k="l">&#9664;</div>
+      <div class="btn" data-k="d">&#9660;</div>
+      <div class="btn" data-k="u">&#9650;</div>
+      <div class="btn" data-k="r">&#9654;</div>
+    </div>
+    <div class="cl">
+      <div class="btn big" data-k="g">THR</div>
+      <div class="btn big" data-k="s">SUP</div>
+      <div class="btn big" data-k="k">KICK</div>
+      <div class="btn big" data-k="p">PUN</div>
+    </div>
+  </div>
+<script>
+/* ===== src/fx/surface.js ===== */
+/*
+ * surface.js -- a 32-bit software surface.
+ *
+ * The indexed 8-bit framebuffer this engine started with was an authenticity
+ * choice, and it capped what the renderer could ever look like: no blending,
+ * so no glow, no soft shadow, no motion trail, and shading limited to
+ * whatever fitted in a palette ramp.
+ *
+ * This replaces it with a straight RGBA surface. Everything is still done in
+ * software, by hand, one pixel at a time -- there is exactly one canvas call
+ * in the whole renderer (putImageData) and no GPU anywhere. What changes is
+ * only the range: 24-bit colour and an alpha channel, which is what makes
+ * lighting and effects possible at all.
+ *
+ * Colours are packed 0xAABBGGRR to match the little-endian byte order of
+ * ImageData, so a pixel is one 32-bit store.
+ */
+var FX = FX || {};
+(function (F) {
+  'use strict';
+
+  function rgb(r, g, b) {
+    return (255 << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255);
+  }
+  function rgba(r, g, b, a) {
+    return ((a & 255) << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255);
+  }
+
+  function Surface(w, h) {
+    this.w = w; this.h = h;
+    this.px = new Uint32Array(w * h);
+    this.depth = new Float32Array(w * h);   // for the shaded character pass
+    this.canvas = null; this.ctx = null; this.img = null; this.out = null;
+  }
+
+  Surface.prototype.attach = function (canvas) {
+    this.canvas = canvas;
+    canvas.width = this.w; canvas.height = this.h;
+    this.ctx = canvas.getContext('2d', { alpha: false });
+    this.img = this.ctx.createImageData(this.w, this.h);
+    this.out = new Uint32Array(this.img.data.buffer);
+  };
+
+  /* The one and only canvas call. */
+  Surface.prototype.present = function () {
+    this.out.set(this.px);
+    this.ctx.putImageData(this.img, 0, 0);
+  };
+
+  Surface.prototype.clear = function (c) { this.px.fill(c >>> 0); };
+  Surface.prototype.copyFrom = function (other) { this.px.set(other.px); };
+  Surface.prototype.clearDepth = function () { this.depth.fill(1e9); };
+
+  /* Clear only a rectangle of the depth buffer -- the characters occupy a
+   * small part of the screen, and clearing half a megabyte of float per
+   * frame for that would be most of the frame budget. */
+  Surface.prototype.clearDepthRect = function (x0, y0, x1, y1) {
+    x0 = Math.max(0, x0 | 0); y0 = Math.max(0, y0 | 0);
+    x1 = Math.min(this.w, x1 | 0); y1 = Math.min(this.h, y1 | 0);
+    for (var y = y0; y < y1; y++) this.depth.fill(1e9, y * this.w + x0, y * this.w + x1);
+  };
+
+  Surface.prototype.fillRect = function (x, y, w, h, c) {
+    var x0 = Math.max(0, x | 0), y0 = Math.max(0, y | 0);
+    var x1 = Math.min(this.w, (x + w) | 0), y1 = Math.min(this.h, (y + h) | 0);
+    if (x1 <= x0) return;
+    for (var yy = y0; yy < y1; yy++) this.px.fill(c >>> 0, yy * this.w + x0, yy * this.w + x1);
+  };
+
+  /* Source-over blend of a flat colour. `a` is 0..1. */
+  Surface.prototype.blendRect = function (x, y, w, h, r, g, b, a) {
+    var x0 = Math.max(0, x | 0), y0 = Math.max(0, y | 0);
+    var x1 = Math.min(this.w, (x + w) | 0), y1 = Math.min(this.h, (y + h) | 0);
+    if (x1 <= x0 || a <= 0) return;
+    var p = this.px, W = this.w;
+    var ia = 1 - a, ra = r * a, ga = g * a, ba = b * a;
+    for (var yy = y0; yy < y1; yy++) {
+      var o = yy * W;
+      for (var xx = x0; xx < x1; xx++) {
+        var i = o + xx, v = p[i];
+        p[i] = 0xff000000 |
+          ((((v >>> 16) & 255) * ia + ba) << 16) |
+          ((((v >>> 8) & 255) * ia + ga) << 8) |
+          (((v & 255) * ia + ra));
+      }
+    }
+  };
+
+  Surface.prototype.blendPx = function (x, y, r, g, b, a) {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h || a <= 0) return;
+    if (a > 1) a = 1;
+    var i = y * this.w + x, v = this.px[i], ia = 1 - a;
+    this.px[i] = 0xff000000 |
+      (((((v >>> 16) & 255) * ia + b * a) | 0) << 16) |
+      (((((v >>> 8) & 255) * ia + g * a) | 0) << 8) |
+      ((((v & 255) * ia + r * a) | 0));
+  };
+
+  /* Additive -- glows, sparks, fire. */
+  Surface.prototype.addPx = function (x, y, r, g, b, a) {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h || a <= 0) return;
+    var i = y * this.w + x, v = this.px[i];
+    var nr = (v & 255) + r * a, ng = ((v >>> 8) & 255) + g * a, nb = ((v >>> 16) & 255) + b * a;
+    this.px[i] = 0xff000000 |
+      ((nb > 255 ? 255 : nb | 0) << 16) | ((ng > 255 ? 255 : ng | 0) << 8) | (nr > 255 ? 255 : nr | 0);
+  };
+
+  Surface.prototype.addDisc = function (cx, cy, rad, r, g, b, a) {
+    var x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(this.w - 1, Math.ceil(cx + rad));
+    var y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(this.h - 1, Math.ceil(cy + rad));
+    var r2 = rad * rad;
+    for (var y = y0; y <= y1; y++) {
+      var dy = y - cy;
+      for (var x = x0; x <= x1; x++) {
+        var dx = x - cx, d2 = dx * dx + dy * dy;
+        if (d2 > r2) continue;
+        var f = 1 - Math.sqrt(d2) / rad;
+        this.addPx(x, y, r, g, b, a * f * f);
+      }
+    }
+  };
+
+  /* Soft elliptical shadow -- multiply, so it darkens whatever is under it. */
+  Surface.prototype.shadowEllipse = function (cx, cy, rx, ry, strength) {
+    var x0 = Math.max(0, Math.floor(cx - rx)), x1 = Math.min(this.w - 1, Math.ceil(cx + rx));
+    var y0 = Math.max(0, Math.floor(cy - ry)), y1 = Math.min(this.h - 1, Math.ceil(cy + ry));
+    var p = this.px, W = this.w;
+    for (var y = y0; y <= y1; y++) {
+      var dy = (y - cy) / ry;
+      for (var x = x0; x <= x1; x++) {
+        var dx = (x - cx) / rx, d = dx * dx + dy * dy;
+        if (d >= 1) continue;
+        var k = 1 - strength * (1 - d) * (1 - d);
+        var i = y * W + x, v = p[i];
+        p[i] = 0xff000000 |
+          (((((v >>> 16) & 255) * k) | 0) << 16) |
+          (((((v >>> 8) & 255) * k) | 0) << 8) |
+          ((((v & 255) * k) | 0));
+      }
+    }
+  };
+
+  /* Vertical gradient, used for skies and stage washes. */
+  Surface.prototype.gradientV = function (x, y, w, h, c0, c1) {
+    var y0 = Math.max(0, y | 0), y1 = Math.min(this.h, (y + h) | 0);
+    var r0 = c0 & 255, g0 = (c0 >>> 8) & 255, b0 = (c0 >>> 16) & 255;
+    var r1 = c1 & 255, g1 = (c1 >>> 8) & 255, b1 = (c1 >>> 16) & 255;
+    for (var yy = y0; yy < y1; yy++) {
+      var t = h <= 1 ? 0 : (yy - y) / (h - 1);
+      var c = rgb(r0 + (r1 - r0) * t, g0 + (g1 - g0) * t, b0 + (b1 - b0) * t);
+      this.fillRect(x, yy, w, 1, c);
+    }
+  };
+
+  F.Surface = Surface;
+  F.rgb = rgb;
+  F.rgba = rgba;
+})(FX);
+
+/* ===== src/fx/shade.js ===== */
+/*
+ * shade.js -- per-pixel lit primitives.
+ *
+ * The reason this engine can afford to look modern is that it *generates*
+ * its geometry. A sprite is a finished picture: whatever shading it has was
+ * painted once and can never respond to anything. A capsule defined by two
+ * endpoints and two radii still knows its own shape at render time, so for
+ * every pixel we can recover a surface normal and light it properly.
+ *
+ * Each limb is treated as a capsule swept in Z as well as X/Y -- a rounded
+ * tube seen side-on. For a pixel at signed offset u across the tube (-1 at
+ * one silhouette edge, +1 at the other) the surface normal is
+ *
+ *     N = perp * u  +  z * sqrt(1 - u^2)
+ *
+ * which is exact for a cylinder, and gives a real Lambert term, a real
+ * specular highlight and a real rim light. Depth comes out of the same
+ * expression, so limbs occlude each other correctly instead of relying on
+ * paint order.
+ *
+ * Everything here is forward-shaded straight into the surface with a depth
+ * test, and silhouette pixels are coverage-blended, so edges are smooth
+ * without a separate anti-aliasing pass.
+ */
+var FX = FX || {};
+(function (F) {
+  'use strict';
+
+  /* Materials: base colour, how shiny, how much rim. Tuned to read as
+   * cloth / skin / metal rather than as tinted plastic. */
+  function mat(r, g, b, spec, gloss, rim) {
+    return { r: r, g: g, b: b, spec: spec === undefined ? 0.12 : spec,
+      gloss: gloss || 12, rim: rim === undefined ? 0.5 : rim };
+  }
+  F.mat = mat;
+
+  // light: front, above, from the character's left
+  var LX = -0.36, LY = -0.66, LZ = 0.66;
+  // a second, cooler fill from the opposite side keeps shadows from going flat
+  var FX2 = 0.55, FY2 = -0.15, FZ2 = 0.82;
+
+  function Shader(surf) {
+    this.s = surf;
+    /* World-to-device scale. The fighter is authored in its own ~128-unit
+     * space; the game lays out a 480x270 world and renders it to a denser
+     * surface. One knob here beats scaling every radius by hand. */
+    this.S = 1;
+    this.bx0 = 0; this.by0 = 0; this.bx1 = 0; this.by1 = 0;
+    this.ambR = 42; this.ambG = 46; this.ambB = 60;   // ambient/sky bounce
+    this.keyR = 255; this.keyG = 238; this.keyB = 214;
+    this.fillR = 90; this.fillG = 120; this.fillB = 168;
+    this.rimR = 190; this.rimG = 214; this.rimB = 255;
+    this.tint = 0;                                     // 0..1 hit flash
+    this.tintR = 255; this.tintG = 255; this.tintB = 255;
+  }
+
+  /* Reserve a region: the depth buffer only needs clearing where we draw. */
+  Shader.prototype.begin = function (x0, y0, x1, y1) {
+    var S = this.S;
+    x0 *= S; y0 *= S; x1 *= S; y1 *= S;
+    this.bx0 = Math.max(0, x0 | 0); this.by0 = Math.max(0, y0 | 0);
+    this.bx1 = Math.min(this.s.w, x1 | 0); this.by1 = Math.min(this.s.h, y1 | 0);
+    this.s.clearDepthRect(this.bx0, this.by0, this.bx1, this.by1);
+  };
+
+  /* Shade one pixel given its normal and depth, with coverage for the edge. */
+  Shader.prototype.px = function (x, y, nx, ny, nz, z, m, cov, ao) {
+    if (x < this.bx0 || y < this.by0 || x >= this.bx1 || y >= this.by1) return;
+    var s = this.s, i = y * s.w + x;
+    if (z >= s.depth[i]) return;
+    if (cov >= 0.995) s.depth[i] = z;
+
+    var d = nx * LX + ny * LY + nz * LZ;
+    if (d < 0) d = 0;
+    // wrap term: skin and cloth do not fall to black at the terminator
+    d = d * 0.82 + 0.18;
+
+    var f = nx * FX2 + ny * FY2 + nz * FZ2;
+    if (f < 0) f = 0;
+    f *= 0.34;
+
+    // Blinn specular against the key light
+    var hx = LX, hy = LY, hz = LZ + 1;
+    var hl = 1 / Math.sqrt(hx * hx + hy * hy + hz * hz);
+    var sp = nx * hx * hl + ny * hy * hl + nz * hz * hl;
+    if (sp < 0) sp = 0;
+    sp = Math.pow(sp, m.gloss) * m.spec;
+
+    // rim: strongest where the surface turns away from the viewer
+    var rim = 1 - nz;
+    rim = rim * rim * rim * m.rim;
+
+    var occ = ao === undefined ? 1 : ao;
+    var r = (this.ambR + this.keyR * d) * m.r / 255 * occ + this.fillR * f * m.r / 255
+      + this.keyR * sp + this.rimR * rim;
+    var g = (this.ambG + this.keyG * d) * m.g / 255 * occ + this.fillG * f * m.g / 255
+      + this.keyG * sp + this.rimG * rim;
+    var b = (this.ambB + this.keyB * d) * m.b / 255 * occ + this.fillB * f * m.b / 255
+      + this.keyB * sp + this.rimB * rim;
+
+    if (this.tint > 0) {
+      var t = this.tint;
+      r += (this.tintR - r) * t; g += (this.tintG - g) * t; b += (this.tintB - b) * t;
+    }
+    if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+    if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
+
+    if (cov >= 0.995) {
+      s.px[i] = 0xff000000 | ((b | 0) << 16) | ((g | 0) << 8) | (r | 0);
+    } else {
+      var v = s.px[i], ia = 1 - cov;
+      s.px[i] = 0xff000000 |
+        (((((v >>> 16) & 255) * ia + b * cov) | 0) << 16) |
+        (((((v >>> 8) & 255) * ia + g * cov) | 0) << 8) |
+        ((((v & 255) * ia + r * cov) | 0));
+    }
+  };
+
+  /* A limb. (ax,ay)-(bx,by) with radii r0..r1, lying at depth zb; the tube
+   * bulges toward the viewer by its own radius, which is what makes crossing
+   * limbs sort correctly. */
+  Shader.prototype.capsule = function (ax, ay, bx, by, r0, r1, zb, m, ao) {
+    var S = this.S;
+    if (S !== 1) { ax *= S; ay *= S; bx *= S; by *= S; r0 *= S; r1 *= S; zb *= S; }
+    var dx = bx - ax, dy = by - ay;
+    var seg = Math.sqrt(dx * dx + dy * dy);
+    if (seg < 0.0001) { this.sphere(ax, ay, Math.max(r0, r1), zb, m, ao); return; }
+    var ux = dx / seg, uy = dy / seg;
+    var px = -uy, py = ux;
+    var rmax = Math.max(r0, r1);
+
+    var x0 = Math.floor(Math.min(ax, bx) - rmax - 1), x1 = Math.ceil(Math.max(ax, bx) + rmax + 1);
+    var y0 = Math.floor(Math.min(ay, by) - rmax - 1), y1 = Math.ceil(Math.max(ay, by) + rmax + 1);
+    if (x0 < this.bx0) x0 = this.bx0; if (y0 < this.by0) y0 = this.by0;
+    if (x1 > this.bx1) x1 = this.bx1; if (y1 > this.by1) y1 = this.by1;
+
+    for (var y = y0; y < y1; y++) {
+      for (var x = x0; x < x1; x++) {
+        var vx = x + 0.5 - ax, vy = y + 0.5 - ay;
+        var t = (vx * ux + vy * uy) / seg;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        var qx = ax + ux * seg * t, qy = ay + uy * seg * t;
+        var r = r0 + (r1 - r0) * t;
+        var ex = x + 0.5 - qx, ey = y + 0.5 - qy;
+        var dist = Math.sqrt(ex * ex + ey * ey);
+        if (dist > r + 0.75) continue;
+        var cov = r + 0.5 - dist;
+        if (cov > 1) cov = 1; else if (cov <= 0) continue;
+        var u = (ex * px + ey * py) / r;
+        if (u > 1) u = 1; else if (u < -1) u = -1;
+        var nz = Math.sqrt(1 - u * u);
+        this.px(x, y, px * u, py * u, nz, zb - nz * r, m, cov, ao);
+      }
+    }
+  };
+
+  Shader.prototype.sphere = function (cx, cy, r, zb, m, ao) {
+    this.ellipsoid(cx, cy, r, r, 0, zb, m, ao);
+  };
+
+  /* An ellipsoid, optionally rotated -- heads, shoulders, torso masses. */
+  Shader.prototype.ellipsoid = function (cx, cy, rx, ry, rot, zb, m, ao) {
+    var S = this.S;
+    if (S !== 1) { cx *= S; cy *= S; rx *= S; ry *= S; zb *= S; }
+    var ca = Math.cos(rot), sa = Math.sin(rot);
+    var rr = Math.max(rx, ry);
+    var x0 = Math.floor(cx - rr - 1), x1 = Math.ceil(cx + rr + 1);
+    var y0 = Math.floor(cy - rr - 1), y1 = Math.ceil(cy + rr + 1);
+    if (x0 < this.bx0) x0 = this.bx0; if (y0 < this.by0) y0 = this.by0;
+    if (x1 > this.bx1) x1 = this.bx1; if (y1 > this.by1) y1 = this.by1;
+    var rz = (rx + ry) * 0.5;
+
+    for (var y = y0; y < y1; y++) {
+      for (var x = x0; x < x1; x++) {
+        var dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+        // into the ellipse's own frame
+        var lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
+        var a = lx / rx, b = ly / ry;
+        var q = a * a + b * b;
+        if (q > 1.3) continue;
+        var dq = Math.sqrt(q);
+        var cov = (1 - dq) * Math.min(rx, ry) + 0.5;
+        if (cov > 1) cov = 1; else if (cov <= 0) continue;
+        var nzs = 1 - q;
+        var nz = nzs > 0 ? Math.sqrt(nzs) : 0;
+        // normal in world frame
+        var nlx = a, nly = b;
+        var nx = nlx * ca - nly * sa, ny = nlx * sa + nly * ca;
+        var il = 1 / Math.max(0.0001, Math.sqrt(nx * nx + ny * ny + nz * nz));
+        this.px(x, y, nx * il, ny * il, nz * il, zb - nz * rz, m, cov, ao);
+      }
+    }
+  };
+
+  /* A flat convex polygon, shaded as a slab facing the viewer with a soft
+   * bevel toward its edges. Used for cloth panels and blades, where a tube
+   * would read wrong. */
+  Shader.prototype.polySlab = function (pts, zb, m, bevel, ao) {
+    var n = pts.length, i;
+    var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+    for (i = 0; i < n; i++) {
+      if (pts[i][0] < minX) minX = pts[i][0];
+      if (pts[i][0] > maxX) maxX = pts[i][0];
+      if (pts[i][1] < minY) minY = pts[i][1];
+      if (pts[i][1] > maxY) maxY = pts[i][1];
+    }
+    var x0 = Math.max(this.bx0, Math.floor(minX)), x1 = Math.min(this.bx1, Math.ceil(maxX) + 1);
+    var y0 = Math.max(this.by0, Math.floor(minY)), y1 = Math.min(this.by1, Math.ceil(maxY) + 1);
+    var bv = bevel || 3;
+
+    for (var y = y0; y < y1; y++) {
+      for (var x = x0; x < x1; x++) {
+        // signed distance to the polygon boundary (convex assumption)
+        var px = x + 0.5, py = y + 0.5;
+        var inside = true, best = 1e9, bnx = 0, bny = 0;
+        for (i = 0; i < n; i++) {
+          var ax = pts[i][0], ay = pts[i][1];
+          var j = (i + 1) % n, bx = pts[j][0], by = pts[j][1];
+          var ex = bx - ax, ey = by - ay;
+          var el = Math.sqrt(ex * ex + ey * ey);
+          if (el < 0.0001) continue;
+          var nxe = ey / el, nye = -ex / el;          // outward if CW
+          var d = (px - ax) * nxe + (py - ay) * nye;
+          if (d > 0.5) { inside = false; break; }
+          if (-d < best) { best = -d; bnx = nxe; bny = nye; }
+        }
+        if (!inside) continue;
+        var cov = best + 0.5; if (cov > 1) cov = 1; else if (cov <= 0) continue;
+        var e = Math.min(1, best / bv);
+        var nz = Math.sqrt(Math.max(0.02, e));
+        var s = Math.sqrt(Math.max(0, 1 - nz * nz));
+        this.px(x, y, bnx * s, bny * s, nz, zb - nz * bv, m, cov, ao);
+      }
+    }
+  };
+
+  F.Shader = Shader;
+})(FX);
+
+/* ===== src/fx/fighter.js ===== */
+/*
+ * fighter.js -- a fighting-game character with no animation data.
+ *
+ * Same principle as before, scaled up: the pose is solved every frame from
+ * continuous state. What changes for a fighter is *how* moves are described.
+ *
+ * A punch is not a set of poses here. It is a trajectory for one hand --
+ * three or four points in body-local space with timings -- and the arm is
+ * solved to reach it. That has three consequences worth the trouble:
+ *
+ *   - moves blend. Two springs chasing two targets cross-fade for free, so
+ *     cancelling a jab into a kick is continuous rather than a cut.
+ *   - moves adapt. The same jab reaches further when the body is leaning in,
+ *     lands lower when crouching, and tracks the opponent's height.
+ *   - the body follows the limb. Hips and shoulders counter-rotate against
+ *     the working arm because that is written as a rule, not drawn.
+ *
+ * And because nothing is ever "at rest" in a spring system, the character
+ * keeps breathing, shifting weight and settling even when standing still.
+ */
+var FX = FX || {};
+(function (F) {
+  'use strict';
+
+  var D2R = Math.PI / 180, TAU = Math.PI * 2;
+
+  /* Proportions for a ~128px-tall fighter, roughly seven and a half heads --
+   * the heroic build these games use, not a realistic one. */
+  /* Seen from the side, the "width" of a torso is its front-to-back depth,
+   * not the shoulder span -- an easy thing to get wrong, and it turned the
+   * first build into a barrel. These are half-axes: chest 8.5 means a body
+   * 17 deep. The shoulder span reads instead from how far apart the two
+   * shoulder balls sit along the body's forward axis. */
+  var L = {
+    headRX: 7.4, headRY: 8.8, neck: 4.6,
+    torso: 41,
+    chestD: 8.6, waistD: 7.0, hipD: 8.8,       // half-depth, front to back
+    chestH: 12.5, waistH: 10.0, hipH2: 9.2,    // half-height of each mass
+    shoulderSep: 6.8, shoulderR: 7.0,
+    uArm: 23, lArm: 20, hand: 4.6,
+    uLeg: 32, lLeg: 29, foot: 13,
+    standHip: 64
+  };
+  F.FighterL = L;
+
+  function Spring(v, w) { this.v = v; this.d = 0; this.t = v; this.w = w || 14; }
+  Spring.prototype.set = function (v) { this.v = this.t = v; this.d = 0; };
+  Spring.prototype.step = function (dt) {
+    var w = this.w, f = 1 + 2 * dt * w, ww = w * w, dtww = dt * ww;
+    var det = f + dt * dtww;
+    this.v = (f * this.v + dt * this.d + dtww * dt * this.t) / det;
+    this.d = (this.d + dtww * (this.t - this.v)) / f;
+    return this.v;
+  };
+  F.Spring = Spring;
+
+  /* Two-link IK. `pole` is +1/-1 and picks which way the joint breaks. */
+  function ik2(ax, ay, bx, by, l1, l2, pole) {
+    var dx = bx - ax, dy = by - ay;
+    var raw = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+    var d = raw;
+    var dmin = Math.abs(l1 - l2) + 0.01, dmax = l1 + l2 - 0.01;
+    if (d < dmin) d = dmin; else if (d > dmax) d = dmax;
+    var ux = dx / raw, uy = dy / raw;
+    var a = (l1 * l1 - l2 * l2 + d * d) / (2 * d);
+    var h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+    return [ax + ux * a + uy * h * pole, ay + uy * a - ux * h * pole];
+  }
+  F.ik2 = ik2;
+
+  function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+  function smooth(t) { return t * t * (3 - 2 * t); }
+
+  /* ---- move definitions ---------------------------------------------
+   * Each move is a duration, a set of phase markers, and a function that
+   * writes targets. `p` is normalised progress. Targets are in body-local
+   * space: +x forward, +y up, measured from the chest.
+   */
+  var MOVES = {
+    idle: { dur: 0, loop: true },
+    walk: { dur: 0, loop: true },
+    dash: { dur: 0.34, recover: 0.1 },
+    crouch: { dur: 0, loop: true },
+    block: { dur: 0, loop: true },
+    blockLow: { dur: 0, loop: true },
+    jump: { dur: 0, loop: true },
+
+    jab:       { dur: 0.26, hit: [0.30, 0.48], dmg: 4,  reach: 46, hy: 12,  arm: 0, push: 26, hs: 0.16 },
+    cross:     { dur: 0.36, hit: [0.34, 0.54], dmg: 8,  reach: 52, hy: 10,  arm: 1, push: 46, hs: 0.24 },
+    hook:      { dur: 0.42, hit: [0.40, 0.58], dmg: 10, reach: 40, hy: 14,  arm: 1, push: 54, hs: 0.28, arc: 1 },
+    uppercut:  { dur: 0.50, hit: [0.36, 0.56], dmg: 13, reach: 34, hy: 26,  arm: 1, push: 40, hs: 0.34, launch: 210 },
+    lowKick:   { dur: 0.40, hit: [0.34, 0.54], dmg: 7,  reach: 50, hy: -30, leg: 1, push: 40, hs: 0.22, low: 1 },
+    highKick:  { dur: 0.50, hit: [0.38, 0.58], dmg: 12, reach: 56, hy: 22,  leg: 1, push: 62, hs: 0.30 },
+    roundhouse:{ dur: 0.58, hit: [0.44, 0.62], dmg: 15, reach: 58, hy: 6,   leg: 1, push: 78, hs: 0.36, arc: 1, launch: 120 },
+    sweep:     { dur: 0.46, hit: [0.36, 0.56], dmg: 8,  reach: 52, hy: -40, leg: 1, push: 24, hs: 0.26, low: 1, trip: 1 },
+
+    special:   { dur: 0.90, hit: [0.40, 0.70], dmg: 26, reach: 66, hy: 8, arm: 1,
+                 push: 130, hs: 0.5, launch: 260, super: 1 },
+
+    grab:      { dur: 0.34, hit: [0.24, 0.44], grab: 1, reach: 34, hy: 6 },
+    throw:     { dur: 0.85, dmg: 18 },
+    thrown:    { dur: 0.85 },
+
+    hitHigh:   { dur: 0.30, stun: 1 },
+    hitLow:    { dur: 0.30, stun: 1 },
+    hitHeavy:  { dur: 0.45, stun: 1 },
+    knockdown: { dur: 1.25, stun: 1 },
+    getup:     { dur: 0.55 },
+    victory:   { dur: 0, loop: true },
+    defeat:    { dur: 0, loop: true }
+  };
+  F.MOVES = MOVES;
+
+  /* ---- the fighter --------------------------------------------------- */
+
+  function Fighter(skin, opts) {
+    opts = opts || {};
+    this.skin = skin;
+    this.name = opts.name || 'FIGHTER';
+    this.x = 0; this.y = 0; this.vx = 0; this.vy = 0;
+    this.facing = 1;
+    this.groundY = 0;
+    this.onGround = true;
+
+    this.hp = 100; this.maxHp = 100;
+    this.meter = 0;                       // builds toward the special
+    this.move = 'idle'; this.mt = 0; this.moveDone = true;
+    this.hitLanded = false;
+    this.stun = 0;
+    this.flash = 0;
+    this.blocking = false;
+    this.combo = 0;
+
+    // gait
+    this.phase = 0; this.cadence = 0;
+    this.feet = [
+      { planted: true, wx: -8, wy: 0, liftX: 0, angle: 0 },
+      { planted: true, wx: 8, wy: 0, liftX: 0, angle: 0 }
+    ];
+    this.stride = 44; this.duty = 0.62; this.lift = 8;
+
+    // posture
+    this.hipH = new Spring(L.standHip, 15);
+    this.lean = new Spring(0, 11);           // degrees, + = forward
+    this.twist = new Spring(0, 13);          // shoulder counter-rotation
+    this.headA = new Spring(0, 9);
+    this.crouchS = new Spring(0, 16);
+    this.hipShift = new Spring(0, 7);        // weight on which foot
+
+    // hands live as sprung points in body-local space
+    this.hand = [
+      { x: new Spring(9, 16), y: new Spring(-2, 16) },   // rear
+      { x: new Spring(14, 16), y: new Spring(3, 16) }    // lead
+    ];
+    // a kicking foot gets its own local target while it is off the ground
+    this.kick = { on: 0, x: new Spring(0, 18), y: new Spring(0, 18), leg: 1 };
+
+    // always-on life
+    this.breath = Math.random() * TAU;
+    this.sway = Math.random() * TAU;
+    this.blink = 1.5 + Math.random() * 3;
+    this.blinkT = 0;
+
+    // secondary motion
+    this.hair = [];
+    for (var i = 0; i < 4; i++) this.hair.push({ x: 0, y: 0, vx: 0, vy: 0 });
+    this.belt = [{ x: 0, y: 0, vx: 0, vy: 0 }, { x: 0, y: 0, vx: 0, vy: 0 }];
+    this.trail = [];
+  }
+
+  Fighter.prototype.setGround = function (y) { this.groundY = y; };
+
+  Fighter.prototype.place = function (x, y, facing) {
+    this.x = x; this.y = y; this.groundY = y; this.facing = facing || 1;
+    this.feet[0].wx = x - 9; this.feet[1].wx = x + 9;
+    this.feet[0].wy = this.feet[1].wy = y;
+    this.hipH.set(L.standHip);
+    var c = this.chest();
+    for (var i = 0; i < this.hair.length; i++) { this.hair[i].x = c[0]; this.hair[i].y = c[1]; }
+    for (var j = 0; j < this.belt.length; j++) { this.belt[j].x = c[0]; this.belt[j].y = c[1]; }
+  };
+
+  Fighter.prototype.chest = function () {
+    var hipY = this.y - this.hipH.v;
+    var a = (-90 + this.lean.v * this.facing) * D2R;
+    return [this.x + Math.cos(a) * L.torso * 0.72, hipY + Math.sin(a) * L.torso * 0.72];
+  };
+
+  Fighter.prototype.def = function () { return MOVES[this.move] || MOVES.idle; };
+  Fighter.prototype.progress = function () {
+    var d = this.def();
+    return d.dur > 0 ? clamp01(this.mt / d.dur) : 0;
+  };
+
+  Fighter.prototype.start = function (name) {
+    if (!MOVES[name]) return;
+    this.move = name; this.mt = 0; this.moveDone = false; this.hitLanded = false;
+  };
+
+  Fighter.prototype.busy = function () {
+    var d = this.def();
+    return d.dur > 0 && !this.moveDone;
+  };
+
+  Fighter.prototype.canAct = function () {
+    return this.stun <= 0 && !this.busy();
+  };
+
+  /* ---- update -------------------------------------------------------- */
+
+  Fighter.prototype.update = function (dt, cmd) {
+    cmd = cmd || {};
+    var d = this.def();
+
+    this.breath += dt * (1.55 + (1 - this.hp / this.maxHp) * 1.5);
+    this.sway += dt * 0.62;
+    this.blinkT += dt;
+    if (this.flash > 0) this.flash = Math.max(0, this.flash - dt * 5);
+    if (this.stun > 0) this.stun = Math.max(0, this.stun - dt);
+
+    if (d.dur > 0) {
+      this.mt += dt;
+      if (this.mt >= d.dur) { this.moveDone = true; }
+    }
+
+    // gravity and ground
+    if (!this.onGround) {
+      this.vy += 780 * dt;
+      this.y += this.vy * dt;
+      if (this.y >= this.groundY) {
+        this.y = this.groundY; this.vy = 0; this.onGround = true;
+        if (this.onLand) this.onLand();
+      }
+    }
+    this.x += this.vx * dt;
+    if (this.onGround) this.vx *= Math.pow(0.0009, dt);   // friction
+
+    this.posture(dt, cmd);
+    this.arms(dt, cmd);
+    this.legs(dt, cmd);
+    this.secondary(dt);
+
+    this.hipH.step(dt); this.lean.step(dt); this.twist.step(dt);
+    this.headA.step(dt); this.crouchS.step(dt); this.hipShift.step(dt);
+    this.hand[0].x.step(dt); this.hand[0].y.step(dt);
+    this.hand[1].x.step(dt); this.hand[1].y.step(dt);
+    this.kick.x.step(dt); this.kick.y.step(dt);
+  };
+
+  Fighter.prototype.posture = function (dt, cmd) {
+    var m = this.move, p = this.progress(), d = this.def();
+    var br = Math.sin(this.breath);                 // -1..1, always running
+    var crouching = (m === 'crouch' || m === 'blockLow' || m === 'sweep');
+
+    this.crouchS.t = crouching ? 1 : 0;
+
+    // breathing lifts the chest and rocks the shoulders a little
+    var hip = L.standHip - 22 * this.crouchS.v + br * 0.9;
+    if (!this.onGround) hip = L.standHip - 6;
+    this.hipH.t = hip;
+
+    var lean = 4 + br * 1.2;
+    if (m === 'walk') lean = 8;
+    if (m === 'dash') lean = 16;
+    if (crouching) lean = 16;
+    if (m === 'block' || m === 'blockLow') lean = -3;
+    if (d.arm || d.leg) lean = 6 + 16 * Math.sin(Math.PI * p);
+    if (m === 'hitHigh' || m === 'hitHeavy') lean = -18 * Math.sin(Math.PI * p);
+    if (m === 'hitLow') lean = 20 * Math.sin(Math.PI * p);
+    if (m === 'knockdown') lean = -70 * smooth(clamp01(p * 2));
+    if (m === 'defeat') lean = -60;
+    if (m === 'victory') lean = -4 + br * 2;
+    this.lean.t = lean;
+
+    // shoulders counter-rotate against whichever limb is working
+    var tw = br * 2.5;
+    if (d.arm !== undefined) tw = (d.arm ? -1 : 1) * 22 * Math.sin(Math.PI * p);
+    if (d.leg) tw = 26 * Math.sin(Math.PI * p);
+    if (m === 'walk' || m === 'dash') tw = Math.sin(this.phase * TAU) * 9;
+    this.twist.t = tw;
+
+    this.headA.t = (m === 'knockdown' || m === 'defeat') ? 26 : -br * 2.2 - this.lean.v * 0.25;
+
+    // idle weight shift: a slow drift from one foot to the other
+    this.hipShift.t = (m === 'idle' || m === 'block') ? Math.sin(this.sway) * 2.4 : 0;
+  };
+
+  /* Hand targets in body-local space. Every move writes here; the springs
+   * and the IK do the rest. */
+  Fighter.prototype.arms = function (dt, cmd) {
+    var m = this.move, p = this.progress(), d = this.def();
+    var br = Math.sin(this.breath), br2 = Math.sin(this.breath * 2);
+    // guard stance: lead hand up and forward, rear hand by the chin
+    var g = [[8 + br * 0.9, 7 + br2 * 0.8], [17 + br * 1.2, 11 + br2 * 0.9]];
+
+    if (m === 'block') { g = [[11, 14], [16, 16]]; }
+    else if (m === 'blockLow') { g = [[9, -2], [13, 1]]; }
+    else if (m === 'crouch') { g = [[6, -4], [12, -1]]; }
+    else if (m === 'walk') { g = [[7 + Math.sin(this.phase * TAU) * 3, 1], [16, 5]]; }
+    else if (m === 'jump') { g = [[2, 12], [10, 14]]; }
+    else if (m === 'hitHigh' || m === 'hitHeavy') {
+      var k = Math.sin(Math.PI * p);
+      g = [[7 - 9 * k, 1 + 10 * k], [14 - 12 * k, 5 + 12 * k]];
+    } else if (m === 'hitLow') { g = [[6, -6], [12, -3]]; }
+    else if (m === 'knockdown' || m === 'defeat') { g = [[-6, -8], [2, -12]]; }
+    else if (m === 'victory') { g = [[4, 20 + br * 2], [10, 24 + br * 2]]; }
+    else if (m === 'grab') {
+      var e = Math.sin(Math.PI * clamp01(p * 1.3));
+      g = [[7 + 22 * e, 1 + 4 * e], [16 + 20 * e, 5 + 2 * e]];
+    } else if (m === 'throw') {
+      var tp = smooth(p);
+      g = [[8 + 16 * Math.sin(Math.PI * tp), 4 + 22 * tp], [16 + 14 * Math.sin(Math.PI * tp), 8 + 20 * tp]];
+    } else if (d.arm !== undefined) {
+      /* A strike: the working hand runs out to reach and back. `arc` swings
+       * it wide instead of straight, which is what separates a hook from a
+       * cross without a second animation. */
+      var i = d.arm;
+      var ex = p < 0.45 ? smooth(p / 0.45) : 1 - smooth((p - 0.45) / 0.55);
+      var reach = d.reach, hy = d.hy;
+      var hx2 = 8 + (reach - 8) * ex;
+      var hy2 = 7 + (hy - 7) * ex;
+      if (d.arc) {
+        var a = Math.PI * (0.85 - 1.1 * p);
+        hx2 = 8 + reach * 0.86 * ex * Math.sin(a + 0.6);
+        hy2 = 7 + (hy - 7) * ex + Math.cos(a) * 14 * ex;
+      }
+      if (m === 'uppercut') { hy2 = 7 + (hy + 14) * ex; hx2 = 8 + (reach - 8) * ex * 0.8; }
+      g = [[8, 7], [17, 11]];
+      g[i] = [hx2, hy2];
+      // the other hand pulls back as a counterweight
+      g[1 - i] = [g[1 - i][0] - 8 * ex, g[1 - i][1] + 2 * ex];
+    }
+
+    for (var h = 0; h < 2; h++) {
+      var stiff = (d.arm !== undefined && h === d.arm) ? 42 : 16;
+      this.hand[h].x.w = stiff; this.hand[h].y.w = stiff;
+      this.hand[h].x.t = g[h][0];
+      this.hand[h].y.t = g[h][1];
+    }
+  };
+
+  Fighter.prototype.legs = function (dt, cmd) {
+    var m = this.move, p = this.progress(), d = this.def();
+    var speed = Math.abs(this.vx);
+
+    // kicking foot target
+    if (d.leg) {
+      var ex = p < 0.45 ? smooth(p / 0.45) : 1 - smooth((p - 0.45) / 0.55);
+      var kx = 4 + (d.reach - 4) * ex;
+      var ky = -34 + (d.hy + 34) * ex;
+      if (d.arc) {
+        var a = Math.PI * (0.75 - 0.95 * p);
+        kx = 4 + d.reach * 0.9 * ex * Math.sin(a + 0.7);
+        ky = d.hy * ex + Math.cos(a) * 16 * ex;
+      }
+      this.kick.on = 1; this.kick.leg = 1;
+      this.kick.x.w = 40; this.kick.y.w = 40;
+      this.kick.x.t = kx; this.kick.y.t = ky;
+    } else {
+      this.kick.on = 0;
+      this.kick.x.t = 4; this.kick.y.t = -34;
+    }
+
+    var gy = this.groundY;
+
+    if (!this.onGround) {
+      for (var a2 = 0; a2 < 2; a2++) {
+        var ff = this.feet[a2];
+        ff.planted = false;
+        var tuck = Math.max(0, Math.min(1, -this.vy / 260));
+        var tx = this.x + this.facing * (a2 ? 9 : -5) - this.facing * 5 * tuck;
+        ff.wx += (tx - ff.wx) * Math.min(1, dt * 13);
+        ff.wy += ((gy - 16 - 16 * tuck) - ff.wy) * Math.min(1, dt * 11);
+        ff.angle += (-26 - ff.angle) * Math.min(1, dt * 9);
+      }
+      return;
+    }
+
+    var moving = (m === 'walk' || m === 'dash') && speed > 4;
+    if (moving) {
+      var walkRun = Math.min(1, speed / 150);
+      this.stride = 34 + 26 * walkRun;
+      this.duty = 0.64 - 0.2 * walkRun;
+      this.lift = 5 + 7 * walkRun;
+      this.cadence = speed / this.stride;
+      this.phase = (this.phase + this.cadence * dt) % 1;
+      for (var i = 0; i < 2; i++) {
+        var f = this.feet[i];
+        var ph = (this.phase + i * 0.5) % 1;
+        if (ph < this.duty) {
+          if (!f.planted) { f.planted = true; f.wy = gy; }
+          f.angle += ((ph / this.duty < 0.25 ? 10 : ph / this.duty > 0.78 ? -26 : 0) - f.angle) * Math.min(1, dt * 16);
+        } else {
+          if (f.planted) { f.planted = false; f.liftX = f.wx; }
+          var u = (ph - this.duty) / (1 - this.duty);
+          var st = (1 - this.duty) / Math.max(0.001, this.cadence);
+          var land = this.x + this.vx * st * (1 - u) + Math.sign(this.vx) * this.stride * 0.30;
+          f.wx = f.liftX + (land - f.liftX) * smooth(u);
+          f.wy = gy - Math.sin(Math.PI * u) * this.lift;
+          f.angle += ((u < 0.5 ? -24 + 48 * u : 14) - f.angle) * Math.min(1, dt * 14);
+        }
+      }
+      return;
+    }
+
+    /* Standing: a fighting stance, lead foot forward, rear foot turned out.
+     * The stance drifts with the weight shift so he is never truly still. */
+    var lead = this.facing, back = -this.facing;
+    var shift = this.hipShift.v;
+    var stanceW = 15 + 7 * this.crouchS.v;
+    var want = [this.x + back * stanceW * 0.85 - shift, this.x + lead * stanceW + shift * 0.6];
+    if (this.kick.on) {
+      // planted foot takes all the weight and slides under the body
+      want[1] = this.x + lead * 2;
+      want[0] = this.x - lead * 5;
+    }
+    if (m === 'knockdown' || m === 'defeat') {
+      want = [this.x - lead * 26, this.x - lead * 6];
+    }
+    for (var s = 0; s < 2; s++) {
+      var fs = this.feet[s];
+      fs.planted = true;
+      var rate = (m === 'dash' || this.kick.on) ? 18 : 7;
+      fs.wx += (want[s] - fs.wx) * Math.min(1, dt * rate);
+      fs.wy += (gy - fs.wy) * Math.min(1, dt * 14);
+      fs.angle += ((s === 0 ? -12 : 4) - fs.angle) * Math.min(1, dt * 7);
+    }
+  };
+
+  /* Hair and belt tails: verlet points chasing an anchor. Free follow-through
+   * on every movement, and the main reason the character reads as alive. */
+  Fighter.prototype.secondary = function (dt) {
+    var c = this.chest();
+    var hipY = this.y - this.hipH.v;
+    var pp = this.pose();
+    var hb = (pp.headA + 90 * this.facing) * D2R;
+    var ax = pp.headC[0] - Math.cos(hb) * L.headRX * 0.85;
+    var ay = pp.headC[1] - Math.sin(hb) * L.headRX * 0.85 + 1.5;
+    var seg = 5.2;
+    for (var i = 0; i < this.hair.length; i++) {
+      var h = this.hair[i];
+      h.vy += 620 * dt;
+      h.vx *= 0.90; h.vy *= 0.90;
+      h.x += h.vx * dt; h.y += h.vy * dt;
+      var px = i === 0 ? ax : this.hair[i - 1].x;
+      var py = i === 0 ? ay : this.hair[i - 1].y;
+      var dx = h.x - px, dy = h.y - py;
+      var d = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+      var k = (d - seg) / d;
+      h.x -= dx * k; h.y -= dy * k;
+      h.vx += (-dx * k) / Math.max(dt, 0.0001) * 0.30;
+      h.vy += (-dy * k) / Math.max(dt, 0.0001) * 0.30;
+    }
+    var bx = this.x - this.facing * 3, by = hipY + 3;
+    for (var j = 0; j < this.belt.length; j++) {
+      var b = this.belt[j];
+      b.vy += 700 * dt;
+      b.vx *= 0.88; b.vy *= 0.88;
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      var qx = j === 0 ? bx : this.belt[j - 1].x;
+      var qy = j === 0 ? by : this.belt[j - 1].y;
+      var ex = b.x - qx, ey = b.y - qy;
+      var e = Math.sqrt(ex * ex + ey * ey) || 0.0001;
+      var kk = (e - 9) / e;
+      b.x -= ex * kk; b.y -= ey * kk;
+      b.vx += (-ex * kk) / Math.max(dt, 0.0001) * 0.30;
+      b.vy += (-ey * kk) / Math.max(dt, 0.0001) * 0.30;
+    }
+  };
+
+  /* ---- solved skeleton ------------------------------------------------ */
+
+  Fighter.prototype.pose = function () {
+    var fw = this.facing;
+    var hipY = this.y - this.hipH.v;
+    var hipX = this.x + this.hipShift.v * 0.35 * fw;
+    var leanA = -90 + this.lean.v * fw;
+    var la = leanA * D2R;
+    var ux = Math.cos(la), uy = Math.sin(la);          // hip -> shoulders
+    var neck = [hipX + ux * L.torso, hipY + uy * L.torso];
+    var chest = [hipX + ux * L.torso * 0.72, hipY + uy * L.torso * 0.72];
+    var waist = [hipX + ux * L.torso * 0.34, hipY + uy * L.torso * 0.34];
+
+    // shoulder line, rotated by the torso twist
+    var tw = this.twist.v * D2R * fw;
+    var sx = -uy, sy = ux;                              // perpendicular
+    var sw = L.shoulderSep;
+    var twc = Math.cos(tw), tws = Math.sin(tw);
+    var offx = (sx * twc - ux * tws) * sw, offy = (sy * twc - uy * tws) * sw;
+    var shR = [neck[0] - offx + ux * -3, neck[1] - offy + uy * -3];
+    var shL = [neck[0] + offx + ux * -3, neck[1] + offy + uy * -3];
+    // near shoulder is the one on the viewer's side
+    var shoulders = [shR, shL];
+
+    var headA = leanA + this.headA.v * fw;
+    var ha = headA * D2R;
+    var headBase = [neck[0] + Math.cos(ha) * L.neck, neck[1] + Math.sin(ha) * L.neck];
+    var headC = [headBase[0] + Math.cos(ha) * L.headRY * 0.86,
+      headBase[1] + Math.sin(ha) * L.headRY * 0.86];
+
+    // hands: body-local -> world
+    var hands = [], arms = [];
+    for (var i = 0; i < 2; i++) {
+      var lx = this.hand[i].x.v, ly = this.hand[i].y.v;
+      var hx = chest[0] + fw * lx, hy = chest[1] - ly;
+      var pole = (i === 0 ? 1 : 1) * fw;
+      var elbow = ik2(shoulders[i][0], shoulders[i][1], hx, hy, L.uArm, L.lArm, -pole);
+      hands.push([hx, hy]);
+      arms.push({ sh: shoulders[i], elbow: elbow, wrist: [hx, hy] });
+    }
+
+    // legs
+    var legs = [];
+    for (var j = 0; j < 2; j++) {
+      var hxp = hipX + (j ? 1 : -1) * fw * L.hipD * 0.40;
+      var ax, ay, angle;
+      if (this.kick.on && j === 1) {
+        ax = chest[0] + fw * this.kick.x.v;
+        ay = chest[1] - this.kick.y.v;
+        angle = this.def().low ? 8 : -4;
+      } else {
+        ax = this.feet[j].wx; ay = this.feet[j].wy - 4;
+        angle = this.feet[j].angle;
+      }
+      var rdx = ax - hxp, rdy = ay - hipY;
+      var rd = Math.sqrt(rdx * rdx + rdy * rdy), reach = L.uLeg + L.lLeg - 1;
+      if (rd > reach) { ax = hxp + rdx / rd * reach; ay = hipY + rdy / rd * reach; }
+      var knee = ik2(hxp, hipY, ax, ay, L.uLeg, L.lLeg, -fw);
+      legs.push({ hip: [hxp, hipY], knee: knee, ankle: [ax, ay], angle: angle });
+    }
+
+    return {
+      fw: fw, hip: [hipX, hipY], waist: waist, chest: chest, neck: neck,
+      headC: headC, headA: headA, leanA: leanA,
+      shoulders: shoulders, arms: arms, hands: hands, legs: legs
+    };
+  };
+
+  F.Fighter = Fighter;
+})(FX);
+
+/* ===== src/fx/draw.js ===== */
+/*
+ * draw.js -- render a solved fighter as lit volumes.
+ *
+ * Every body part is a capsule or an ellipsoid handed to the shader, which
+ * recovers a surface normal per pixel and lights it. Nothing here is a
+ * picture; it is a description of a solid, and the picture is the result.
+ *
+ * Depth is explicit rather than implied by paint order: the far arm is
+ * simply further away, so when it crosses the chest the shader sorts it
+ * correctly and the contact reads as an overlap rather than a seam.
+ */
+var FX = FX || {};
+(function (F) {
+  'use strict';
+
+  var L = F.FighterL;
+
+  // depth slices, smaller = nearer the viewer
+  var Z = { farLeg: 34, farArm: 28, hipD: 22, torso: 20, belt: 17, neck: 16,
+    head: 12, hair: 10, nearLeg: 6, nearArm: 1 };
+
+  function mkSkin(o) {
+    return {
+      skin: F.mat(o.skin[0], o.skin[1], o.skin[2], 0.16, 16, 0.55),
+      gi: F.mat(o.gi[0], o.gi[1], o.gi[2], 0.07, 8, 0.68),
+      gi2: F.mat(o.gi2[0], o.gi2[1], o.gi2[2], 0.07, 8, 0.6),
+      trim: F.mat(o.trim[0], o.trim[1], o.trim[2], 0.20, 22, 0.7),
+      hair: F.mat(o.hair[0], o.hair[1], o.hair[2], 0.28, 26, 0.8),
+      metal: F.mat(210, 218, 232, 0.75, 60, 1.0),
+      name: o.name, tint: o.tint || [255, 210, 120]
+    };
+  }
+  F.mkSkin = mkSkin;
+
+  F.SKINS = {
+    kai: mkSkin({
+      name: 'KAI',
+      skin: [232, 176, 138], gi: [238, 240, 246], gi2: [206, 210, 222],
+      trim: [206, 46, 62], hair: [38, 34, 44], tint: [255, 220, 150]
+    }),
+    ryo: mkSkin({
+      name: 'RYO',
+      skin: [206, 150, 112], gi: [58, 92, 168], gi2: [40, 66, 124],
+      trim: [242, 196, 72], hair: [58, 40, 30], tint: [150, 200, 255]
+    })
+  };
+
+  function lerp(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; }
+  function ang(a, b) { return Math.atan2(b[1] - a[1], b[0] - a[0]); }
+
+  /* Bounding box for the depth-clear and shader clip. Generous: hair and a
+   * fully extended kick both leave the body's own footprint. */
+  F.fighterBounds = function (f) {
+    var p = f.pose();
+    var xs = [p.hip[0], p.headC[0]], ys = [p.hip[1], p.headC[1]];
+    for (var i = 0; i < 2; i++) {
+      xs.push(p.arms[i].wrist[0], p.arms[i].elbow[0]);
+      ys.push(p.arms[i].wrist[1], p.arms[i].elbow[1]);
+      xs.push(p.legs[i].ankle[0], p.legs[i].knee[0]);
+      ys.push(p.legs[i].ankle[1], p.legs[i].knee[1]);
+    }
+    for (var h = 0; h < f.hair.length; h++) { xs.push(f.hair[h].x); ys.push(f.hair[h].y); }
+    return {
+      x0: Math.min.apply(null, xs) - 26, x1: Math.max.apply(null, xs) + 26,
+      y0: Math.min.apply(null, ys) - 26, y1: Math.max.apply(null, ys) + 30
+    };
+  };
+
+  /* The contact shadow. Cheap, and it is most of what glues a character to
+   * the floor -- without it a fighter looks pasted on. */
+  F.drawShadow = function (surf, f, groundY) {
+    var lift = Math.max(0, groundY - f.y);
+    var k = Math.max(0.16, 1 - lift / 150);
+    surf.shadowEllipse(f.x + 6, groundY + 2, 30 * k, 8.5 * k, 0.62 * k);
+  };
+
+  F.drawFighter = function (sh, f) {
+    var p = f.pose();
+    var sk = f.skin;
+    var fw = p.fw;
+
+    sh.tint = f.flash;
+    sh.tintR = sk.tint[0]; sh.tintG = sk.tint[1]; sh.tintB = sk.tint[2];
+
+    var far = 0, near = 1;                    // arm/leg indices
+    drawLeg(sh, p.legs[far], sk, Z.farLeg, 0.72, fw);
+    drawArm(sh, p.arms[far], sk, Z.farArm, 0.74, fw);
+
+    drawTorso(sh, p, f, sk, fw);
+    drawHead(sh, p, f, sk, fw);
+
+    drawLeg(sh, p.legs[near], sk, Z.nearLeg, 1.0, fw);
+    drawArm(sh, p.arms[near], sk, Z.nearArm, 1.0, fw);
+  };
+
+  function drawLeg(sh, lg, sk, z, ao, fw) {
+    // bare lower leg, gi trouser over the thigh and knee
+    var mid = lerp(lg.knee, lg.ankle, 0.44);
+    sh.capsule(lg.hip[0], lg.hip[1], lg.knee[0], lg.knee[1], 8.2, 6.3, z, sk.gi, ao);
+    sh.capsule(lg.knee[0], lg.knee[1], mid[0], mid[1], 6.4, 5.4, z, sk.gi, ao);
+    // shin starts inside the trouser cuff so there is no ring at the seam
+    sh.capsule(mid[0], mid[1], lg.ankle[0], lg.ankle[1], 5.0, 3.2, z + 0.6, sk.skin, ao);
+    // foot
+    var a = (lg.angle || 0) * Math.PI / 180;
+    var fx = Math.cos(a) * fw, fy = Math.sin(a);
+    sh.capsule(lg.ankle[0], lg.ankle[1] + 1, lg.ankle[0] + fx * L.foot * 0.8,
+      lg.ankle[1] + 1 + fy * L.foot * 0.8, 4.2, 3.0, z - 2, sk.skin, ao);
+    // ankle wrap
+    sh.sphere(lg.ankle[0], lg.ankle[1], 3.6, z - 1, sk.trim, ao);
+  }
+
+  function drawArm(sh, a, sk, z, ao, fw) {
+    sh.sphere(a.sh[0], a.sh[1], L.shoulderR, z + 1, sk.gi, ao);
+    var sleeve = lerp(a.sh, a.elbow, 0.60);
+    sh.capsule(a.sh[0], a.sh[1], sleeve[0], sleeve[1], 6.4, 5.2, z, sk.gi, ao);
+    sh.capsule(sleeve[0], sleeve[1], a.elbow[0], a.elbow[1], 4.8, 4.2, z + 0.6, sk.skin, ao);
+    sh.capsule(a.elbow[0], a.elbow[1], a.wrist[0], a.wrist[1], 4.2, 3.5, z, sk.skin, ao);
+    // wrist wrap and fist
+    var wa = ang(a.elbow, a.wrist);
+    sh.capsule(a.wrist[0] - Math.cos(wa) * 3, a.wrist[1] - Math.sin(wa) * 3,
+      a.wrist[0], a.wrist[1], 4.0, 4.2, z - 1, sk.trim, ao);
+    sh.ellipsoid(a.wrist[0] + Math.cos(wa) * 2.6, a.wrist[1] + Math.sin(wa) * 2.6,
+      4.8, 4.2, wa, z - 2, sk.skin, ao);
+  }
+
+  function drawTorso(sh, p, f, sk, fw) {
+    var la = p.leanA * Math.PI / 180;
+    // pelvis, abdomen, chest -- three masses give the taper a real body has
+    sh.ellipsoid(p.hip[0], p.hip[1], L.hipD, L.hipH2, la + Math.PI / 2, Z.hipD, sk.gi, 0.95);
+    sh.ellipsoid(p.waist[0], p.waist[1], L.waistD, L.waistH, la + Math.PI / 2, Z.torso, sk.gi, 0.98);
+    sh.ellipsoid(p.chest[0], p.chest[1], L.chestD, L.chestH, la + Math.PI / 2, Z.torso - 1, sk.gi, 1);
+    // the yoke across the shoulders -- this is what gives the V
+    sh.capsule(p.shoulders[0][0], p.shoulders[0][1], p.shoulders[1][0], p.shoulders[1][1],
+      7.6, 7.6, Z.torso - 2, sk.gi, 1);
+
+    // the gi's open front: a darker panel down the centreline
+    var top = lerp(p.chest, p.neck, 0.42), bot = lerp(p.hip, p.waist, 0.5);
+    sh.capsule(top[0] + fw * 3.0, top[1], bot[0] + fw * 2.0, bot[1], 4.2, 5.2, Z.torso - 3, sk.gi2, 1);
+
+    // belt
+    var b0 = lerp(p.hip, p.waist, 0.62);
+    sh.ellipsoid(b0[0], b0[1], L.waistD * 1.16, 4.4, la + Math.PI / 2, Z.belt, sk.trim, 1);
+    // belt tails, from the verlet chain
+    var prev = [b0[0] - fw * 2, b0[1] + 2];
+    for (var i = 0; i < f.belt.length; i++) {
+      var b = f.belt[i];
+      sh.capsule(prev[0], prev[1], b.x, b.y, 3.4 - i * 0.6, 2.8 - i * 0.6, Z.belt - 1, sk.trim, 0.9);
+      prev = [b.x, b.y];
+    }
+  }
+
+  function drawHead(sh, p, f, sk, fw) {
+    var ha = p.headA * Math.PI / 180;
+    sh.capsule(p.neck[0], p.neck[1], p.headC[0] - Math.cos(ha) * L.headRY * 0.7,
+      p.headC[1] - Math.sin(ha) * L.headRY * 0.7, 4.6, 4.2, Z.neck, sk.skin, 0.88);
+    // skull and jaw
+    sh.ellipsoid(p.headC[0], p.headC[1], L.headRX, L.headRY, ha + Math.PI / 2, Z.head, sk.skin, 1);
+    var jaw = [p.headC[0] - Math.cos(ha) * 3.0 + Math.cos(ha + Math.PI / 2 * fw) * 2.0,
+      p.headC[1] - Math.sin(ha) * 3.0 + Math.sin(ha + Math.PI / 2 * fw) * 2.0];
+    sh.ellipsoid(jaw[0], jaw[1], 5.4, 5.0, ha, Z.head - 1, sk.skin, 0.97);
+
+    // hair: a cap set back off the brow, plus the verlet tail
+    var bx = Math.cos(ha + Math.PI / 2 * fw), by = Math.sin(ha + Math.PI / 2 * fw);
+    sh.ellipsoid(p.headC[0] + Math.cos(ha) * 2.2 - bx * 1.5,
+      p.headC[1] + Math.sin(ha) * 2.2 - by * 1.5,
+      L.headRX * 0.98, L.headRY * 0.74, ha + Math.PI / 2, Z.hair, sk.hair, 1);
+    var prev = [p.headC[0] - Math.cos(ha + Math.PI / 2 * fw) * L.headRX * 0.7 + Math.cos(ha) * 2,
+      p.headC[1] - Math.sin(ha + Math.PI / 2 * fw) * L.headRX * 0.7 + Math.sin(ha) * 2];
+    for (var i = 0; i < f.hair.length; i++) {
+      var h = f.hair[i];
+      sh.capsule(prev[0], prev[1], h.x, h.y, 5.2 - i * 0.9, 4.4 - i * 0.9, Z.hair + 1, sk.hair, 0.95);
+      prev = [h.x, h.y];
+    }
+
+    /* Face. At this size it is three marks -- brow, nose, mouth -- but
+     * without them the head is an egg and the character has no direction. */
+    var fx = Math.cos(ha + Math.PI / 2 * fw), fy = Math.sin(ha + Math.PI / 2 * fw);
+    var ux2 = Math.cos(ha), uy2 = Math.sin(ha);
+    function fp(fwd, up, r1, r2, rot, z, m, a) {
+      sh.ellipsoid(p.headC[0] + fx * fwd + ux2 * up, p.headC[1] + fy * fwd + uy2 * up,
+        r1, r2, rot, z, m, a === undefined ? 1 : a);
+    }
+    // nose
+    fp(L.headRX * 0.92, -0.4, 2.3, 1.9, ha, Z.head - 2, sk.skin, 1.04);
+    // brow shelf
+    fp(L.headRX * 0.62, 2.2, 3.0, 1.5, ha + Math.PI / 2, Z.head - 2, sk.hair, 0.9);
+    // eye
+    var open = f.blinkT % f.blink > 0.13 ? 1 : 0.16;
+    fp(L.headRX * 0.60, 0.5, 1.9, 1.7 * open, ha + Math.PI / 2, Z.head - 3,
+      F.mat(24, 20, 28, 0.55, 45, 0.3));
+    // mouth line
+    fp(L.headRX * 0.66, -3.4, 1.7, 0.75, ha + Math.PI / 2, Z.head - 3,
+      F.mat(150, 84, 78, 0.1, 10, 0.2));
+  }
+
+  F.Z = Z;
+})(FX);
+
+/* ===== src/fx/sound.js ===== */
+/*
+ * sound.js -- impact synthesis. No samples; every cue is oscillators and
+ * shaped noise, which is all a punch really is: a transient plus a body.
+ */
+var FX = FX || {};
+(function (F) {
+  'use strict';
+  function Sound() { this.ctx = null; this.on = true; }
+  Sound.prototype.enable = function () {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      this.ctx = new AC();
+      this.g = this.ctx.createGain(); this.g.gain.value = 0.3;
+      this.comp = this.ctx.createDynamicsCompressor();
+      this.g.connect(this.comp); this.comp.connect(this.ctx.destination);
+    } catch (e) { this.ctx = null; }
+  };
+  Sound.prototype.noise = function (dur, vol, f, q, sweep) {
+    if (!this.ctx || !this.on) return;
+    var c = this.ctx, t = c.currentTime, n = Math.max(1, (c.sampleRate * dur) | 0);
+    var buf = c.createBuffer(1, n, c.sampleRate), d = buf.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 2);
+    var s = c.createBufferSource(); s.buffer = buf;
+    var bp = c.createBiquadFilter(); bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(f, t); bp.Q.value = q || 1.2;
+    if (sweep) bp.frequency.exponentialRampToValueAtTime(Math.max(40, sweep), t + dur);
+    var g = c.createGain(); g.gain.value = vol;
+    s.connect(bp); bp.connect(g); g.connect(this.g); s.start(t);
+  };
+  Sound.prototype.tone = function (type, f0, f1, dur, vol) {
+    if (!this.ctx || !this.on) return;
+    var c = this.ctx, t = c.currentTime;
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    o.connect(g); g.connect(this.g); o.start(t); o.stop(t + dur + 0.02);
+  };
+  Sound.prototype.play = function (k) {
+    switch (k) {
+      case 'hit':   this.noise(0.10, 0.7, 900, 1.0, 200); this.tone('square', 190, 70, 0.09, 0.16); break;
+      case 'heavy': this.noise(0.20, 0.9, 520, 0.9, 90);  this.tone('sawtooth', 130, 44, 0.20, 0.24); break;
+      case 'block': this.noise(0.07, 0.5, 2600, 3.0, 1400); this.tone('square', 900, 500, 0.05, 0.07); break;
+      case 'grab':  this.noise(0.10, 0.4, 400, 1.0, 180); break;
+      case 'super': this.noise(0.5, 0.85, 300, 0.7, 60);
+        this.tone('sawtooth', 90, 900, 0.32, 0.2); this.tone('square', 1400, 180, 0.5, 0.12); break;
+      case 'ko':    this.noise(0.7, 0.9, 240, 0.6, 50); this.tone('sawtooth', 200, 36, 0.8, 0.28); break;
+      default: break;
+    }
+  };
+  F.Sound = Sound;
+})(FX);
+
+/* ===== src/fx/fight.js ===== */
+/*
+ * fight.js -- the match: stage, hit resolution, effects, HUD, AI.
+ *
+ * The stage is painted once into a backing surface and copied per frame,
+ * which leaves the whole frame budget for the things that move. Everything
+ * that does move -- fighters, sparks, dust, the shockwave rings -- is drawn
+ * live on top.
+ *
+ * The feel of a fighting game is mostly in three details that cost almost
+ * nothing: hitstop (freeze both fighters for a few frames on contact so the
+ * blow reads), screen shake scaled to damage, and a flash on the struck
+ * body rather than on the whole screen. All three are here.
+ */
+var FX = FX || {};
+(function (F) {
+  'use strict';
+
+  var W = 480, H = 270;               // world units
+  var SCALE = 2;                      // device pixels per world unit
+  var GROUND = 232;
+  var WALL_L = 34, WALL_R = W - 34;
+
+  /* ---- stage ---------------------------------------------------------- */
+
+  function hash(a, b) {
+    var n = (a * 374761393 + b * 668265263) | 0;
+    n = (n ^ (n >> 13)) * 1274126177;
+    return ((n ^ (n >> 16)) >>> 0) / 4294967296;
+  }
+
+  function paintStage(bg) {
+    var S = SCALE, w = bg.w, h = bg.h;
+    // dusk sky
+    bg.gradientV(0, 0, w, GROUND * S, F.rgb(48, 36, 62), F.rgb(196, 118, 96));
+    // sun haze
+    bg.addDisc(w * 0.66, GROUND * S * 0.74, 190 * S / 2, 255, 176, 120, 0.5);
+    bg.addDisc(w * 0.66, GROUND * S * 0.74, 90 * S / 2, 255, 214, 160, 0.55);
+
+    // far mountains
+    var i, x, y;
+    for (i = 0; i < 3; i++) {
+      var baseY = (GROUND - 44 - i * 9) * S;
+      var amp = (26 - i * 6) * S;
+      var col = F.rgb(52 + i * 12, 44 + i * 12, 70 + i * 10);
+      for (x = 0; x < w; x++) {
+        var t = x / w;
+        var yy = baseY - Math.abs(Math.sin(t * (5 + i * 3) + i)) * amp
+          - Math.sin(t * (17 + i * 7)) * amp * 0.22;
+        bg.fillRect(x, yy, 1, baseY - yy + 6 * S, col);
+      }
+    }
+
+    // temple wall behind the arena
+    var wallTop = (GROUND - 132) * S, wallH = (GROUND - 6) * S - wallTop;
+    bg.gradientV(0, wallTop, w, wallH, F.rgb(74, 56, 62), F.rgb(44, 32, 40));
+    // pillars
+    for (i = 0; i < 7; i++) {
+      var px = (24 + i * 74) * S;
+      bg.gradientV(px, wallTop, 15 * S, wallH, F.rgb(96, 74, 78), F.rgb(52, 38, 46));
+      bg.fillRect(px, wallTop, 2 * S, wallH, F.rgb(126, 100, 100));
+      bg.fillRect(px + 13 * S, wallTop, 2 * S, wallH, F.rgb(34, 24, 30));
+      // capital
+      bg.fillRect(px - 3 * S, wallTop, 21 * S, 5 * S, F.rgb(108, 84, 86));
+      bg.fillRect(px - 3 * S, wallTop, 21 * S, 1.5 * S, F.rgb(148, 120, 116));
+    }
+    // hanging lanterns
+    for (i = 0; i < 6; i++) {
+      var lx = (52 + i * 76) * S, ly = (GROUND - 148) * S;
+      bg.fillRect(lx, wallTop - 22 * S, 1 * S, 22 * S, F.rgb(40, 30, 34));
+      bg.addDisc(lx, ly + 8 * S, 16 * S, 255, 150, 70, 0.30);
+    }
+
+    // floor: a stone platform in perspective
+    var fy = GROUND * S;
+    bg.gradientV(0, fy, w, h - fy, F.rgb(92, 72, 68), F.rgb(30, 24, 26));
+    // boards converging slightly, plus grain
+    for (y = 0; y < h - fy; y++) {
+      var d = y / (h - fy);
+      var lineC = F.rgb(70 - d * 30, 54 - d * 22, 52 - d * 22);
+      if (y % Math.round(9 * S) === 0) bg.fillRect(0, fy + y, w, 1, lineC);
+    }
+    for (i = 0; i < 2600; i++) {
+      var gx = (hash(i, 7) * w) | 0, gy = (fy + hash(i, 11) * (h - fy)) | 0;
+      var v = hash(i, 3);
+      bg.blendPx(gx, gy, 210, 180, 150, 0.05 + v * 0.07);
+    }
+    // front edge highlight
+    bg.fillRect(0, fy, w, 1.5 * S, F.rgb(150, 120, 104));
+    bg.fillRect(0, fy - 1 * S, w, 1 * S, F.rgb(58, 42, 44));
+
+    // vignette
+    for (y = 0; y < h; y++) {
+      for (x = 0; x < w; x += 1) {
+        var dx = (x / w - 0.5) * 2, dy = (y / h - 0.5) * 2;
+        var r = dx * dx * 0.7 + dy * dy * 0.9;
+        if (r < 0.55) { x += 0; continue; }
+        var k = Math.min(0.62, (r - 0.55) * 0.85);
+        bg.blendPx(x, y, 8, 6, 14, k);
+      }
+    }
+  }
+
+  /* ---- particles ------------------------------------------------------ */
+
+  function Fx() { this.p = []; this.rings = []; this.shake = 0; this.hitstop = 0; this.flash = 0; }
+
+  Fx.prototype.spark = function (x, y, n, power, col) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2;
+      var sp = (30 + Math.random() * 190) * power;
+      this.p.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 40,
+        life: 0.18 + Math.random() * 0.34, t: 0, r: 1 + Math.random() * 2.4,
+        c: col || [255, 226, 150], g: 380, add: 1 });
+    }
+  };
+  Fx.prototype.dust = function (x, y, n, dir) {
+    for (var i = 0; i < n; i++) {
+      this.p.push({ x: x + (Math.random() - 0.5) * 12, y: y - Math.random() * 3,
+        vx: (Math.random() - 0.3) * 55 * (dir || 1), vy: -18 - Math.random() * 42,
+        life: 0.4 + Math.random() * 0.5, t: 0, r: 2 + Math.random() * 4.5,
+        c: [186, 160, 138], g: 60, add: 0 });
+    }
+  };
+  Fx.prototype.ring = function (x, y, power, col) {
+    this.rings.push({ x: x, y: y, t: 0, life: 0.28, power: power, c: col || [255, 220, 160] });
+  };
+
+  Fx.prototype.update = function (dt) {
+    var i, a;
+    for (i = this.p.length - 1; i >= 0; i--) {
+      a = this.p[i];
+      a.t += dt;
+      if (a.t >= a.life) { this.p.splice(i, 1); continue; }
+      a.vy += a.g * dt;
+      a.vx *= Math.pow(0.12, dt);
+      a.x += a.vx * dt; a.y += a.vy * dt;
+    }
+    for (i = this.rings.length - 1; i >= 0; i--) {
+      a = this.rings[i]; a.t += dt;
+      if (a.t >= a.life) this.rings.splice(i, 1);
+    }
+    if (this.shake > 0) this.shake = Math.max(0, this.shake - dt * 5.5);
+    if (this.flash > 0) this.flash = Math.max(0, this.flash - dt * 6);
+  };
+
+  Fx.prototype.draw = function (surf, ox, oy) {
+    var i, a, S = SCALE;
+    for (i = 0; i < this.rings.length; i++) {
+      a = this.rings[i];
+      var u = a.t / a.life;
+      var rad = (6 + u * 46 * a.power) * S;
+      var al = (1 - u) * (1 - u) * 0.9;
+      // a thin expanding shell, drawn additively
+      var x0 = a.x * S + ox, y0 = a.y * S + oy;
+      var steps = Math.max(18, (rad * 0.9) | 0);
+      for (var k = 0; k < steps; k++) {
+        var th = k / steps * Math.PI * 2;
+        var px = x0 + Math.cos(th) * rad, py = y0 + Math.sin(th) * rad * 0.62;
+        surf.addPx(px | 0, py | 0, a.c[0], a.c[1], a.c[2], al);
+        surf.addPx((px + 1) | 0, py | 0, a.c[0], a.c[1], a.c[2], al * 0.6);
+      }
+    }
+    for (i = 0; i < this.p.length; i++) {
+      a = this.p[i];
+      var t = 1 - a.t / a.life;
+      var r = a.r * (a.add ? t : 1 + (1 - t) * 1.4) * S;
+      var px2 = a.x * S + ox, py2 = a.y * S + oy;
+      if (a.add) surf.addDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 1.5);
+      else {
+        var rr = Math.max(1, r) | 0;
+        surf.blendRect(px2 - rr, py2 - rr, rr * 2, rr * 2, a.c[0], a.c[1], a.c[2], t * 0.30);
+      }
+    }
+  };
+
+  /* ---- match ---------------------------------------------------------- */
+
+  function Match(canvas) {
+    this.surf = new F.Surface(W * SCALE, H * SCALE);
+    this.surf.attach(canvas);
+    this.bg = new F.Surface(W * SCALE, H * SCALE);
+    paintStage(this.bg);
+
+    this.sh = new F.Shader(this.surf);
+    this.sh.S = SCALE;
+    this.fx = new Fx();
+
+    this.a = new F.Fighter(F.SKINS.kai, { name: 'KAI' });
+    this.b = new F.Fighter(F.SKINS.ryo, { name: 'RYO' });
+    this.a.name = 'KAI'; this.b.name = 'RYO';
+    this.reset();
+
+    this.input = { l: 0, r: 0, u: 0, d: 0, p: 0, k: 0, s: 0, g: 0 };
+    this.demo = true;
+    this.time = 99; this.round = 1; this.wins = [0, 0];
+    this.over = 0; this.banner = ''; this.bannerT = 0;
+    this.acc = 0; this.last = 0;
+    this.aiT = [0, 0];
+  }
+
+  Match.prototype.reset = function () {
+    this.a.place(W * 0.38, GROUND, 1);
+    this.b.place(W * 0.62, GROUND, -1);
+    this.a.hp = this.a.maxHp; this.b.hp = this.b.maxHp;
+    this.a.meter = this.b.meter = 0;
+    this.a.start('idle'); this.b.start('idle');
+    this.a.stun = this.b.stun = 0;
+    this.a.vx = this.b.vx = 0;
+    this.time = 99; this.over = 0;
+  };
+
+  Match.prototype.say = function (t, dur) { this.banner = t; this.bannerT = dur || 1.6; };
+
+  /* Resolve one fighter's active frames against the other. */
+  Match.prototype.resolve = function (at, df) {
+    var d = at.def();
+    if (!d.hit || at.hitLanded) return;
+    var p = at.progress();
+    if (p < d.hit[0] || p > d.hit[1]) return;
+
+    var dx = (df.x - at.x) * at.facing;
+    var reachW = d.reach * 0.92 + 26;
+    if (dx < -12 || dx > reachW) return;
+    // height check: crouching ducks highs, jumping avoids lows
+    var lowMove = !!d.low;
+    var dfCrouch = df.crouchS.v > 0.55;
+    if (!lowMove && dfCrouch && !d.super) return;
+    if (lowMove && !df.onGround) return;
+
+    at.hitLanded = true;
+
+    var hx = at.x + at.facing * (dx * 0.6 + 14);
+    var hy = df.y - (lowMove ? 22 : 78);
+
+    // blocking: correct guard height, facing the attacker
+    var guarding = (df.move === 'block' || df.move === 'blockLow') &&
+      ((df.x - at.x) * df.facing < 0);
+    var guardRight = guarding && ((lowMove && df.move === 'blockLow') || (!lowMove && df.move === 'block'));
+
+    if (guardRight) {
+      df.hp -= d.dmg * 0.12;
+      df.vx += at.facing * d.push * 0.45;
+      at.vx -= at.facing * 22;
+      df.flash = 0.5;
+      this.fx.spark(hx, hy, 9, 0.5, [180, 220, 255]);
+      this.fx.ring(hx, hy, 0.5, [170, 210, 255]);
+      this.fx.shake = Math.max(this.fx.shake, d.hs * 0.4);
+      this.fx.hitstop = Math.max(this.fx.hitstop, 0.045);
+      at.combo = 0;
+      if (this.onSound) this.onSound('block');
+      return;
+    }
+
+    if (d.grab) {
+      df.start('thrown'); df.stun = 0.9;
+      at.start('throw');
+      if (this.onSound) this.onSound('grab');
+      return;
+    }
+
+    var dmg = d.dmg * (1 - Math.min(0.45, at.combo * 0.07));
+    df.hp = Math.max(0, df.hp - dmg);
+    df.flash = 1;
+    df.stun = d.super ? 0.7 : 0.26 + d.hs * 0.5;
+    df.vx += at.facing * d.push;
+    at.combo++;
+    at.meter = Math.min(100, at.meter + (d.super ? -100 : dmg * 1.5));
+
+    if (d.launch) {
+      df.vy = -d.launch; df.onGround = false;
+      df.start('knockdown');
+    } else if (d.trip) {
+      df.start('knockdown');
+    } else {
+      df.start(d.dmg >= 10 ? 'hitHeavy' : (lowMove ? 'hitLow' : 'hitHigh'));
+    }
+
+    this.fx.spark(hx, hy, d.super ? 46 : 16 + d.dmg, d.super ? 2.0 : 0.6 + d.dmg / 24,
+      d.super ? [255, 190, 255] : [255, 228, 150]);
+    this.fx.ring(hx, hy, d.super ? 2.2 : 0.6 + d.dmg / 20, d.super ? [255, 170, 255] : null);
+    this.fx.shake = Math.max(this.fx.shake, d.hs);
+    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.18 : 0.05 + d.hs * 0.12);
+    if (d.super) this.fx.flash = 0.8;
+    if (this.onSound) this.onSound(d.super ? 'super' : (d.dmg >= 10 ? 'heavy' : 'hit'));
+  };
+
+  /* Translate a control struct into a move. */
+  Match.prototype.drive = function (f, c, foe) {
+    f.facing = foe.x >= f.x ? 1 : -1;
+    if (f.hp <= 0) { if (f.move !== 'defeat' && f.onGround) f.start('defeat'); return; }
+    if (f.move === 'defeat' || f.move === 'thrown') return;
+
+    if (f.move === 'knockdown' && f.moveDone && f.onGround) { f.start('getup'); return; }
+    if (f.move === 'throw' && f.moveDone) { f.start('idle'); return; }
+    if (!f.canAct()) return;
+
+    var fwd = f.facing > 0 ? c.r : c.l;
+    var back = f.facing > 0 ? c.l : c.r;
+
+    if (!f.onGround) return;
+
+    if (c.s && f.meter >= 100) { f.start('special'); f.vx = f.facing * 40; return; }
+    if (c.g) { f.start('grab'); return; }
+    if (c.p) { f.start(c.d ? 'uppercut' : (back ? 'hook' : 'jab')); return; }
+    if (c.k) { f.start(c.d ? 'sweep' : (back ? 'roundhouse' : (c.u ? 'highKick' : 'lowKick'))); return; }
+    if (c.u) { f.start('jump'); f.vy = -395; f.onGround = false; f.vx = (fwd ? f.facing : back ? -f.facing : 0) * 118;
+      this.fx.dust(f.x, f.y, 7, 1); return; }
+    if (c.d) { f.start(back ? 'blockLow' : 'crouch'); return; }
+    if (back) { f.start('block'); f.vx = -f.facing * 78; return; }
+    if (fwd) { f.start('walk'); f.vx = f.facing * 108; return; }
+    f.start('idle');
+  };
+
+  Match.prototype.ai = function (f, foe, i, dt) {
+    var c = { l: 0, r: 0, u: 0, d: 0, p: 0, k: 0, s: 0, g: 0 };
+    this.aiT[i] -= dt;
+    var dist = Math.abs(foe.x - f.x);
+    var toward = foe.x > f.x ? 'r' : 'l';
+    var away = foe.x > f.x ? 'l' : 'r';
+
+    // react to an incoming attack
+    var fd = foe.def();
+    var incoming = fd.hit && foe.progress() < fd.hit[1] && dist < 96;
+    if (incoming && Math.random() < 0.6) {
+      c[away] = 1;
+      if (fd.low) c.d = 1;
+      return c;
+    }
+    if (this.aiT[i] > 0) return this.aiHold || c;
+
+    if (f.meter >= 100 && dist < 90 && Math.random() < 0.5) { c.s = 1; this.aiT[i] = 0.9; return c; }
+    if (dist > 108) { c[toward] = 1; this.aiT[i] = 0.12 + Math.random() * 0.2; return c; }
+    if (dist > 74) {
+      if (Math.random() < 0.42) { c.k = 1; c.u = Math.random() < 0.4 ? 1 : 0; }
+      else c[toward] = 1;
+      this.aiT[i] = 0.22 + Math.random() * 0.3;
+      return c;
+    }
+    var r = Math.random();
+    if (r < 0.30) c.p = 1;
+    else if (r < 0.46) { c.p = 1; c.d = 1; }
+    else if (r < 0.60) c.k = 1;
+    else if (r < 0.68) c.g = 1;
+    else if (r < 0.78) { c.u = 1; c[toward] = 1; }
+    else if (r < 0.90) { c[away] = 1; }
+    else c.d = 1;
+    this.aiT[i] = 0.20 + Math.random() * 0.34;
+    return c;
+  };
+
+  Match.prototype.step = function (dt) {
+    this.fx.update(dt);
+    if (this.fx.hitstop > 0) { this.fx.hitstop -= dt; return; }
+
+    if (this.bannerT > 0) this.bannerT -= dt;
+    if (!this.over) {
+      this.time -= dt;
+      if (this.time <= 0) { this.time = 0; this.finish(this.a.hp >= this.b.hp ? 0 : 1); }
+    }
+
+    var ca = this.over ? {} : (this.demo ? this.ai(this.a, this.b, 0, dt) : this.readInput());
+    var cb = this.over ? {} : this.ai(this.b, this.a, 1, dt);
+
+    this.drive(this.a, ca, this.b);
+    this.drive(this.b, cb, this.a);
+
+    this.a.setGround(GROUND); this.b.setGround(GROUND);
+    this.a.update(dt, ca); this.b.update(dt, cb);
+
+    this.resolve(this.a, this.b);
+    this.resolve(this.b, this.a);
+
+    // landing dust
+    var self = this;
+    this.a.onLand = function () { self.fx.dust(self.a.x, GROUND, 8, 1); };
+    this.b.onLand = function () { self.fx.dust(self.b.x, GROUND, 8, -1); };
+
+    // walls and body separation
+    [this.a, this.b].forEach(function (f) {
+      if (f.x < WALL_L) { f.x = WALL_L; f.vx = Math.max(0, f.vx); }
+      if (f.x > WALL_R) { f.x = WALL_R; f.vx = Math.min(0, f.vx); }
+    });
+    var gap = this.b.x - this.a.x;
+    if (Math.abs(gap) < 36) {
+      var push = (36 - Math.abs(gap)) * 0.5 * Math.sign(gap || 1);
+      this.a.x -= push; this.b.x += push;
+    }
+
+    if (!this.over && (this.a.hp <= 0 || this.b.hp <= 0)) {
+      this.finish(this.a.hp <= 0 ? 1 : 0);
+    }
+    if (this.over) {
+      this.over -= dt;
+      if (this.over <= 0) { this.round++; this.reset(); this.say('ROUND ' + this.round, 1.4); }
+    }
+  };
+
+  Match.prototype.finish = function (winner) {
+    if (this.over) return;
+    this.over = 3.4;
+    this.wins[winner]++;
+    var w = winner ? this.b : this.a;
+    var l = winner ? this.a : this.b;
+    w.start('victory'); l.hp = 0; l.start('defeat');
+    this.say('K.O.', 2.2);
+    this.fx.flash = 0.9;
+    this.fx.shake = 0.9;
+    if (this.onSound) this.onSound('ko');
+  };
+
+  Match.prototype.readInput = function () {
+    var i = this.input;
+    return { l: i.l, r: i.r, u: i.u, d: i.d, p: i.p, k: i.k, s: i.s, g: i.g };
+  };
+
+  /* ---- render --------------------------------------------------------- */
+
+  Match.prototype.render = function () {
+    var surf = this.surf, S = SCALE;
+    surf.copyFrom(this.bg);
+
+    var ox = 0, oy = 0;
+    if (this.fx.shake > 0) {
+      var k = this.fx.shake * this.fx.shake * 13;
+      ox = (Math.random() - 0.5) * k * S; oy = (Math.random() - 0.5) * k * S;
+    }
+
+    F.drawShadow(surf, this.a, GROUND * 1);
+    F.drawShadow(surf, this.b, GROUND * 1);
+
+    // far fighter first
+    var order = this.a.y <= this.b.y ? [this.a, this.b] : [this.b, this.a];
+    for (var i = 0; i < 2; i++) {
+      var f = order[i];
+      var b = F.fighterBounds(f);
+      this.sh.begin(b.x0, b.y0, b.x1, b.y1);
+      F.drawFighter(this.sh, f);
+    }
+
+    this.fx.draw(surf, ox, oy);
+    if (this.fx.flash > 0) {
+      surf.blendRect(0, 0, surf.w, surf.h, 255, 244, 230, this.fx.flash * 0.5);
+    }
+    this.hud(surf);
+    surf.present();
+  };
+
+  /* Chunky vector HUD, drawn with rectangles -- no font asset. */
+  function bar(surf, x, y, w, h, frac, r, g, b, flip) {
+    surf.fillRect(x - 2, y - 2, w + 4, h + 4, F.rgb(18, 16, 22));
+    surf.fillRect(x, y, w, h, F.rgb(46, 40, 48));
+    var fw = Math.max(0, Math.min(1, frac)) * w;
+    var bx = flip ? x + w - fw : x;
+    surf.fillRect(bx, y, fw, h, F.rgb(r, g, b));
+    surf.fillRect(bx, y, fw, h * 0.34, F.rgb(Math.min(255, r + 60), Math.min(255, g + 60), Math.min(255, b + 50)));
+  }
+
+  /* A 3x5 bitmap font written as rows, because the packed-hex version of
+   * this was wrong in a dozen places and spelled the fighters' names
+   * incorrectly. Rows are legible; hex is not. */
+  var FONT = {
+    'A': '010101111101101', 'B': '110101110101110', 'C': '011100100100011',
+    'D': '110101101101110', 'E': '111100110100111', 'F': '111100110100100',
+    'G': '011100101101011', 'H': '101101111101101', 'I': '111010010010111',
+    'J': '001001001101010', 'K': '101101110101101', 'L': '100100100100111',
+    'M': '101111111101101', 'N': '110101101101101', 'O': '010101101101010',
+    'P': '110101110100100', 'Q': '010101101110011', 'R': '110101110101101',
+    'S': '011100010001110', 'T': '111010010010010', 'U': '101101101101011',
+    'V': '101101101101010', 'W': '101101111111101', 'X': '101101010101101',
+    'Y': '101101010010010', 'Z': '111001010100111',
+    '0': '111101101101111', '1': '010110010010111', '2': '111001111100111',
+    '3': '111001111001111', '4': '101101111001001', '5': '111100111001111',
+    '6': '111100111101111', '7': '111001001001001', '8': '111101111101111',
+    '9': '111101111001111',
+    '.': '000000000000010', '!': '010010010000010', '-': '000000111000000',
+    ' ': '000000000000000'
+  };
+  function glyph(surf, ch, x, y, px, c) {
+    var g = FONT[ch]; if (!g) return;
+    for (var r = 0; r < 5; r++) {
+      for (var k = 0; k < 3; k++) {
+        if (g.charCodeAt(r * 3 + k) === 49) surf.fillRect(x + k * px, y + r * px, px, px, c);
+      }
+    }
+  }
+  function text(surf, str, x, y, px, c, shadow) {
+    str = String(str).toUpperCase();
+    for (var i = 0; i < str.length; i++) {
+      if (shadow !== undefined) glyph(surf, str[i], x + i * px * 4 + px, y + px, px, shadow);
+      glyph(surf, str[i], x + i * px * 4, y, px, c);
+    }
+  }
+  function textW(str, px) { return String(str).length * px * 4 - px; }
+  F.text = text; F.textW = textW;
+
+  Match.prototype.hud = function (surf) {
+    var S = SCALE, w = surf.w;
+    var bw = 186 * S, bh = 13 * S, by = 14 * S;
+    bar(surf, 20 * S, by, bw, bh, this.a.hp / this.a.maxHp, 226, 72, 62, false);
+    bar(surf, w - 20 * S - bw, by, bw, bh, this.b.hp / this.b.maxHp, 226, 72, 62, true);
+    // super meters
+    bar(surf, 20 * S, by + bh + 5 * S, bw * 0.62, 5 * S, this.a.meter / 100, 90, 190, 255, false);
+    bar(surf, w - 20 * S - bw * 0.62, by + bh + 5 * S, bw * 0.62, 5 * S, this.b.meter / 100, 90, 190, 255, true);
+
+    text(surf, this.a.name, 20 * S, by + bh + 13 * S, 1.6 * S, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+    var nb = this.b.name;
+    text(surf, nb, w - 20 * S - textW(nb, 1.6 * S), by + bh + 13 * S, 1.6 * S, F.rgb(240, 226, 200), F.rgb(10, 8, 12));
+
+    // timer
+    var ts = String(Math.max(0, Math.ceil(this.time)));
+    if (ts.length < 2) ts = '0' + ts;
+    var tp = 4 * S;
+    surf.fillRect(w / 2 - 22 * S, by - 3 * S, 44 * S, 26 * S, F.rgb(18, 16, 22));
+    text(surf, ts, w / 2 - textW(ts, tp) / 2, by + 1 * S, tp, F.rgb(255, 236, 190), F.rgb(20, 10, 8));
+
+    // round pips
+    for (var i = 0; i < 2; i++) {
+      for (var k = 0; k < 2; k++) {
+        var px = i ? w - 26 * S - k * 12 * S : 20 * S + k * 12 * S;
+        var on = this.wins[i] > k;
+        surf.fillRect(px, by + bh + 22 * S, 7 * S, 7 * S, on ? F.rgb(255, 206, 90) : F.rgb(58, 50, 56));
+      }
+    }
+
+    if (this.bannerT > 0 && this.banner) {
+      var bp = 9 * S;
+      var bwid = textW(this.banner, bp);
+      var a = Math.min(1, this.bannerT * 1.6);
+      var yy = 100 * S - (1 - a) * 12 * S;
+      text(surf, this.banner, w / 2 - bwid / 2, yy, bp, F.rgb(255, 232, 180), F.rgb(120, 20, 20));
+    }
+    if (this.a.combo > 1) {
+      text(surf, this.a.combo + ' HIT', 26 * S, 64 * S, 2.6 * S, F.rgb(255, 210, 120), F.rgb(20, 10, 8));
+    }
+    if (this.demo) {
+      text(surf, 'DEMO', w / 2 - textW('DEMO', 2 * S) / 2, surf.h - 16 * S, 2 * S,
+        F.rgb(200, 190, 180), F.rgb(10, 8, 12));
+    }
+  };
+
+  Match.prototype.frame = function (now) {
+    if (!this.last) this.last = now;
+    var dt = Math.min(60, now - this.last) / 1000;
+    this.last = now;
+    this.acc += dt;
+    var fixed = 1 / 60;
+    var n = 0;
+    while (this.acc >= fixed && n < 4) { this.step(fixed); this.acc -= fixed; n++; }
+    this.render();
+  };
+
+  F.Match = Match;
+  F.GROUND = GROUND;
+  F.WORLD = { W: W, H: H, SCALE: SCALE };
+})(FX);
+
+  (function () {
+    var canvas = document.getElementById('screen');
+    var m = new FX.Match(canvas);
+    window.__match = m;
+
+    var snd = new FX.Sound();
+    m.onSound = function (k) { snd.play(k); };
+
+    var KEYS = { ArrowLeft:'l', ArrowRight:'r', ArrowUp:'u', ArrowDown:'d',
+      KeyA:'l', KeyD:'r', KeyW:'u', KeyS:'d',
+      KeyJ:'p', KeyK:'k', KeyL:'g', Semicolon:'s',
+      KeyZ:'p', KeyX:'k', KeyC:'g', KeyV:'s' };
+    // the hint uses A/S/D/F for attacks; map those too without breaking WASD
+    KEYS.KeyF = 's';
+    function takeOver() { if (m.demo) { m.demo = false; m.say('FIGHT', 1.2); } snd.enable(); }
+    window.addEventListener('keydown', function (e) {
+      var k = KEYS[e.code];
+      if (e.code === 'KeyA' || e.code === 'KeyS' || e.code === 'KeyD') {
+        // A/S/D double as attacks once the player has taken control
+        k = e.code === 'KeyA' ? 'p' : e.code === 'KeyS' ? 'k' : 'g';
+      }
+      if (!k) return;
+      e.preventDefault(); takeOver(); m.input[k] = 1;
+    }, { passive:false });
+    window.addEventListener('keyup', function (e) {
+      var k = KEYS[e.code];
+      if (e.code === 'KeyA') k = 'p'; if (e.code === 'KeyS') k = 'k'; if (e.code === 'KeyD') k = 'g';
+      if (!k) return; e.preventDefault(); m.input[k] = 0;
+    }, { passive:false });
+
+    var pad = document.getElementById('pad');
+    if (pad) {
+      var btns = pad.querySelectorAll('[data-k]');
+      for (var i = 0; i < btns.length; i++) (function (el) {
+        var k = el.getAttribute('data-k');
+        function dn(e) { e.preventDefault(); takeOver(); m.input[k] = 1; el.classList.add('on'); }
+        function up(e) { e.preventDefault(); m.input[k] = 0; el.classList.remove('on'); }
+        el.addEventListener('touchstart', dn, { passive:false });
+        el.addEventListener('touchend', up, { passive:false });
+        el.addEventListener('touchcancel', up, { passive:false });
+        el.addEventListener('mousedown', dn); el.addEventListener('mouseup', up);
+        el.addEventListener('mouseleave', up);
+      })(btns[i]);
+    }
+    canvas.addEventListener('pointerdown', takeOver);
+
+    function fit() {
+      var padEl = document.getElementById('pad');
+      var ph = padEl && getComputedStyle(padEl).display !== 'none' ? padEl.offsetHeight : 0;
+      var hintEl = document.getElementById('hint');
+      var hh = hintEl && getComputedStyle(hintEl).display !== 'none' ? hintEl.offsetHeight : 0;
+      var aw = window.innerWidth - 6, ah = window.innerHeight - ph - hh - 6;
+      var sc = Math.min(aw / canvas.width, ah / canvas.height);
+      canvas.style.width = Math.round(canvas.width * sc) + 'px';
+      canvas.style.height = Math.round(canvas.height * sc) + 'px';
+    }
+    window.addEventListener('resize', fit);
+    window.addEventListener('orientationchange', function () { setTimeout(fit, 120); });
+    fit();
+
+    m.say('ROUND 1', 1.6);
+    function loop(t) { m.frame(t); requestAnimationFrame(loop); }
+    requestAnimationFrame(loop);
+  })();
+  
+</script>
