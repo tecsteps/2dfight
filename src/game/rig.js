@@ -1,18 +1,26 @@
 /*
  * rig.js -- the articulated figure the sprites are baked from.
  *
- * Mechner filmed his brother on VHS and traced the frames. We can't film
- * anybody, so the substitute is a jointed figure driven by absolute limb
- * angles, posed by hand to match the motion the rotoscope produced. Same
- * end product: a stack of finished bitmaps. The runtime never sees this.
+ * Mechner filmed his brother running around in white clothes and traced the
+ * frames. We can't film anybody and we can't copy his drawings, so the
+ * substitute is to rebuild what the rotoscope was actually capturing: real
+ * human proportions, and real weight.
+ *
+ * The first version of this file drew tapered capsules on a stick figure,
+ * and it read as a jointed doll -- no shoulders, no chest, no calves, no
+ * shoes. A human silhouette is not a set of tubes. It has a deltoid over
+ * the shoulder joint, a ribcage wider than the waist, a quadriceps that
+ * bulges above the knee and a calf that bulges below it, and a foot that is
+ * a wedge, not a cylinder. Those are what the eye reads at this size, so
+ * they are what the rig draws.
  *
  * Angle convention: degrees, screen-style (y down), so 90 = straight down,
  * -90 = straight up, 0 = forward (the direction the sprite faces), 180 =
  * behind. Every angle is absolute, not relative to its parent -- authoring
- * a pose then means describing the silhouette you want, not doing forward
+ * a pose means describing the silhouette you want, not doing forward
  * kinematics in your head.
  *
- * Pose layout (14 numbers):
+ * Pose layout (14 numbers, plus an optional x-squash):
  *   [ hipX, hipY, torso, head,
  *     farShoulder, farElbow, nearShoulder, nearElbow,
  *     farHip, farKnee, farFoot, nearHip, nearKnee, nearFoot ]
@@ -32,13 +40,30 @@ var POP = POP || {};
 
   P.Bake = { W: BW, H: BH, REF_X: REF_X, REF_Y: REF_Y, RES: RES };
 
-  // limb lengths, 1x pixels
+  /* Proportions, measured off the original's own sprite atlas rather than
+   * guessed. The standing frame there (kid-15) is 12x41 pixels, in a storey
+   * 63 tall -- so the character occupies about two thirds of the room's
+   * height, not the five sixths an earlier version of this rig assumed.
+   *
+   * The other thing the atlas shows is that he is not built like a fashion
+   * illustration: the head is large, the torso long, the legs comparatively
+   * short. About five and a half heads tall, not seven. Getting that wrong
+   * is most of what made the figure read as a doll.
+   */
   var L = {
-    torso: 14.8, neck: 2.6, headR: 4.0,
-    uArm: 8.6, lArm: 7.6, hand: 2.2,
-    uLeg: 13.5, lLeg: 12.5, foot: 6,
-    sword: 25
+    torso: 13.5,        // hip centre to shoulder line
+    neck: 2.2,
+    headW: 3.1, headH: 3.6,
+    shoulderW: 3.0,     // deltoid radius
+    uArm: 7.6, lArm: 6.6,
+    uLeg: 10.5, lLeg: 9.5, foot: 5.6,
+    sword: 21
   };
+
+  /* Poses author hipX/hipY in the old, taller coordinate space. Rather than
+   * rewrite sixty pose rows, scale the root here -- every angle stays valid,
+   * and the whole figure shrinks to the atlas's proportions on one knob. */
+  var POSE_SCALE = 0.755;
 
   var D2R = Math.PI / 180;
 
@@ -46,6 +71,9 @@ var POP = POP || {};
     var a = ang * D2R;
     return [x + Math.cos(a) * len, y - Math.sin(a) * len];
   }
+  function dir(ang) { var a = ang * D2R; return [Math.cos(a), -Math.sin(a)]; }
+  function add(p, d, k) { return [p[0] + d[0] * k, p[1] + d[1] * k]; }
+  function mix(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; }
 
   // pose space (x right, y up from floor) -> supersampled canvas space
   function cx(x) { return (REF_X + x) * Z; }
@@ -61,15 +89,45 @@ var POP = POP || {};
   }
   function dot(cv, a, r, col) { R.disc(cv, cx(a[0]), cy(a[1]), r * Z, col); }
 
+  function poly(cv, pts, col) {
+    var f = [];
+    for (var i = 0; i < pts.length; i++) { f.push(cx(pts[i][0]), cy(pts[i][1])); }
+    R.fillPoly(cv, f, col);
+  }
+
+  /* A limb with a shaped profile: radii are sampled evenly from a to b, so
+   * [4.7, 4.4, 3.4] gives a thigh that is full at the top and narrows into
+   * the knee, and [3.3, 3.6, 2.0] gives a calf that swells then tapers to
+   * the ankle. This is the single biggest difference between "leg" and
+   * "tube" at fifty pixels tall. */
+  function limb(cv, a, b, radii, col) {
+    var n = radii.length;
+    for (var i = 0; i < n - 1; i++) {
+      cap(cv, mix(a, b, i / (n - 1)), mix(a, b, (i + 1) / (n - 1)), radii[i], radii[i + 1], col);
+    }
+  }
+
+  // rotated oval, as a polygon -- the raster only does axis-aligned ellipses
+  function oval(cv, c, rx, ry, ang, col) {
+    var d = dir(ang), n = [-d[1], d[0]];
+    var pts = [];
+    for (var i = 0; i < 18; i++) {
+      var t = i / 18 * Math.PI * 2;
+      var u = Math.cos(t) * ry, v = Math.sin(t) * rx;
+      pts.push([c[0] + d[0] * u + n[0] * v, c[1] + d[1] * u + n[1] * v]);
+    }
+    poly(cv, pts, col);
+  }
+
   /* Wardrobes. Same rig, different bytes -- the guard is the prince in a
-   * blue coat and a helmet, which is also roughly what the original did. */
+   * blue coat, which is roughly what the original did too. */
   P.SKINS = {
     prince: {
       clothD: C.CLOTH_D, clothM: C.CLOTH_M, clothL: C.CLOTH_L, clothH: C.CLOTH_H,
       skinD: C.SKIN_D, skinM: C.SKIN_M, skinL: C.SKIN_L,
       hair: C.HAIR_D, hair2: C.HAIR_M,
-      sashD: C.RED_D, sashM: C.RED_M,
-      bootD: C.BRICK_S, bootM: C.BRICK_D,
+      sashD: C.CLOTH_M, sashM: C.CLOTH_L,
+      bootD: C.SKIN_M, bootM: C.SKIN_L,
       helmet: 0
     },
     guard: {
@@ -90,45 +148,96 @@ var POP = POP || {};
     }
   };
 
-  /* Draw one leg chain. `far` picks the darker shade set so the two legs
-   * separate visually without any depth buffer. */
-  function drawLeg(cv, hip, angs, sk, far) {
+  /* Every joint position for a pose, computed once and shared by the
+   * renderer and by anything else that needs to know where a hand is. */
+  function rigPoints(p) {
+    var hip = [p[0] * POSE_SCALE, p[1] * POSE_SCALE];
+    var torsoA = p[2], headA = p[3];
+    var neck = adv(hip[0], hip[1], torsoA, L.torso);
+    // shoulders sit just below the top of the spine
+    var sh = adv(neck[0], neck[1], torsoA, -1.4);
+    var headBase = adv(neck[0], neck[1], headA, L.neck);
+    var headC = adv(headBase[0], headBase[1], headA, L.headH * 0.82);
+
+    function arm(sa, ea) {
+      var elbow = adv(sh[0], sh[1], sa, L.uArm);
+      var wrist = adv(elbow[0], elbow[1], ea, L.lArm);
+      return { elbow: elbow, wrist: wrist };
+    }
+    function leg(hx, ha, ka, fa) {
+      var h = [hx, hip[1]];
+      var knee = adv(h[0], h[1], ha, L.uLeg);
+      var ankle = adv(knee[0], knee[1], ka, L.lLeg);
+      return { hip: h, knee: knee, ankle: ankle, footA: fa };
+    }
+
+    return {
+      hip: hip, torsoA: torsoA, headA: headA,
+      neck: neck, sh: sh, headBase: headBase, headC: headC,
+      farArm: arm(p[4], p[5]), nearArm: arm(p[6], p[7]),
+      farLeg: leg(hip[0] - 1.1, p[8], p[9], p[10]),
+      nearLeg: leg(hip[0] + 1.1, p[11], p[12], p[13])
+    };
+  }
+
+  /* A shoe: heel, sole, toe box. Drawn as a wedge because that is what a
+   * foot's silhouette is, and a capsule toe was reading as a club. */
+  function drawShoe(cv, ankle, footA, col, dark) {
+    var f = dir(footA), u = [-f[1], f[0]];   // f is along the foot, u is up
+    var heel = add(add(ankle, f, -2.7), u, -0.6);
+    poly(cv, [
+      add(heel, u, 1.9),
+      add(add(ankle, f, 1.4), u, 1.7),
+      add(add(ankle, f, L.foot * 0.62), u, 0.7),
+      add(add(ankle, f, L.foot + 0.6), u, -1.1),
+      add(add(ankle, f, L.foot + 0.2), u, -2.2),
+      add(add(ankle, f, -2.4), u, -2.2),
+      heel
+    ], col);
+    // sole
+    poly(cv, [
+      add(add(ankle, f, L.foot + 0.4), u, -1.5),
+      add(add(ankle, f, L.foot + 0.2), u, -2.3),
+      add(add(ankle, f, -2.5), u, -2.3),
+      add(add(ankle, f, -2.6), u, -1.5)
+    ], dark);
+  }
+
+  function drawLeg(cv, lg, sk, far) {
     cv.partId = far ? PART.FAR_LEG : PART.NEAR_LEG;
     var cloth = far ? sk.clothD : sk.clothM;
     var clothHi = far ? sk.clothM : sk.clothL;
     var boot = far ? sk.bootD : sk.bootM;
-    var knee = adv(hip[0], hip[1], angs[0], L.uLeg);
-    var ankle = adv(knee[0], knee[1], angs[1], L.lLeg);
-    // baggy trouser on the thigh, tapering at the knee
-    cap(cv, hip, knee, 3.9, 3.1, cloth);
-    // shin: trouser to mid-calf, then boot
-    var mid = [knee[0] + (ankle[0] - knee[0]) * 0.55, knee[1] + (ankle[1] - knee[1]) * 0.55];
-    cap(cv, knee, mid, 3.1, 2.5, clothHi);
-    cap(cv, mid, ankle, 2.4, 2.0, boot);
-    var toe = adv(ankle[0], ankle[1], angs[2], L.foot);
-    cap(cv, ankle, toe, 2.2, 1.5, boot);
+    var bootD = far ? C.SHADOW : sk.bootD;
+    // thigh: full at the glute, narrowing into the knee
+    limb(cv, lg.hip, lg.knee, [3.8, 3.5, 2.7], cloth);
+    // shank: trouser to mid-calf with the calf swell, then the boot
+    var mid = mix(lg.knee, lg.ankle, 0.52);
+    limb(cv, lg.knee, mid, [2.6, 2.9], clothHi);
+    limb(cv, mid, lg.ankle, [2.4, 1.7], boot);
+    drawShoe(cv, lg.ankle, lg.footA, boot, bootD);
   }
 
-  function drawArm(cv, sh, angs, sk, far) {
+  function drawArm(cv, sh, a, sk, far) {
     cv.partId = far ? PART.FAR_ARM : PART.NEAR_ARM;
     var sleeve = far ? sk.clothD : sk.clothL;
-    var skin = far ? sk.skinM : sk.skinL;
-    var elbow = adv(sh[0], sh[1], angs[0], L.uArm);
-    var wrist = adv(elbow[0], elbow[1], angs[1], L.lArm);
-    // short sleeve down to mid-upper-arm, bare forearm below
-    var sleeveEnd = [sh[0] + (elbow[0] - sh[0]) * 0.58, sh[1] + (elbow[1] - sh[1]) * 0.58];
-    cap(cv, sh, sleeveEnd, 3.0, 2.3, sleeve);
-    cap(cv, sleeveEnd, elbow, 1.9, 1.6, skin);
-    cap(cv, elbow, wrist, 1.6, 1.35, skin);
-    dot(cv, wrist, 1.5, skin);
-    return wrist;
+    var skin = far ? sk.skinD : sk.skinL;
+    // deltoid: the cap over the shoulder joint. Without it the arm looks
+    // like it was pushed into a socket.
+    dot(cv, sh, L.shoulderW, sleeve);
+    var sleeveEnd = mix(sh, a.elbow, 0.55);
+    limb(cv, sh, sleeveEnd, [2.7, 2.6], sleeve);
+    limb(cv, sleeveEnd, a.elbow, [2.2, 1.8], skin);
+    limb(cv, a.elbow, a.wrist, [1.9, 2.0, 1.4], skin);   // forearm swell
+    // hand, oriented along the forearm
+    var fa = Math.atan2(-(a.wrist[1] - a.elbow[1]), a.wrist[0] - a.elbow[0]) / D2R;
+    oval(cv, add(a.wrist, dir(fa), 1.2), 1.25, 1.7, fa, skin);
   }
 
   function drawSword(cv, wrist, ang, sk) {
     cv.partId = PART.SWORD;
     var tip = adv(wrist[0], wrist[1], ang, L.sword);
     var base = adv(wrist[0], wrist[1], ang, -3);
-    // crossguard
     var g1 = adv(wrist[0], wrist[1], ang + 90, 3.2);
     var g2 = adv(wrist[0], wrist[1], ang - 90, 3.2);
     cap(cv, base, wrist, 1.6, 1.6, C.STEEL_D);
@@ -136,66 +245,94 @@ var POP = POP || {};
     cap(cv, wrist, tip, 1.9, 0.9, C.STEEL_L);
   }
 
+  function drawTorso(cv, r, sk) {
+    cv.partId = PART.TORSO;
+    var axis = dir(r.torsoA);                 // hip -> shoulders
+    var fwd = dir(r.torsoA + 90);             // the way the figure faces
+    function pt(u, perp) {
+      return add(add(r.hip, axis, u * L.torso), fwd, perp);
+    }
+    /* Side-view silhouette: deep at the hips, pinched at the waist, full
+     * through the chest, narrowing again at the shoulders. */
+    poly(cv, [
+      pt(-0.06, 3.2), pt(0.26, 2.6), pt(0.58, 3.7), pt(0.84, 3.9), pt(1.02, 2.7),
+      pt(1.04, -2.8), pt(0.86, -3.7), pt(0.56, -3.6), pt(0.26, -2.8), pt(-0.06, -3.5)
+    ], sk.clothM);
+    // lit front plane of the chest
+    poly(cv, [
+      pt(0.30, 2.5), pt(0.58, 3.6), pt(0.84, 3.8), pt(1.0, 2.6),
+      pt(0.98, 0.5), pt(0.60, 0.8), pt(0.32, 0.3)
+    ], sk.clothL);
+    // pelvis
+    dot(cv, r.hip, 3.6, sk.clothM);
+    // the sash. The kid's own palette has none -- the original dresses him
+    // in plain cream head to foot -- so for him this is drawn in cloth
+    // tones and simply reads as a belted waist.
+    var w0 = pt(0.10, 0), w1 = pt(0.30, 0);
+    cap(cv, w0, w1, 3.5, 3.6, sk.sashM);
+    cap(cv, w0, w1, 2.6, 2.7, sk.sashD);
+    // a tail of sash hanging at the back
+    var t0 = add(pt(0.16, -3.0), axis, 0);
+    var t1 = add(t0, dir(r.torsoA - 170), 4.4);
+    cap(cv, t0, t1, 1.4, 0.9, sk.sashM);
+  }
+
+  function drawHead(cv, r, sk) {
+    cv.partId = PART.HEAD;
+    var headA = r.headA;
+    var fwd = dir(headA + 90);
+    // neck
+    cap(cv, r.neck, r.headBase, 1.7, 1.6, sk.skinM);
+    // cranium plus jaw: an oval with a wedge hung off the front-bottom
+    oval(cv, r.headC, L.headW, L.headH, headA, sk.skinL);
+    var jaw = add(add(r.headC, dir(headA), -1.4), fwd, 1.0);
+    oval(cv, jaw, 2.5, 2.9, headA, sk.skinL);
+    // brow and nose
+    var nose = add(add(r.headC, fwd, L.headW * 0.86), dir(headA), 0.2);
+    dot(cv, nose, 1.05, sk.skinL);
+
+    if (sk.helmet) {
+      oval(cv, add(r.headC, dir(headA), 0.9), L.headW * 1.02, L.headH * 0.78, headA, sk.helmet);
+      dot(cv, add(r.headC, dir(headA - 90), 2.4), 2.4, C.STEEL_D);
+      // nasal bar
+      cap(cv, add(r.headC, fwd, L.headW * 0.75),
+        add(add(r.headC, fwd, L.headW * 0.72), dir(headA), -2.4), 0.7, 0.6, C.STEEL_D);
+    } else {
+      // hair: a cap over the skull that runs down the back of the neck,
+      // which is what gives the head a readable shape in silhouette
+      oval(cv, add(r.headC, dir(headA), 0.55), L.headW * 1.00, L.headH * 0.84, headA, sk.hair);
+      var nape = add(add(r.headC, dir(headA - 90), 2.2), dir(headA), -1.3);
+      oval(cv, nape, 1.8, 2.3, headA, sk.hair);
+      dot(cv, add(nape, dir(headA), -1.2), 1.4, sk.hair2);
+      // face: reclaim the front of the skull from the hair
+      poly(cv, [
+        add(add(r.headC, fwd, 0.2), dir(headA), 2.6),
+        add(add(r.headC, fwd, L.headW * 0.95), dir(headA), 0.9),
+        add(add(r.headC, fwd, L.headW * 0.95), dir(headA), -1.8),
+        add(add(r.headC, fwd, 1.4), dir(headA), -4.0),
+        add(add(r.headC, fwd, -0.4), dir(headA), -2.0)
+      ], sk.skinL);
+      // fringe over the brow
+      cap(cv, add(add(r.headC, fwd, 0.4), dir(headA), 3.2),
+        add(add(r.headC, fwd, 3.0), dir(headA), 2.3), 1.5, 1.0, sk.hair);
+    }
+    // eye
+    var eye = add(add(r.headC, fwd, L.headW * 0.60), dir(headA), 0.55);
+    dot(cv, eye, 0.72, C.OUTLINE);
+  }
+
   /* Draw a full pose. Painter's order: far limbs, body, near limbs. */
   function drawPose(cv, p, sk, opts) {
     opts = opts || {};
-    var hipX = p[0], hipY = p[1];
-    var hip = [hipX, hipY];
-    var torsoA = p[2], headA = p[3];
-
-    var neck = adv(hipX, hipY, torsoA, L.torso);
-    var headBase = adv(neck[0], neck[1], headA, L.neck);
-    var headC = adv(headBase[0], headBase[1], headA, L.headR * 0.9);
-
-    // shoulders sit slightly below the neck joint along the torso axis
-    var sh = [neck[0] - Math.cos(torsoA * D2R) * 1.2, neck[1] + Math.sin(torsoA * D2R) * 1.2];
-    // hips splay a touch so the two legs don't start from one point
-    var hipF = [hipX - 0.6, hipY], hipN = [hipX + 0.6, hipY];
-
-    drawLeg(cv, hipF, [p[8], p[9], p[10]], sk, true);
-    var farWrist = drawArm(cv, sh, [p[4], p[5]], sk, true);
-    if (opts.swordFar) drawSword(cv, farWrist, opts.swordFar, sk);
-
-    // torso: wide at the chest, narrow at the waist
-    cv.partId = PART.TORSO;
-    var chest = [hipX + (neck[0] - hipX) * 0.60, hipY + (neck[1] - hipY) * 0.60];
-    cap(cv, hip, chest, 3.9, 4.5, sk.clothM);
-    cap(cv, chest, neck, 4.3, 2.3, sk.clothL);
-    // sash at the waist
-    var w1 = [hipX + (chest[0] - hipX) * 0.04, hipY + (chest[1] - hipY) * 0.04];
-    var w2 = [hipX + (chest[0] - hipX) * 0.32, hipY + (chest[1] - hipY) * 0.32];
-    cap(cv, w1, w2, 4.2, 4.3, sk.sashM);
-    cap(cv, w1, w2, 3.0, 3.1, sk.sashD);
-
-    // neck + head
-    cv.partId = PART.HEAD;
-    cap(cv, neck, headBase, 1.9, 1.9, sk.skinM);
-    R.disc(cv, cx(headC[0]), cy(headC[1]), L.headR * Z, sk.skinL);
-    // brow/nose bump on the forward side
-    var nose = adv(headC[0], headC[1], headA + 90, L.headR * 0.82);
-    R.disc(cv, cx(nose[0]), cy(nose[1]), 1.0 * Z, sk.skinL);
-    // hair cap over the back and top of the skull
-    if (sk.helmet) {
-      var hTop = adv(headC[0], headC[1], headA, L.headR * 0.55);
-      R.disc(cv, cx(hTop[0]), cy(hTop[1]), L.headR * 0.95 * Z, sk.helmet);
-      var hBack = adv(headC[0], headC[1], headA - 90, L.headR * 0.75);
-      R.disc(cv, cx(hBack[0]), cy(hBack[1]), L.headR * 0.8 * Z, C.STEEL_D);
-    } else {
-      var top = adv(headC[0], headC[1], headA, L.headR * 0.26);
-      R.disc(cv, cx(top[0]), cy(top[1]), L.headR * 0.86 * Z, sk.hair);
-      var back = adv(headC[0], headC[1], headA - 90, L.headR * 0.50);
-      R.disc(cv, cx(back[0]), cy(back[1]), L.headR * 0.76 * Z, sk.hair2);
-      // face has to survive the hair discs -- redraw the forward cheek
-      var face = adv(headC[0], headC[1], headA + 90, L.headR * 0.50);
-      R.disc(cv, cx(face[0]), cy(face[1]), L.headR * 0.64 * Z, sk.skinL);
-    }
-    // eye
-    var eye = adv(headC[0], headC[1], headA + 74, L.headR * 0.58);
-    R.disc(cv, cx(eye[0]), cy(eye[1]), 0.75 * Z, C.OUTLINE);
-
-    drawLeg(cv, hipN, [p[11], p[12], p[13]], sk, false);
-    var nearWrist = drawArm(cv, sh, [p[6], p[7]], sk, false);
-    if (opts.sword) drawSword(cv, nearWrist, opts.sword, sk);
+    var r = rigPoints(p);
+    drawLeg(cv, r.farLeg, sk, true);
+    drawArm(cv, r.sh, r.farArm, sk, true);
+    if (opts.swordFar) drawSword(cv, r.farArm.wrist, opts.swordFar, sk);
+    drawTorso(cv, r, sk);
+    drawHead(cv, r, sk);
+    drawLeg(cv, r.nearLeg, sk, false);
+    drawArm(cv, r.sh, r.nearArm, sk, false);
+    if (opts.sword) drawSword(cv, r.nearArm.wrist, opts.sword, sk);
   }
 
   /* Horizontal squash of a finished bitmap, nearest-neighbour, about the
@@ -211,56 +348,47 @@ var POP = POP || {};
         out[y * nw + x] = spr.data[y * spr.w + sx];
       }
     }
-    // keep the reference column in the same place after the squash
-    var newOx = Math.round(spr.ox * f);
-    return { w: nw, h: spr.h, ox: newOx, oy: spr.oy, data: out };
+    return { w: nw, h: spr.h, ox: Math.round(spr.ox * f), oy: spr.oy, data: out };
   }
 
-  /* Bake one pose into a finished, cropped, outlined indexed sprite. */
   var _cv = null;
+  function canvas() {
+    if (!_cv) _cv = new P.RasterCanvas(BW * Z, BH * Z);
+    _cv.clear();
+    return _cv;
+  }
+  function finish(cv, pose) {
+    var lo = R.downsample(cv, BW * RES, BH * RES);
+    var px = R.outline(lo.color, BW * RES, BH * RES, C.CLOTH_D, lo.part, null);
+    var spr = R.crop(px, BW * RES, BH * RES, REF_X * RES, REF_Y * RES);
+    var xs = pose[14];
+    if (xs !== undefined && xs < 0.999) spr = squashX(spr, xs);
+    return spr;
+  }
+
   function bakePose(pose, sk, opts) {
-    if (!_cv) _cv = new P.RasterCanvas(BW * Z, BH * Z);
-    _cv.clear();
-    drawPose(_cv, pose, sk, opts);
-    var lo = R.downsample(_cv, BW * RES, BH * RES);
-    var px = R.outline(lo.color, BW * RES, BH * RES, C.OUTLINE, lo.part);
-    var spr = R.crop(px, BW * RES, BH * RES, REF_X * RES, REF_Y * RES);
-    var xs = pose[14];
-    if (xs !== undefined && xs < 0.999) spr = squashX(spr, xs);
-    return spr;
+    var cv = canvas();
+    drawPose(cv, pose, sk, opts);
+    return finish(cv, pose);
   }
 
-  /* Where the near hand ends up for a given pose -- needed because the
-   * sword is a separate bitmap, exactly as it was in the original frame
-   * table (which carried an `image` and a `sword` field per frame). */
-  function nearWrist(p) {
-    var neck = adv(p[0], p[1], p[2], L.torso);
-    var sh = [neck[0] - Math.cos(p[2] * D2R) * 1.5, neck[1] + Math.sin(p[2] * D2R) * 1.5];
-    var elbow = adv(sh[0], sh[1], p[6], L.uArm);
-    return adv(elbow[0], elbow[1], p[7], L.lArm);
-  }
-
-  /* Bake just the blade, so an unarmed prince and an armed one share one
-   * set of body frames. */
+  /* Bake just the blade, so an unarmed prince and an armed one share one set
+   * of body frames -- the original's frame table carried `image` and `sword`
+   * as separate fields for the same reason. */
   function bakeSword(pose, angle) {
-    if (!_cv) _cv = new P.RasterCanvas(BW * Z, BH * Z);
-    _cv.clear();
-    var w = nearWrist(pose);
-    drawSword(_cv, w, angle, P.SKINS.prince);
-    var lo = R.downsample(_cv, BW * RES, BH * RES);
-    var px = R.outline(lo.color, BW * RES, BH * RES, C.OUTLINE, lo.part);
-    var spr = R.crop(px, BW * RES, BH * RES, REF_X * RES, REF_Y * RES);
-    var xs = pose[14];
-    if (xs !== undefined && xs < 0.999) spr = squashX(spr, xs);
-    return spr;
+    var cv = canvas();
+    drawSword(cv, rigPoints(pose).nearArm.wrist, angle, P.SKINS.prince);
+    return finish(cv, pose);
   }
 
   P.Rig = {
     L: L,
+    POSE_SCALE: POSE_SCALE,
     drawPose: drawPose,
     bakePose: bakePose,
     bakeSword: bakeSword,
-    nearWrist: nearWrist,
+    rigPoints: rigPoints,
+    nearWrist: function (p) { return rigPoints(p).nearArm.wrist; },
     squashX: squashX,
     adv: adv
   };

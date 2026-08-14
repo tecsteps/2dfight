@@ -39,13 +39,13 @@ var POP = POP || {};
     0xa3856a, // 8  brick highlight
     0xc7a888, // 9  stone highlight
     0xe8d5b5, // 10 bright stone / cream
-    0x7a5238, // 11 skin shadow
-    0x9c6642, // 12 skin mid
-    0xc9905e, // 13 skin light
-    0x6d7480, // 14 cloth shadow
-    0x9aa2ad, // 15 cloth mid
-    0xd2d8de, // 16 cloth light
-    0xf2f5f8, // 17 cloth highlight
+    0xa87050, // 11 skin shadow
+    0xd09068, // 12 skin mid
+    0xeeb188, // 13 skin light
+    0xa89878, // 14 cloth shadow  (far limbs)
+    0xd8c8a8, // 15 cloth mid     (shaded folds)
+    0xf0e6cf, // 16 cloth light   (the tunic proper)
+    0xfaf5e6, // 17 cloth highlight
     0x1d1a17, // 18 outline / hair dark
     0x8a1c14, // 19 red dark (sash, guard)
     0xc4302010 & 0xffffff, // placeholder, overwritten below
@@ -66,8 +66,8 @@ var POP = POP || {};
   PAL_RGB[31] = 0x3aa03a; // green light
   // hair is deliberately NOT the outline colour: when they matched, the
   // outline ring fused with the hair and every head grew a halo
-  PAL_RGB[32] = 0x30211a; // hair dark
-  PAL_RGB[33] = 0x4a3324; // hair mid
+  PAL_RGB[32] = 0xb89410; // hair dark   -- the kid is blond, not brunet
+  PAL_RGB[33] = 0xdcbc28; // hair mid
   PAL_RGB[34] = 0x141c30; // night sky
   PAL_RGB[35] = 0x6a2a1a; // torch bracket
 

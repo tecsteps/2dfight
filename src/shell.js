@@ -70,13 +70,15 @@ var POP = POP || {};
     function fit() {
       var wrap = document.getElementById('wrap');
       var padEl = document.getElementById('pad');
-      var availW = window.innerWidth;
+      var availW = window.innerWidth - 4;
       var padH = padEl ? padEl.offsetHeight : 0;
       var availH = window.innerHeight - padH;
+      /* Fill the window. Snapping to whole-number scales used to matter --
+       * a fractional upscale of a 320x200 buffer smears the pixel grid --
+       * but the framebuffer is RES times denser now, so a game pixel is
+       * already several device pixels and the grid survives any scale. The
+       * snapping was throwing away up to a third of the window for nothing. */
       var scale = Math.min(availW / 320, availH / 200);
-      // prefer whole-number scales when there is room; a fractional scale
-      // on a small phone is better than wasting a third of the screen
-      if (scale >= 2) scale = Math.floor(scale);
       var w = Math.round(320 * scale), h = Math.round(200 * scale);
       canvas.style.width = w + 'px';
       canvas.style.height = h + 'px';

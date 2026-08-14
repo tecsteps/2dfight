@@ -305,6 +305,10 @@ var POP = POP || {};
       this.fightControl(c);
       return;
     }
+    // ...and once the fight is over, drop the guard stance. Without this he
+    // stands en garde at a corpse forever, because `ready` is not a state
+    // any of the ordinary movement branches below know how to leave.
+    if (s === 'ready' || s === 'engarde') { this.startSeq('stand'); return; }
 
     if (s === 'stand' || s === 'crouch') {
       if (s === 'crouch' && !c.down) { this.startSeq('stand'); return; }

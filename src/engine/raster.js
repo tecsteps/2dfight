@@ -172,7 +172,7 @@ var POP = POP || {};
 
   /* Grow a 1px dark border around the silhouette. The original sprites read
    * clearly against busy brickwork because of exactly this. */
-  function outline(data, w, h, color, part) {
+  function outline(data, w, h, color, part, edgeColor) {
     var out = new Uint8Array(data);
     var i, x, y;
     // internal edges first: where two different parts touch, darken the one
@@ -195,7 +195,11 @@ var POP = POP || {};
         }
       }
     }
-    // then the silhouette
+    // then the silhouette -- skipped unless an edge colour is given. The
+    // original sprites carry no keyline at all; a light figure on a dark
+    // dungeon reads perfectly well without one, and adding one made ours
+    // look like a cartoon sticker.
+    if (edgeColor === undefined || edgeColor === null) return out;
     for (y = 0; y < h; y++) {
       for (x = 0; x < w; x++) {
         i = y * w + x;
@@ -205,7 +209,7 @@ var POP = POP || {};
         else if (x < w - 1 && data[i + 1]) hit = true;
         else if (y > 0 && data[i - w]) hit = true;
         else if (y < h - 1 && data[i + w]) hit = true;
-        if (hit) out[i] = color;
+        if (hit) out[i] = edgeColor;
       }
     }
     return out;

@@ -135,8 +135,10 @@ var POP = POP || {};
   Level.prototype.isFloor = function (roomId, col, row) {
     if (col < 0 || col >= ROOM_W) return false;
     var t = this.tile(roomId, col, row);
-    if (t === T.GATE) return false;
-    return !!STANDABLE[t] || t === T.WALL;
+    // A gateway has a floor -- the gate is a barrier hanging above it, not a
+    // hole. Treating it as unstandable dropped the prince through the
+    // doorway he was walking towards.
+    return !!STANDABLE[t] || t === T.WALL || t === T.GATE;
   };
 
   Level.prototype.isWall = function (roomId, col, row) {
