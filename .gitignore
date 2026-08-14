@@ -1,2 +1,5 @@
 node_modules/
 *.png
+
+# scratch build target used while iterating; dist/fight.html is what ships
+dist/dev.html
