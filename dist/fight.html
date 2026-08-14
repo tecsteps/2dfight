@@ -1620,7 +1620,8 @@ var FX = FX || {};
     var guardRight = guarding && ((lowMove && df.move === 'blockLow') || (!lowMove && df.move === 'block'));
 
     if (guardRight) {
-      df.hp -= d.dmg * 0.12;
+      // a grab has no dmg field; blocking one used to set health to NaN
+      df.hp = Math.max(0, df.hp - (d.dmg || 0) * 0.12);
       df.vx += at.facing * d.push * 0.45;
       at.vx -= at.facing * 22;
       df.flash = 0.5;
