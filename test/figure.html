@@ -1,0 +1,70 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>procedural figure</title>
+<style>body{background:#0b0908;margin:0}canvas{image-rendering:pixelated;width:100%;display:block}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script src="../src/engine/gfx.js"></script>
+<script src="../src/engine/raster.js"></script>
+<script src="../src/engine/figure.js"></script>
+<script>
+/* Drives the procedural figure at a range of speeds so the gait can be
+ * judged. Nothing is baked: every frame is solved and rasterised live. */
+var Q = new URLSearchParams(location.search);
+var SPEEDS = (Q.get('speeds') || '0,26,55,95,130').split(',').map(Number);
+var STEPS = +(Q.get('steps') || 8);      // frames sampled per speed
+var DT = +(Q.get('dt') || 0.05);         // seconds between sampled frames
+var SETTLE = +(Q.get('settle') || 3);    // seconds of warm-up before sampling
+
+var CELL_W = 44, CELL_H = 62;
+var g = new POP.Gfx(CELL_W * STEPS, CELL_H * SPEEDS.length);
+g.attach(document.getElementById('c'));
+g.clear(POP.C.SHADOW);
+
+var SKIN = {
+  clothD: POP.C.CLOTH_D, clothM: POP.C.CLOTH_M, clothL: POP.C.CLOTH_L, clothH: POP.C.CLOTH_H,
+  skinD: POP.C.SKIN_D, skinM: POP.C.SKIN_M, skinL: POP.C.SKIN_L,
+  hair: POP.C.HAIR_D, hair2: POP.C.HAIR_M,
+  sashD: POP.C.CLOTH_M, sashM: POP.C.CLOTH_L, helmet: 0
+};
+
+var t0 = performance.now(), drawn = 0;
+for (var r = 0; r < SPEEDS.length; r++) {
+  var speed = SPEEDS[r];
+  var fig = new POP.Figure(SKIN);
+  var baseY = (r + 1) * CELL_H - 6;
+  fig.teleport(20, baseY);
+  fig.vx = speed;
+
+  // let the springs and the gait settle before we start sampling
+  var sub = 1 / 120;
+  for (var w = 0; w < SETTLE / sub; w++) {
+    fig.x += fig.vx * sub;
+    if (fig.x > CELL_W * STEPS - 20) fig.x = 20;
+    fig.setGround(baseY);
+    fig.update(sub, { move: speed > 0 ? 1 : 0 });
+  }
+
+  for (var s = 0; s < STEPS; s++) {
+    // advance DT of simulation in small sub-steps, then sample
+    for (var k = 0; k < DT / sub; k++) {
+      fig.x += fig.vx * sub;
+      fig.setGround(baseY);
+      fig.update(sub, { move: speed > 0 ? 1 : 0 });
+    }
+    // park the figure in its cell for the contact sheet
+    var shownX = fig.x;
+    var cellX = s * CELL_W + CELL_W / 2;
+    var dx = cellX - shownX;
+    fig.x += dx; for (var q2 = 0; q2 < 2; q2++) fig.feet[q2].wx += dx;
+    g.hline(s * CELL_W, baseY, CELL_W, POP.C.BRICK_D);
+    fig.draw(g);
+    drawn++;
+    fig.x -= dx; for (var q3 = 0; q3 < 2; q3++) fig.feet[q3].wx -= dx;
+  }
+}
+var ms = performance.now() - t0;
+g.present();
+window.__stats = { drawn: drawn, totalMs: Math.round(ms), msPerDraw: +(ms / drawn).toFixed(3) };
+document.title = drawn + ' poses solved+drawn live';
+</script>
+</body></html>

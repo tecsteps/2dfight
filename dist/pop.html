@@ -375,7 +375,7 @@ var POP = POP || {};
   function span(cv, y, xa, xb, color) {
     var o = y * cv.w;
     cv.data.fill(color, o + xa, o + xb + 1);
-    cv.part.fill(cv.partId, o + xa, o + xb + 1);
+    if (cv.part) cv.part.fill(cv.partId, o + xa, o + xb + 1);
   }
 
   function disc(cv, cx, cy, r, color) {
@@ -718,864 +718,491 @@ var POP = POP || {};
   P.Audio = Audio;
 })(POP);
 
-/* ===== src/game/rig.js ===== */
+/* ===== src/engine/figure.js ===== */
 /*
- * rig.js -- the articulated figure the sprites are baked from.
+ * figure.js -- a character whose pose is computed, never stored.
  *
- * Mechner filmed his brother running around in white clothes and traced the
- * frames. We can't film anybody and we can't copy his drawings, so the
- * substitute is to rebuild what the rotoscope was actually capturing: real
- * human proportions, and real weight.
+ * This is the pivot away from sprites. There is no frame table, no baked
+ * bitmap, no keyframe clip and no animation asset of any kind. The pose is
+ * a pure function of continuous state -- a gait phase, a velocity, a set of
+ * spring positions -- evaluated fresh every frame and rasterised straight
+ * into the indexed framebuffer.
  *
- * The first version of this file drew tapered capsules on a stick figure,
- * and it read as a jointed doll -- no shoulders, no chest, no calves, no
- * shoes. A human silhouette is not a set of tubes. It has a deltoid over
- * the shoulder joint, a ribcage wider than the waist, a quadriceps that
- * bulges above the knee and a calf that bulges below it, and a foot that is
- * a wedge, not a cylinder. Those are what the eye reads at this size, so
- * they are what the rig draws.
+ * Three ideas do the work:
  *
- * Angle convention: degrees, screen-style (y down), so 90 = straight down,
- * -90 = straight up, 0 = forward (the direction the sprite faces), 180 =
- * behind. Every angle is absolute, not relative to its parent -- authoring
- * a pose means describing the silhouette you want, not doing forward
- * kinematics in your head.
+ * 1. FOOT CONTACTS ARE THE ANIMATION. A gait oscillator decides, per foot,
+ *    whether it is planted or swinging. A planted foot is pinned to a WORLD
+ *    coordinate and simply does not move while the body travels over it.
+ *    Skating is not tuned away, it is structurally impossible -- which is
+ *    the property rotoscoped frames had for free, because the artist was
+ *    tracing a foot that really was planted.
  *
- * Pose layout (14 numbers, plus an optional x-squash):
- *   [ hipX, hipY, torso, head,
- *     farShoulder, farElbow, nearShoulder, nearElbow,
- *     farHip, farKnee, farFoot, nearHip, nearKnee, nearFoot ]
- * hipY is height above the floor line, hipX is offset from the body axis.
+ * 2. LEGS ARE SOLVED, NOT POSED. Given hip and foot, two-link IK gives the
+ *    knee. So the legs are always exactly long enough to reach the ground,
+ *    at any speed, any stride, any hip height, with no authored angles.
+ *
+ * 3. EVERYTHING ELSE IS A SPRING. Every remaining joint chases a target
+ *    through a critically damped spring. Follow-through, overshoot and the
+ *    softness of a transition come out of the integrator rather than out of
+ *    hand-drawn in-betweens, and blending between behaviours is free: you
+ *    change the target, the body catches up.
+ *
+ * The consequence is that motion is continuous and parameterised. Ask for a
+ * different speed and the stride, cadence, lean and arm swing all follow;
+ * nothing snaps to a frame grid, because there is no grid.
  */
 var POP = POP || {};
 (function (P) {
   'use strict';
 
-  var R = P.Raster, C = P.C;
-  var SS = R.SS;
-  var RES = P.RES;             // device pixels per logical pixel
-  var Z = RES * SS;            // total oversample while drawing
+  var C = P.C, R = P.Raster;
+  var D2R = Math.PI / 180, R2D = 180 / Math.PI;
+  var TAU = Math.PI * 2;
 
-  // bake canvas in logical units; reference point is the feet on the floor
-  var BW = 88, BH = 96, REF_X = 44, REF_Y = 76;
-
-  P.Bake = { W: BW, H: BH, REF_X: REF_X, REF_Y: REF_Y, RES: RES };
-
-  /* Proportions, measured off the original's own sprite atlas rather than
-   * guessed. The standing frame there (kid-15) is 12x41 pixels, in a storey
-   * 63 tall -- so the character occupies about two thirds of the room's
-   * height, not the five sixths an earlier version of this rig assumed.
-   *
-   * The other thing the atlas shows is that he is not built like a fashion
-   * illustration: the head is large, the torso long, the legs comparatively
-   * short. About five and a half heads tall, not seven. Getting that wrong
-   * is most of what made the figure read as a doll.
-   */
+  /* Proportions in logical pixels, measured off the original's sprite atlas:
+   * its standing frame is 41 tall in a 63-pixel storey, and the build is
+   * about five and a half heads -- big head, long torso, short legs. */
   var L = {
-    torso: 13.5,        // hip centre to shoulder line
-    neck: 2.2,
-    headW: 3.1, headH: 3.6,
-    shoulderW: 3.0,     // deltoid radius
+    torso: 13.5, neck: 2.2,
+    headW: 3.1, headH: 3.6, shoulderW: 3.0,
     uArm: 7.6, lArm: 6.6,
     uLeg: 10.5, lLeg: 9.5, foot: 5.6,
-    sword: 21
+    hipHalf: 1.1, standHip: 21.4
   };
 
-  /* Poses author hipX/hipY in the old, taller coordinate space. Rather than
-   * rewrite sixty pose rows, scale the root here -- every angle stays valid,
-   * and the whole figure shrinks to the atlas's proportions on one knob. */
-  var POSE_SCALE = 0.755;
-
-  var D2R = Math.PI / 180;
-
-  function adv(x, y, ang, len) {
-    var a = ang * D2R;
-    return [x + Math.cos(a) * len, y - Math.sin(a) * len];
-  }
-  function dir(ang) { var a = ang * D2R; return [Math.cos(a), -Math.sin(a)]; }
-  function add(p, d, k) { return [p[0] + d[0] * k, p[1] + d[1] * k]; }
-  function mix(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; }
-
-  // pose space (x right, y up from floor) -> supersampled canvas space
-  function cx(x) { return (REF_X + x) * Z; }
-  function cy(y) { return (REF_Y - y) * Z; }
-
-  /* Part ids, ordered back-to-front. The outline pass darkens whichever
-   * side of a boundary has the lower id, so a near limb always cuts a clean
-   * dark edge into whatever it overlaps. */
-  var PART = { FAR_LEG: 1, FAR_ARM: 2, TORSO: 3, HEAD: 4, NEAR_LEG: 5, NEAR_ARM: 6, SWORD: 7 };
-
-  function cap(cv, a, b, r0, r1, col) {
-    R.capsule(cv, cx(a[0]), cy(a[1]), cx(b[0]), cy(b[1]), r0 * Z, r1 * Z, col);
-  }
-  function dot(cv, a, r, col) { R.disc(cv, cx(a[0]), cy(a[1]), r * Z, col); }
-
-  function poly(cv, pts, col) {
-    var f = [];
-    for (var i = 0; i < pts.length; i++) { f.push(cx(pts[i][0]), cy(pts[i][1])); }
-    R.fillPoly(cv, f, col);
-  }
-
-  /* A limb with a shaped profile: radii are sampled evenly from a to b, so
-   * [4.7, 4.4, 3.4] gives a thigh that is full at the top and narrows into
-   * the knee, and [3.3, 3.6, 2.0] gives a calf that swells then tapers to
-   * the ankle. This is the single biggest difference between "leg" and
-   * "tube" at fifty pixels tall. */
-  function limb(cv, a, b, radii, col) {
-    var n = radii.length;
-    for (var i = 0; i < n - 1; i++) {
-      cap(cv, mix(a, b, i / (n - 1)), mix(a, b, (i + 1) / (n - 1)), radii[i], radii[i + 1], col);
-    }
-  }
-
-  // rotated oval, as a polygon -- the raster only does axis-aligned ellipses
-  function oval(cv, c, rx, ry, ang, col) {
-    var d = dir(ang), n = [-d[1], d[0]];
-    var pts = [];
-    for (var i = 0; i < 18; i++) {
-      var t = i / 18 * Math.PI * 2;
-      var u = Math.cos(t) * ry, v = Math.sin(t) * rx;
-      pts.push([c[0] + d[0] * u + n[0] * v, c[1] + d[1] * u + n[1] * v]);
-    }
-    poly(cv, pts, col);
-  }
-
-  /* Wardrobes. Same rig, different bytes -- the guard is the prince in a
-   * blue coat, which is roughly what the original did too. */
+  /* Wardrobes. Colour tables only -- there is no geometry to vary, since
+   * the same solved figure draws every character. */
   P.SKINS = {
     prince: {
       clothD: C.CLOTH_D, clothM: C.CLOTH_M, clothL: C.CLOTH_L, clothH: C.CLOTH_H,
       skinD: C.SKIN_D, skinM: C.SKIN_M, skinL: C.SKIN_L,
       hair: C.HAIR_D, hair2: C.HAIR_M,
-      sashD: C.CLOTH_M, sashM: C.CLOTH_L,
-      bootD: C.SKIN_M, bootM: C.SKIN_L,
-      helmet: 0
+      sashD: C.CLOTH_M, sashM: C.CLOTH_L, helmet: 0
     },
     guard: {
       clothD: C.BLUE_D, clothM: C.BLUE_M, clothL: C.BLUE_L, clothH: C.BLUE_L,
       skinD: C.SKIN_D, skinM: C.SKIN_D, skinL: C.SKIN_M,
       hair: C.HAIR_D, hair2: C.HAIR_M,
-      sashD: C.RED_D, sashM: C.RED_M,
-      bootD: C.BRICK_S, bootM: C.BRICK_D,
-      helmet: C.STEEL_M
-    },
-    skeleton: {
-      clothD: C.BRICK_S, clothM: C.BRICK_D, clothL: C.BRICK_MD, clothH: C.CREAM,
-      skinD: C.BRICK_D, skinM: C.STONE_H, skinL: C.CREAM,
-      hair: C.OUTLINE, hair2: C.BRICK_S,
-      sashD: C.BRICK_S, sashM: C.BRICK_D,
-      bootD: C.BRICK_S, bootM: C.BRICK_D,
-      helmet: 0
+      sashD: C.RED_D, sashM: C.RED_M, helmet: C.STEEL_M
     }
   };
 
-  /* Every joint position for a pose, computed once and shared by the
-   * renderer and by anything else that needs to know where a hand is. */
-  function rigPoints(p) {
-    var hip = [p[0] * POSE_SCALE, p[1] * POSE_SCALE];
-    var torsoA = p[2], headA = p[3];
-    var neck = adv(hip[0], hip[1], torsoA, L.torso);
-    // shoulders sit just below the top of the spine
-    var sh = adv(neck[0], neck[1], torsoA, -1.4);
+  /* ---- critically damped spring -------------------------------------
+   * The standard "smooth towards a target with no overshoot" integrator.
+   * `omega` is stiffness; higher snaps harder. Stable at any dt.
+   */
+  function Spring(v, omega) { this.v = v; this.d = 0; this.t = v; this.w = omega || 14; }
+  Spring.prototype.set = function (v) { this.v = this.t = v; this.d = 0; };
+  Spring.prototype.step = function (dt) {
+    var w = this.w, f = 1 + 2 * dt * w;
+    var ww = w * w, dtww = dt * ww, det = f + dt * dtww;
+    this.v = (f * this.v + dt * this.d + dtww * dt * this.t + dt * this.t * 0 ) / det;
+    this.d = (this.d + dtww * (this.t - this.v)) / f;
+    return this.v;
+  };
+
+  /* Two-link IK: place the ankle at (ax, ay) given a hip at (hx, hy).
+   * Returns the knee position, choosing the forward-bending solution. */
+  function ik2(hx, hy, ax, ay, l1, l2, front) {
+    var dx = ax - hx, dy = ay - hy;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var dmin = Math.abs(l1 - l2) + 0.01, dmax = l1 + l2 - 0.01;
+    if (d < dmin) d = dmin;
+    if (d > dmax) d = dmax;
+    var ux = dx / Math.max(0.0001, Math.sqrt(dx * dx + dy * dy));
+    var uy = dy / Math.max(0.0001, Math.sqrt(dx * dx + dy * dy));
+    var a = (l1 * l1 - l2 * l2 + d * d) / (2 * d);
+    var h2 = l1 * l1 - a * a;
+    var h = h2 > 0 ? Math.sqrt(h2) : 0;
+    var mx = hx + ux * a, my = hy + uy * a;
+    // perpendicular; `front` picks which side the knee falls on
+    return [mx + uy * h * front, my - ux * h * front];
+  }
+
+  function len(ax, ay, bx, by) { var dx = bx - ax, dy = by - ay; return Math.sqrt(dx * dx + dy * dy); }
+
+  /* ---- the figure ---------------------------------------------------- */
+
+  function Figure(skin) {
+    this.skin = skin;
+    this.x = 0; this.y = 0;          // pelvis reference: feet-on-floor point
+    this.facing = 1;
+    this.vx = 0;
+
+    this.phase = 0;                  // gait cycle position, 0..1
+    this.cadence = 0;                // cycles per second, follows speed
+    this.airborne = false;
+    this.groundY = 0;
+
+    // per-foot contact state, in WORLD coordinates
+    this.feet = [
+      { planted: true, wx: 0, wy: 0, liftX: 0, liftY: 0, angle: 0 },
+      { planted: true, wx: 0, wy: 0, liftX: 0, liftY: 0, angle: 0 }
+    ];
+
+    // sprung degrees of freedom
+    this.hipH = new Spring(L.standHip, 16);
+    this.lean = new Spring(-88, 10);
+    this.head = new Spring(-90, 8);
+    this.armF = [new Spring(95, 13), new Spring(100, 11)];  // shoulder, elbow
+    this.armN = [new Spring(88, 13), new Spring(95, 11)];
+    this.crouch = new Spring(0, 12);
+    this.reach = new Spring(0, 14);       // 0 = normal, 1 = arms overhead
+    this.bladeA = new Spring(-8, 18);
+    this.armed = false;
+
+    // gait shape, adjusted by speed
+    this.stride = 32;
+    this.duty = 0.55;
+    this.lift = 5.5;
+  }
+
+  Figure.prototype.setGround = function (y) { this.groundY = y; };
+
+  Figure.prototype.teleport = function (x, y) {
+    this.x = x; this.y = y; this.groundY = y;
+    for (var i = 0; i < 2; i++) {
+      var f = this.feet[i];
+      f.planted = true; f.wx = x + (i ? 4 : -4); f.wy = y; f.angle = 0;
+    }
+    this.hipH.set(L.standHip);
+  };
+
+  /* Advance the whole model by dt seconds.
+   * cmd: { move: -1..1, crouch: 0..1, reach: 0..1, airborne, blade }  */
+  Figure.prototype.update = function (dt, cmd) {
+    cmd = cmd || {};
+    var move = cmd.move || 0;
+    var speed = Math.abs(this.vx);
+
+    if (move !== 0) this.facing = move > 0 ? 1 : -1;
+
+    /* Gait shape scales with speed the way a real one does: a walk has a
+     * long stance and a short stride, a run has a short stance, a long
+     * stride and a flight phase where neither foot is down. */
+    var walkRun = Math.min(1, speed / 90);
+    this.stride = 20 + 22 * walkRun;
+    this.duty = 0.62 - 0.26 * walkRun;         // <0.5 means flight
+    this.lift = 3.2 + 4.0 * walkRun;
+
+    this.cadence = speed > 1 ? speed / this.stride : 0;
+    if (this.cadence > 0) this.phase = (this.phase + this.cadence * dt) % 1;
+
+    this.airborne = !!cmd.airborne;
+
+    // posture targets
+    this.crouch.t = cmd.crouch || 0;
+    this.reach.t = cmd.reach || 0;
+    var leanAmt = 15 * walkRun * Math.min(1, speed / 40) + 10 * this.crouch.v;
+    this.lean.t = -90 + this.facing * (this.airborne ? 6 : leanAmt);
+    this.head.t = -90 + this.facing * 6 * walkRun;
+    this.hipH.t = (L.standHip - 6.5 * this.crouch.v) - (this.airborne ? 0 : 1.6 * walkRun);
+
+    this.updateFeet(dt, walkRun);
+    this.updateArms(dt, walkRun, cmd);
+
+    this.hipH.step(dt); this.lean.step(dt); this.head.step(dt);
+    this.crouch.step(dt); this.reach.step(dt); this.bladeA.step(dt);
+  };
+
+  /* Foot contacts. This is the part that makes the motion read as walking
+   * rather than as a drawing being dragged sideways. */
+  Figure.prototype.updateFeet = function (dt, walkRun) {
+    var self = this;
+    var gy = this.groundY;
+
+    if (this.airborne) {
+      // in flight both feet just follow the body; nothing is planted
+      for (var a = 0; a < 2; a++) {
+        var ff = this.feet[a];
+        ff.planted = false;
+        var tx = this.x + this.facing * (a ? 5 : -3);
+        ff.wx += (tx - ff.wx) * Math.min(1, dt * 12);
+        ff.wy += ((gy - 4) - ff.wy) * Math.min(1, dt * 8);
+        ff.angle += (-20 - ff.angle) * Math.min(1, dt * 8);
+      }
+      return;
+    }
+
+    if (this.cadence <= 0) {
+      // standing: settle both feet either side of the body axis
+      for (var s = 0; s < 2; s++) {
+        var fs = this.feet[s];
+        fs.planted = true;
+        var want = this.x + this.facing * (s ? 3.4 : -3.4);
+        fs.wx += (want - fs.wx) * Math.min(1, dt * 6);
+        fs.wy = gy;
+        fs.angle += (0 - fs.angle) * Math.min(1, dt * 6);
+      }
+      return;
+    }
+
+    for (var i = 0; i < 2; i++) {
+      var f = this.feet[i];
+      var p = (this.phase + i * 0.5) % 1;
+      var stance = p < this.duty;
+
+      if (stance) {
+        if (!f.planted) {
+          // touchdown: nail the foot to the world here and now
+          f.planted = true;
+          f.wy = gy;
+        }
+        // planted: the world position does not change at all
+        f.angle += ((p / this.duty < 0.25 ? 12 : p / this.duty > 0.75 ? -34 : 0) - f.angle)
+          * Math.min(1, dt * 16);
+      } else {
+        if (f.planted) {
+          f.planted = false;
+          f.liftX = f.wx; f.liftY = f.wy;
+        }
+        var u = (p - this.duty) / (1 - this.duty);      // 0..1 through swing
+        // where the body will be when this foot lands, plus a lead so it
+        // reaches out ahead the way a stride does
+        var swingTime = (1 - this.duty) / Math.max(0.001, this.cadence);
+        var landX = this.x + this.vx * swingTime * (1 - u)
+          + this.facing * this.stride * 0.30;
+        var e = u * u * (3 - 2 * u);
+        f.wx = f.liftX + (landX - f.liftX) * e;
+        f.wy = gy - Math.sin(Math.PI * u) * this.lift;
+        f.angle += ((u < 0.5 ? -30 + 60 * u : 18) - f.angle) * Math.min(1, dt * 14);
+      }
+      void self;
+    }
+  };
+
+  Figure.prototype.updateArms = function (dt, walkRun, cmd) {
+    var sw = Math.sin(this.phase * TAU);
+    var swLead = Math.sin(this.phase * TAU + 0.85);   // forearm lags the arm
+    var amp = 30 * walkRun + 5;
+    var bend = 24 + 34 * walkRun;
+
+    if (this.reach.v > 0.02) {
+      // reaching overhead (hanging, climbing) overrides the swing
+      var r = this.reach.v;
+      this.armF[0].t = 95 + (-88 - 95) * r;
+      this.armF[1].t = 100 + (-90 - 100) * r;
+      this.armN[0].t = 88 + (-86 - 88) * r;
+      this.armN[1].t = 95 + (-88 - 95) * r;
+    } else if (cmd.guard) {
+      this.armF[0].t = 130; this.armF[1].t = 176;
+      this.armN[0].t = 20 + (cmd.thrust || 0) * -18;
+      this.armN[1].t = -6 + (cmd.thrust || 0) * 8;
+    } else {
+      this.armF[0].t = 92 - amp * sw;
+      this.armF[1].t = 92 - amp * 1.35 * swLead - bend;
+      this.armN[0].t = 92 + amp * sw;
+      this.armN[1].t = 92 + amp * 1.35 * swLead - bend;
+    }
+    this.armF[0].step(dt); this.armF[1].step(dt);
+    this.armN[0].step(dt); this.armN[1].step(dt);
+  };
+
+  /* ---- pose evaluation ----------------------------------------------
+   * Turn the continuous state into concrete joint positions. Pure function
+   * of the state; nothing here is looked up.
+   */
+  Figure.prototype.pose = function () {
+    var hipY = this.y - this.hipH.v;            // screen space: y grows down
+    var hipX = this.x;
+    var leanA = this.lean.v, headA = this.head.v;
+
+    // screen space: y grows down, so -90 (up) must decrease y
+    function adv(x, y, ang, l) {
+      return [x + Math.cos(ang * D2R) * l, y + Math.sin(ang * D2R) * l];
+    }
+    var neck = adv(hipX, hipY, leanA, L.torso);
+    var sh = adv(neck[0], neck[1], leanA, -1.4);
     var headBase = adv(neck[0], neck[1], headA, L.neck);
     var headC = adv(headBase[0], headBase[1], headA, L.headH * 0.82);
 
-    function arm(sa, ea) {
+    var out = { hipX: hipX, hipY: hipY, leanA: leanA, headA: headA,
+      neck: neck, sh: sh, headC: headC, legs: [], arms: [] };
+
+    for (var i = 0; i < 2; i++) {
+      var f = this.feet[i];
+      var hx = hipX + this.facing * (i ? L.hipHalf : -L.hipHalf);
+      // the ankle sits above the contact point by the height of the foot
+      var ax = f.wx, ay = f.wy - 2.0;
+      /* Clamp the ankle into leg reach. A world-pinned foot is normally
+       * within reach by construction, but if the body is teleported -- a
+       * room cut, a respawn -- the pin is briefly stale, and drawing to it
+       * would stretch the shin clean across the screen. Degrade, don't
+       * explode. */
+      var rdx = ax - hx, rdy = ay - hipY;
+      var rd = Math.sqrt(rdx * rdx + rdy * rdy), reach = L.uLeg + L.lLeg - 0.5;
+      if (rd > reach) { ax = hx + rdx / rd * reach; ay = hipY + rdy / rd * reach; }
+      var knee = ik2(hx, hipY, ax, ay, L.uLeg, L.lLeg, -this.facing);
+      out.legs.push({ hip: [hx, hipY], knee: knee, ankle: [ax, ay], angle: f.angle });
+    }
+    var arms = [this.armF, this.armN];
+    for (var a = 0; a < 2; a++) {
+      var sa = arms[a][0].v, ea = arms[a][1].v;
+      if (this.facing < 0) { sa = 180 - sa; ea = 180 - ea; }
       var elbow = adv(sh[0], sh[1], sa, L.uArm);
       var wrist = adv(elbow[0], elbow[1], ea, L.lArm);
-      return { elbow: elbow, wrist: wrist };
-    }
-    function leg(hx, ha, ka, fa) {
-      var h = [hx, hip[1]];
-      var knee = adv(h[0], h[1], ha, L.uLeg);
-      var ankle = adv(knee[0], knee[1], ka, L.lLeg);
-      return { hip: h, knee: knee, ankle: ankle, footA: fa };
-    }
-
-    return {
-      hip: hip, torsoA: torsoA, headA: headA,
-      neck: neck, sh: sh, headBase: headBase, headC: headC,
-      farArm: arm(p[4], p[5]), nearArm: arm(p[6], p[7]),
-      farLeg: leg(hip[0] - 1.1, p[8], p[9], p[10]),
-      nearLeg: leg(hip[0] + 1.1, p[11], p[12], p[13])
-    };
-  }
-
-  /* A shoe: heel, sole, toe box. Drawn as a wedge because that is what a
-   * foot's silhouette is, and a capsule toe was reading as a club. */
-  function drawShoe(cv, ankle, footA, col, dark) {
-    var f = dir(footA), u = [-f[1], f[0]];   // f is along the foot, u is up
-    var heel = add(add(ankle, f, -2.7), u, -0.6);
-    poly(cv, [
-      add(heel, u, 1.9),
-      add(add(ankle, f, 1.4), u, 1.7),
-      add(add(ankle, f, L.foot * 0.62), u, 0.7),
-      add(add(ankle, f, L.foot + 0.6), u, -1.1),
-      add(add(ankle, f, L.foot + 0.2), u, -2.2),
-      add(add(ankle, f, -2.4), u, -2.2),
-      heel
-    ], col);
-    // sole
-    poly(cv, [
-      add(add(ankle, f, L.foot + 0.4), u, -1.5),
-      add(add(ankle, f, L.foot + 0.2), u, -2.3),
-      add(add(ankle, f, -2.5), u, -2.3),
-      add(add(ankle, f, -2.6), u, -1.5)
-    ], dark);
-  }
-
-  function drawLeg(cv, lg, sk, far) {
-    cv.partId = far ? PART.FAR_LEG : PART.NEAR_LEG;
-    var cloth = far ? sk.clothD : sk.clothM;
-    var clothHi = far ? sk.clothM : sk.clothL;
-    var boot = far ? sk.bootD : sk.bootM;
-    var bootD = far ? C.SHADOW : sk.bootD;
-    // thigh: full at the glute, narrowing into the knee
-    limb(cv, lg.hip, lg.knee, [3.8, 3.5, 2.7], cloth);
-    // shank: trouser to mid-calf with the calf swell, then the boot
-    var mid = mix(lg.knee, lg.ankle, 0.52);
-    limb(cv, lg.knee, mid, [2.6, 2.9], clothHi);
-    limb(cv, mid, lg.ankle, [2.4, 1.7], boot);
-    drawShoe(cv, lg.ankle, lg.footA, boot, bootD);
-  }
-
-  function drawArm(cv, sh, a, sk, far) {
-    cv.partId = far ? PART.FAR_ARM : PART.NEAR_ARM;
-    var sleeve = far ? sk.clothD : sk.clothL;
-    var skin = far ? sk.skinD : sk.skinL;
-    // deltoid: the cap over the shoulder joint. Without it the arm looks
-    // like it was pushed into a socket.
-    dot(cv, sh, L.shoulderW, sleeve);
-    var sleeveEnd = mix(sh, a.elbow, 0.55);
-    limb(cv, sh, sleeveEnd, [2.7, 2.6], sleeve);
-    limb(cv, sleeveEnd, a.elbow, [2.2, 1.8], skin);
-    limb(cv, a.elbow, a.wrist, [1.9, 2.0, 1.4], skin);   // forearm swell
-    // hand, oriented along the forearm
-    var fa = Math.atan2(-(a.wrist[1] - a.elbow[1]), a.wrist[0] - a.elbow[0]) / D2R;
-    oval(cv, add(a.wrist, dir(fa), 1.2), 1.25, 1.7, fa, skin);
-  }
-
-  function drawSword(cv, wrist, ang, sk) {
-    cv.partId = PART.SWORD;
-    var tip = adv(wrist[0], wrist[1], ang, L.sword);
-    var base = adv(wrist[0], wrist[1], ang, -3);
-    var g1 = adv(wrist[0], wrist[1], ang + 90, 3.2);
-    var g2 = adv(wrist[0], wrist[1], ang - 90, 3.2);
-    cap(cv, base, wrist, 1.6, 1.6, C.STEEL_D);
-    cap(cv, g1, g2, 1.2, 1.2, C.GOLD);
-    cap(cv, wrist, tip, 1.9, 0.9, C.STEEL_L);
-  }
-
-  function drawTorso(cv, r, sk) {
-    cv.partId = PART.TORSO;
-    var axis = dir(r.torsoA);                 // hip -> shoulders
-    var fwd = dir(r.torsoA + 90);             // the way the figure faces
-    function pt(u, perp) {
-      return add(add(r.hip, axis, u * L.torso), fwd, perp);
-    }
-    /* Side-view silhouette: deep at the hips, pinched at the waist, full
-     * through the chest, narrowing again at the shoulders. */
-    poly(cv, [
-      pt(-0.06, 3.2), pt(0.26, 2.6), pt(0.58, 3.7), pt(0.84, 3.9), pt(1.02, 2.7),
-      pt(1.04, -2.8), pt(0.86, -3.7), pt(0.56, -3.6), pt(0.26, -2.8), pt(-0.06, -3.5)
-    ], sk.clothM);
-    // lit front plane of the chest
-    poly(cv, [
-      pt(0.30, 2.5), pt(0.58, 3.6), pt(0.84, 3.8), pt(1.0, 2.6),
-      pt(0.98, 0.5), pt(0.60, 0.8), pt(0.32, 0.3)
-    ], sk.clothL);
-    // pelvis
-    dot(cv, r.hip, 3.6, sk.clothM);
-    // the sash. The kid's own palette has none -- the original dresses him
-    // in plain cream head to foot -- so for him this is drawn in cloth
-    // tones and simply reads as a belted waist.
-    var w0 = pt(0.10, 0), w1 = pt(0.30, 0);
-    cap(cv, w0, w1, 3.5, 3.6, sk.sashM);
-    cap(cv, w0, w1, 2.6, 2.7, sk.sashD);
-    // a tail of sash hanging at the back
-    var t0 = add(pt(0.16, -3.0), axis, 0);
-    var t1 = add(t0, dir(r.torsoA - 170), 4.4);
-    cap(cv, t0, t1, 1.4, 0.9, sk.sashM);
-  }
-
-  function drawHead(cv, r, sk) {
-    cv.partId = PART.HEAD;
-    var headA = r.headA;
-    var fwd = dir(headA + 90);
-    // neck
-    cap(cv, r.neck, r.headBase, 1.7, 1.6, sk.skinM);
-    // cranium plus jaw: an oval with a wedge hung off the front-bottom
-    oval(cv, r.headC, L.headW, L.headH, headA, sk.skinL);
-    var jaw = add(add(r.headC, dir(headA), -1.4), fwd, 1.0);
-    oval(cv, jaw, 2.5, 2.9, headA, sk.skinL);
-    // brow and nose
-    var nose = add(add(r.headC, fwd, L.headW * 0.86), dir(headA), 0.2);
-    dot(cv, nose, 1.05, sk.skinL);
-
-    if (sk.helmet) {
-      oval(cv, add(r.headC, dir(headA), 0.9), L.headW * 1.02, L.headH * 0.78, headA, sk.helmet);
-      dot(cv, add(r.headC, dir(headA - 90), 2.4), 2.4, C.STEEL_D);
-      // nasal bar
-      cap(cv, add(r.headC, fwd, L.headW * 0.75),
-        add(add(r.headC, fwd, L.headW * 0.72), dir(headA), -2.4), 0.7, 0.6, C.STEEL_D);
-    } else {
-      // hair: a cap over the skull that runs down the back of the neck,
-      // which is what gives the head a readable shape in silhouette
-      oval(cv, add(r.headC, dir(headA), 0.55), L.headW * 1.00, L.headH * 0.84, headA, sk.hair);
-      var nape = add(add(r.headC, dir(headA - 90), 2.2), dir(headA), -1.3);
-      oval(cv, nape, 1.8, 2.3, headA, sk.hair);
-      dot(cv, add(nape, dir(headA), -1.2), 1.4, sk.hair2);
-      // face: reclaim the front of the skull from the hair
-      poly(cv, [
-        add(add(r.headC, fwd, 0.2), dir(headA), 2.6),
-        add(add(r.headC, fwd, L.headW * 0.95), dir(headA), 0.9),
-        add(add(r.headC, fwd, L.headW * 0.95), dir(headA), -1.8),
-        add(add(r.headC, fwd, 1.4), dir(headA), -4.0),
-        add(add(r.headC, fwd, -0.4), dir(headA), -2.0)
-      ], sk.skinL);
-      // fringe over the brow
-      cap(cv, add(add(r.headC, fwd, 0.4), dir(headA), 3.2),
-        add(add(r.headC, fwd, 3.0), dir(headA), 2.3), 1.5, 1.0, sk.hair);
-    }
-    // eye
-    var eye = add(add(r.headC, fwd, L.headW * 0.60), dir(headA), 0.55);
-    dot(cv, eye, 0.72, C.OUTLINE);
-  }
-
-  /* Draw a full pose. Painter's order: far limbs, body, near limbs. */
-  function drawPose(cv, p, sk, opts) {
-    opts = opts || {};
-    var r = rigPoints(p);
-    drawLeg(cv, r.farLeg, sk, true);
-    drawArm(cv, r.sh, r.farArm, sk, true);
-    if (opts.swordFar) drawSword(cv, r.farArm.wrist, opts.swordFar, sk);
-    drawTorso(cv, r, sk);
-    drawHead(cv, r, sk);
-    drawLeg(cv, r.nearLeg, sk, false);
-    drawArm(cv, r.sh, r.nearArm, sk, false);
-    if (opts.sword) drawSword(cv, r.nearArm.wrist, opts.sword, sk);
-  }
-
-  /* Horizontal squash of a finished bitmap, nearest-neighbour, about the
-   * reference column. Used for the turn: rather than draw three-quarter
-   * views we compress the side view edge-on, which is exactly the sort of
-   * bitmap trick the era ran on. */
-  function squashX(spr, f) {
-    var nw = Math.max(1, Math.round(spr.w * f));
-    var out = new Uint8Array(nw * spr.h);
-    for (var y = 0; y < spr.h; y++) {
-      for (var x = 0; x < nw; x++) {
-        var sx = Math.min(spr.w - 1, Math.floor((x + 0.5) / f));
-        out[y * nw + x] = spr.data[y * spr.w + sx];
-      }
-    }
-    return { w: nw, h: spr.h, ox: Math.round(spr.ox * f), oy: spr.oy, data: out };
-  }
-
-  var _cv = null;
-  function canvas() {
-    if (!_cv) _cv = new P.RasterCanvas(BW * Z, BH * Z);
-    _cv.clear();
-    return _cv;
-  }
-  function finish(cv, pose) {
-    var lo = R.downsample(cv, BW * RES, BH * RES);
-    var px = R.outline(lo.color, BW * RES, BH * RES, C.CLOTH_D, lo.part, null);
-    var spr = R.crop(px, BW * RES, BH * RES, REF_X * RES, REF_Y * RES);
-    var xs = pose[14];
-    if (xs !== undefined && xs < 0.999) spr = squashX(spr, xs);
-    return spr;
-  }
-
-  function bakePose(pose, sk, opts) {
-    var cv = canvas();
-    drawPose(cv, pose, sk, opts);
-    return finish(cv, pose);
-  }
-
-  /* Bake just the blade, so an unarmed prince and an armed one share one set
-   * of body frames -- the original's frame table carried `image` and `sword`
-   * as separate fields for the same reason. */
-  function bakeSword(pose, angle) {
-    var cv = canvas();
-    drawSword(cv, rigPoints(pose).nearArm.wrist, angle, P.SKINS.prince);
-    return finish(cv, pose);
-  }
-
-  P.Rig = {
-    L: L,
-    POSE_SCALE: POSE_SCALE,
-    drawPose: drawPose,
-    bakePose: bakePose,
-    bakeSword: bakeSword,
-    rigPoints: rigPoints,
-    nearWrist: function (p) { return rigPoints(p).nearArm.wrist; },
-    squashX: squashX,
-    adv: adv
-  };
-})(POP);
-
-/* ===== src/game/poses.js ===== */
-/*
- * poses.js -- the pose library, and the clips built out of it.
- *
- * These stand in for the rotoscope. Where the original traced VHS frames of
- * David Mechner running around a parking lot in white clothes, this is the
- * same motion described as joint angles and hand-tuned until the silhouette
- * reads right. Frame counts and timing are taken from the real SEQTABLE.S,
- * so the *rhythm* is the original's even though the drawings are ours.
- *
- * A clip is either an explicit frame list or a set of keys interpolated out
- * to a frame count. Interpolation here is authoring convenience only -- by
- * the time the game runs, every frame is a finished bitmap.
- */
-var POP = POP || {};
-(function (P) {
-  'use strict';
-
-  /* pose: hipX hipY torso head | farSh farEl nearSh nearEl
-   *       | farHip farKnee farFoot | nearHip nearKnee nearFoot | xscale */
-  function pz(hx, hy, t, hd, fs, fe, ns, ne, fh, fk, ff, nh, nk, nf, xs) {
-    return [hx, hy, t, hd, fs, fe, ns, ne, fh, fk, ff, nh, nk, nf,
-      xs === undefined ? 1 : xs];
-  }
-
-  function lerp(a, b, u) {
-    var o = new Array(15);
-    for (var i = 0; i < 15; i++) o[i] = a[i] + (b[i] - a[i]) * u;
-    return o;
-  }
-
-  /* ---- individual poses --------------------------------------------- */
-
-  var STAND = pz(0, 27, -88, -90, 95, 98, 87, 92, 88, 90, 5, 93, 91, 2);
-  var STAND_A = pz(0, 26, -85, -88, 100, 112, 80, 84, 86, 92, 5, 96, 94, 2);
-
-  /* Eight-frame run cycle, 32 pixels -- one tile.
-   *
-   * The stance leg is not hand-authored: it is solved by two-link IK against
-   * the chx values in seq.js so the planted foot holds a fixed world
-   * position. That is what stops the character skating, and it is what
-   * rotoscoping gave the original for free -- a traced foot that really was
-   * planted cannot slip. Regenerate with `node tools/mkrun.mjs`.
-   *
-   * The swing leg and the arms are authored; nothing constrains them.
-   * Frames 4-7 are 0-3 with the legs and arms swapped, which also swaps
-   * which leg gets the lit shade -- they read as alternating in front, free.
-   */
-var RUN = [
-    pz(0, 26, -72, -78, 80, -25, 112, 125, 112, 128, -26, 52.8, 94.5, 14),
-    pz(0, 24.5, -70, -78, 88, -8, 106, 118, 116, 150, -34, 46.2, 106.3, 2),
-    pz(0, 25, -70, -80, 98, 25, 98, 100, 100, 148, -30, 55.4, 117.4, -14),
-    pz(0, 27, -73, -80, 108, 70, 88, 40, 80, 120, -12, 82.2, 120.5, -40),
-    pz(0, 26, -72, -78, 112, 125, 80, -25, 52.6, 87.5, 14, 112, 128, -26),
-    pz(0, 24.5, -70, -78, 106, 118, 88, -8, 45.9, 105.3, 2, 116, 150, -34),
-    pz(0, 25, -70, -80, 98, 100, 98, 25, 57.7, 120.4, -14, 100, 148, -30),
-    pz(0, 27, -73, -80, 88, 40, 108, 70, 85.9, 121.4, -40, 80, 120, -12)
-  ];
-
-  var CROUCH = pz(0, 15, -58, -74, 60, 80, 52, 74, 96, 138, 0, 104, 142, 4);
-  var CROUCH_DEEP = pz(0, 12, -50, -70, 70, 95, 62, 88, 100, 148, 2, 108, 152, 6);
-
-  /* ---- clip table ---------------------------------------------------
-   * `frames` = literal poses. `keys` = [frameIndex, pose] pairs, everything
-   * between them interpolated. `n` = total frames when using keys.
-   */
-  var CLIPS = {
-
-    stand: { frames: [STAND] },
-    alertstand: { frames: [STAND_A] },
-    runcyc: { frames: RUN },
-
-    // startrun: six frames from a standing start into the cycle.
-    // chx in the real table is 0,0,0,8,3,3 -- the lunge is on frame 4.
-    startrun: {
-      frames: [
-        pz(0, 26, -84, -88, 92, 98, 86, 92, 88, 94, 5, 92, 92, 2),
-        pz(0, 25, -80, -85, 102, 118, 76, 66, 94, 104, 2, 86, 96, 6),
-        pz(0, 24, -76, -82, 116, 152, 62, 32, 104, 118, -8, 78, 92, 6),
-        pz(0, 24, -72, -80, 130, 186, 50, 10, 112, 134, -24, 70, 88, 5),
-        pz(0, 25, -71, -79, 138, 192, 46, 6, 116, 140, -28, 68, 88, 5),
-        pz(0, 26, -72, -78, 46, 6, 134, 190, 113, 126, -22, 68, 88, 5)
-      ]
-    },
-
-    // runstop: skid. Weight goes back, front foot planted and braced.
-    runstop: {
-      frames: [
-        pz(0, 25, -80, -84, 60, 30, 118, 170, 100, 120, -10, 74, 90, 12),
-        pz(-2, 22, -96, -92, 30, -10, 140, 190, 108, 130, 0, 58, 78, 20),
-        pz(-3, 21, -100, -95, 20, -25, 148, 200, 112, 126, 4, 55, 74, 22),
-        pz(-2, 23, -96, -92, 40, 5, 130, 180, 104, 116, 6, 64, 82, 14)
-      ]
-    },
-
-    // turn: `aboutface` fires first, so these frames play already facing the
-    // new way -- the figure resolves out of an edge-on pivot. The x-squash
-    // is doing the work a set of three-quarter drawings would have done.
-    turn: {
-      frames: [
-        pz(0, 25, -88, -90, 92, 100, 90, 96, 90, 94, 3, 92, 93, 2, 0.34),
-        pz(0, 25, -88, -90, 94, 102, 88, 95, 90, 93, 3, 92, 92, 2, 0.50),
-        pz(0, 26, -88, -90, 95, 101, 88, 94, 89, 92, 4, 93, 92, 2, 0.66),
-        pz(0, 26, -88, -90, 95, 100, 87, 93, 89, 91, 4, 93, 91, 2, 0.79),
-        pz(0, 27, -88, -90, 95, 99, 87, 92, 88, 90, 5, 93, 91, 2, 0.88),
-        pz(0, 27, -88, -90, 95, 98, 87, 92, 88, 90, 5, 93, 91, 2, 0.94),
-        pz(0, 27, -88, -90, 95, 98, 87, 92, 88, 90, 5, 93, 91, 2, 0.98),
-        STAND
-      ]
-    },
-
-    // standing jump: 18 frames. Crouch, uncoil, tuck, reach, land, recover.
-    standjump: {
-      n: 18,
-      keys: [
-        [0, pz(0, 25, -80, -86, 100, 118, 82, 96, 92, 104, 2, 96, 106, 2)],
-        [3, pz(0, 20, -68, -80, 126, 172, 108, 150, 98, 128, 0, 102, 132, 2)],
-        [5, CROUCH_DEEP],
-        [6, pz(0, 18, -60, -76, 148, 204, 132, 196, 100, 146, 0, 106, 150, 4)],
-        [7, pz(0, 25, -70, -80, 78, 26, 62, 14, 96, 112, -8, 100, 116, -4)],
-        [8, pz(0, 31, -76, -84, 24, -28, 10, -40, 108, 128, -38, 114, 136, -34)],
-        [9, pz(0, 35, -82, -88, 2, -42, -8, -52, 74, 122, -22, 84, 130, -18)],
-        [10, pz(0, 33, -80, -86, 22, -16, 12, -26, 60, 82, 10, 70, 88, 6)],
-        [11, pz(0, 28, -78, -84, 40, 10, 32, 4, 70, 86, 6, 80, 90, 3)],
-        [12, pz(0, 19, -62, -76, 58, 78, 50, 72, 92, 134, 0, 100, 140, 4)],
-        [13, pz(0, 22, -70, -80, 70, 92, 62, 86, 92, 118, 2, 98, 122, 3)],
-        [15, pz(0, 25, -80, -85, 86, 96, 78, 90, 90, 100, 4, 94, 102, 3)],
-        [17, STAND]
-      ]
-    },
-
-    // running jump: 11 frames, the long one. chy goes -3,-9,-2 then +11,+3,
-    // so the arc is entirely in the data -- no gravity involved.
-    runjump: {
-      n: 11,
-      keys: [
-        [0, RUN[2]],
-        [1, pz(0, 26, -68, -78, 92, 60, 96, 140, 92, 160, -50, 100, 100, 8)],
-        [2, pz(0, 25, -64, -76, 120, 150, 70, 30, 78, 140, -30, 112, 116, -4)],
-        [3, pz(0, 23, -60, -74, 140, 190, 44, 0, 62, 96, 4, 122, 140, -30)],
-        [4, pz(0, 28, -66, -78, 150, 200, 20, -30, 74, 84, 8, 132, 152, -40)],
-        [5, pz(0, 33, -74, -84, 130, 186, -2, -48, 96, 96, 4, 138, 160, -44)],
-        [6, pz(0, 36, -80, -88, 100, 150, -14, -56, 116, 118, -14, 120, 156, -40)],
-        [7, pz(0, 35, -80, -88, 70, 106, 4, -36, 100, 108, -6, 86, 138, -22)],
-        [8, pz(0, 31, -78, -86, 46, 52, 30, -6, 76, 88, 8, 66, 100, 2)],
-        [9, pz(0, 25, -70, -80, 58, 72, 52, 40, 88, 116, 2, 78, 96, 6)],
-        [10, pz(0, 26, -72, -78, 46, 8, 132, 186, 110, 124, -20, 70, 90, 5)]
-      ]
-    },
-
-    // jumpup: vertical spring to catch a ledge overhead.
-    jumpup: {
-      n: 9,
-      keys: [
-        [0, pz(0, 24, -80, -86, 102, 120, 84, 98, 92, 108, 2, 96, 110, 2)],
-        [2, CROUCH_DEEP],
-        [3, pz(0, 22, -74, -82, 40, -10, 30, -20, 96, 130, -2, 102, 134, 2)],
-        [4, pz(0, 32, -86, -92, -60, -84, -66, -86, 100, 130, -20, 106, 136, -16)],
-        [5, pz(0, 38, -88, -92, -80, -88, -82, -88, 92, 118, -10, 98, 122, -8)],
-        [6, pz(0, 36, -88, -92, -82, -88, -84, -88, 90, 108, -4, 94, 110, -2)],
-        [7, pz(0, 28, -82, -88, 60, 80, 54, 76, 92, 122, 0, 98, 126, 2)],
-        [8, STAND]
-      ]
-    },
-
-    // hang: hands on the ledge one row up, feet swinging near the floor
-    // below. The cycle in the real table swings back and forth for 40-odd
-    // frames before it gives out; we keep a short loop of the same motion.
-    hang: {
-      n: 12,
-      keys: [
-        [0, pz(0, 46.9, -88, -84, -86, -89, -88, -89, 84, 96, 20, 90, 100, 16)],
-        [3, pz(0, 45.4, -86, -82, -86, -89, -88, -89, 74, 88, 26, 80, 92, 22)],
-        [6, pz(0, 46.9, -88, -84, -86, -89, -88, -89, 88, 98, 18, 94, 102, 14)],
-        [9, pz(0, 45.4, -90, -86, -86, -89, -88, -89, 100, 110, 8, 106, 114, 6)],
-        [11, pz(0, 46.9, -88, -84, -86, -89, -88, -89, 86, 97, 19, 92, 101, 15)]
-      ]
-    },
-    hangstraight: {
-      frames: [pz(0, 46.9, -89, -86, -87, -89, -88, -89, 90, 96, 14, 95, 99, 12)]
-    },
-
-    // hangdrop: let go, absorb the half-storey.
-    hangdrop: {
-      n: 6,
-      keys: [
-        [0, pz(0, 46.9, -88, -84, -74, -84, -78, -85, 92, 104, 10, 98, 108, 8)],
-        [1, pz(0, 41.2, -86, -84, -30, -50, -36, -54, 96, 118, 4, 102, 122, 4)],
-        [2, pz(0, 31.2, -74, -80, 30, 20, 24, 14, 98, 132, 0, 104, 136, 2)],
-        [3, CROUCH],
-        [5, STAND]
-      ]
-    },
-
-    // climbup: 15 frames. Halfway through, the real sequence does
-    // `chx,5 / chy,-63 / up` -- it teleports the character one row up and
-    // switches rooms mid-animation. Frames after that point are authored
-    // against the upper floor, which is why they start in a heap.
-    climbup: {
-      n: 15,
-      keys: [
-        [0, pz(0, 46.9, -88, -84, -86, -89, -88, -89, 88, 98, 18, 94, 102, 14)],
-        [2, pz(0, 52.5, -86, -80, -82, -112, -84, -110, 84, 104, 16, 90, 108, 12)],
-        [4, pz(0, 59.6, -84, -76, -78, -130, -80, -128, 80, 112, 12, 86, 116, 10)],
-        [5, pz(0, 65.3, -82, -74, -76, -142, -78, -140, 76, 120, 8, 82, 124, 6)],
-        // --- chy,-63: everything below is relative to the upper floor ---
-        [6, pz(-2, 9, -34, -56, 44, 96, 38, 92, 108, 158, 8, 114, 160, 10)],
-        [8, pz(-1, 12, -44, -62, 52, 92, 46, 88, 104, 152, 6, 110, 154, 8)],
-        [10, pz(0, 16, -56, -70, 62, 88, 56, 84, 98, 142, 4, 106, 146, 6)],
-        [12, pz(0, 21, -70, -80, 76, 92, 70, 88, 94, 116, 2, 100, 120, 4)],
-        [14, STAND]
-      ]
-    },
-
-    freefall: {
-      n: 4,
-      keys: [
-        [0, pz(0, 27, -84, -80, -40, -70, -50, -76, 74, 108, -10, 108, 130, -18)],
-        [2, pz(0, 27, -92, -96, -30, -62, -58, -84, 96, 130, -20, 88, 112, -6)],
-        [3, pz(0, 27, -86, -84, -44, -72, -46, -74, 80, 116, -14, 102, 124, -14)]
-      ]
-    },
-
-    softland: {
-      n: 4,
-      keys: [
-        [0, pz(0, 21, -66, -78, 54, 66, 46, 60, 94, 132, 0, 100, 136, 4)],
-        [1, CROUCH],
-        [3, STAND]
-      ]
-    },
-    hardland: {
-      n: 8,
-      keys: [
-        [0, pz(0, 14, -46, -66, 84, 118, 78, 114, 102, 152, 2, 110, 156, 6)],
-        [1, pz(0, 11, -38, -60, 92, 128, 86, 124, 104, 158, 4, 112, 162, 8)],
-        [4, CROUCH_DEEP],
-        [6, CROUCH],
-        [7, STAND]
-      ]
-    },
-
-    crouch: { frames: [CROUCH] },
-
-    // a single walking step, used for the fourteen step-lengths the real
-    // game had for lining up exactly with a ledge.
-    step: {
-      n: 8,
-      keys: [
-        [0, STAND],
-        [1, pz(0, 26, -84, -88, 100, 112, 80, 86, 84, 92, 6, 98, 96, 2)],
-        [3, pz(0, 25, -80, -86, 112, 132, 68, 60, 74, 88, 10, 108, 110, -4)],
-        [5, pz(0, 25, -82, -86, 104, 120, 76, 74, 80, 90, 8, 102, 102, 0)],
-        [7, STAND]
-      ]
-    },
-
-    bump: {
-      n: 5,
-      keys: [
-        [0, pz(0, 25, -96, -94, 40, 8, 34, 2, 94, 100, 2, 88, 96, 4)],
-        [1, pz(-2, 24, -102, -98, 30, -6, 24, -12, 98, 106, 0, 84, 94, 6)],
-        [3, pz(-1, 26, -92, -92, 60, 40, 54, 34, 92, 96, 4, 90, 94, 3)],
-        [4, STAND]
-      ]
-    },
-
-    drink: {
-      n: 10,
-      keys: [
-        [0, STAND],
-        [2, pz(0, 26, -86, -88, 92, 96, 40, -30, 88, 92, 4, 93, 92, 2)],
-        [4, pz(0, 26, -88, -96, 92, 96, 10, -70, 88, 92, 4, 93, 92, 2)],
-        [7, pz(0, 26, -90, -104, 92, 96, 4, -82, 88, 92, 4, 93, 92, 2)],
-        [9, STAND]
-      ]
-    },
-
-    /* ---- swordplay -------------------------------------------------- */
-
-    engarde: {
-      n: 5,
-      keys: [
-        [0, STAND],
-        [2, pz(0, 26, -84, -88, 110, 140, 60, 30, 86, 94, 6, 96, 98, 2)],
-        [4, pz(0, 25, -84, -88, 128, 172, 22, -4, 78, 96, 6, 104, 104, 0)]
-      ],
-      sword: [null, -40, -20, -8, -4]
-    },
-    ready: {
-      n: 4,
-      keys: [
-        [0, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)],
-        [2, pz(0, 24, -83, -88, 132, 178, 24, -2, 78, 98, 6, 104, 104, 0)],
-        [3, pz(0, 25, -84, -88, 130, 176, 21, -5, 76, 96, 6, 106, 106, 0)]
-      ],
-      sword: [-4, -2, 0, -3]
-    },
-    advance: {
-      n: 4,
-      keys: [
-        [0, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)],
-        [1, pz(0, 24, -80, -86, 134, 180, 16, -10, 66, 92, 10, 110, 112, -4)],
-        [2, pz(0, 24, -82, -87, 132, 178, 18, -8, 70, 94, 8, 100, 100, 2)],
-        [3, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)]
-      ],
-      sword: [-4, -6, -5, -4]
-    },
-    retreat: {
-      n: 4,
-      keys: [
-        [0, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)],
-        [1, pz(0, 24, -88, -90, 126, 172, 26, 0, 86, 100, 4, 96, 100, 2)],
-        [2, pz(0, 24, -86, -89, 128, 174, 24, -2, 92, 104, 2, 88, 96, 4)],
-        [3, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)]
-      ],
-      sword: [-4, -8, -6, -4]
-    },
-    // strike: the lunge. Front leg drives out, sword arm extends level.
-    strike: {
-      n: 4,
-      keys: [
-        [0, pz(0, 25, -82, -88, 132, 178, 34, 10, 78, 98, 6, 104, 104, 0)],
-        [1, pz(2, 22, -74, -86, 146, 196, 8, -2, 58, 78, 12, 118, 122, -6)],
-        [2, pz(4, 20, -70, -84, 152, 202, 2, 0, 48, 66, 16, 126, 130, -10)],
-        [3, pz(1, 23, -78, -87, 140, 188, 16, -4, 66, 86, 10, 112, 114, -2)]
-      ],
-      sword: [-14, -4, 0, -6]
-    },
-    block: {
-      n: 3,
-      keys: [
-        [0, pz(0, 25, -84, -88, 128, 172, 10, -34, 78, 96, 6, 104, 104, 0)],
-        [1, pz(0, 25, -86, -90, 126, 168, -6, -54, 82, 98, 4, 100, 102, 0)],
-        [2, pz(0, 25, -85, -89, 127, 170, 2, -44, 80, 97, 5, 102, 103, 0)]
-      ],
-      sword: [-56, -74, -66]
-    },
-    stabbed: {
-      n: 6,
-      keys: [
-        [0, pz(0, 25, -92, -94, 118, 150, 40, 20, 88, 100, 4, 96, 100, 2)],
-        [1, pz(-2, 24, -100, -100, 100, 120, 66, 60, 96, 112, 0, 86, 96, 6)],
-        [3, pz(-4, 23, -108, -106, 80, 96, 88, 92, 104, 124, -4, 78, 90, 10)],
-        [5, pz(-6, 22, -112, -110, 70, 84, 96, 104, 110, 132, -8, 72, 86, 12)]
-      ],
-      sword: [-20, -40, -70, -90]
-    },
-    dead: {
-      n: 5,
-      keys: [
-        [0, pz(-6, 20, -120, -116, 66, 78, 100, 110, 114, 138, -10, 68, 82, 14)],
-        [2, pz(-8, 12, -150, -140, 40, 40, 130, 140, 130, 150, -20, 50, 70, 20)],
-        [4, pz(-10, 4, -172, -168, 14, 10, 160, 168, 152, 166, -30, 30, 52, 26)]
-      ],
-      sword: [null, null, null, null, null]
-    }
-  };
-
-  /* Expand keys into frames. */
-  function expand(clip) {
-    if (clip.frames) return clip.frames;
-    var keys = clip.keys, n = clip.n, out = new Array(n);
-    for (var f = 0; f < n; f++) {
-      var a = keys[0], b = keys[keys.length - 1];
-      for (var i = 0; i < keys.length - 1; i++) {
-        if (f >= keys[i][0] && f <= keys[i + 1][0]) { a = keys[i]; b = keys[i + 1]; break; }
-      }
-      if (f <= keys[0][0]) { out[f] = keys[0][1]; continue; }
-      if (f >= keys[keys.length - 1][0]) { out[f] = keys[keys.length - 1][1]; continue; }
-      var span = b[0] - a[0];
-      var u = span === 0 ? 0 : (f - a[0]) / span;
-      // smoothstep: keeps interpolated in-betweens from looking mechanical
-      u = u * u * (3 - 2 * u);
-      out[f] = lerp(a[1], b[1], u);
+      out.arms.push({ sh: sh, elbow: elbow, wrist: wrist });
     }
     return out;
+  };
+
+  /* ---- live rasterisation --------------------------------------------
+   * Straight into the framebuffer, in device pixels, every frame. Each part
+   * is drawn twice: an expanded pass in a shadow tone, then the part
+   * itself. That rim is what separates a near limb from whatever is behind
+   * it -- the job an outline pass did when these were baked bitmaps.
+   */
+  function Painter(g) {
+    this.g = g;
+    this.cv = { w: g.w, h: g.h, data: g.buf, part: null, partId: 0 };
+    this.s = g.s;
   }
-
-  P.CLIPS = CLIPS;
-  P.expandClip = expand;
-  P.pz = pz;
-})(POP);
-
-/* ===== src/game/frames.js ===== */
-/*
- * frames.js -- the baked frame table.
- *
- * Mirrors the original FRAMEDEF: a flat, numbered list of frames, each one
- * carrying a body image and (separately) a sword image. Sequences address
- * frames by number, so the sequence interpreter never knows what a clip is.
- *
- * Everything here runs once, at boot. Afterwards the game only blits.
- */
-var POP = POP || {};
-(function (P) {
-  'use strict';
-
-  // Order matters only in that it fixes the frame numbering; sequences are
-  // resolved through CLIP_BASE so the numbers stay an implementation detail.
-  var CLIP_ORDER = [
-    'stand', 'alertstand', 'startrun', 'runcyc', 'runstop', 'turn',
-    'standjump', 'runjump', 'jumpup', 'hang', 'hangstraight', 'hangdrop',
-    'climbup', 'freefall', 'softland', 'hardland', 'crouch', 'step',
-    'bump', 'drink',
-    'engarde', 'ready', 'advance', 'retreat', 'strike', 'block',
-    'stabbed', 'dead'
-  ];
-
-  /* Build the whole frame table for one wardrobe. Returns
-   * { frames:[{img, sword}], base:{clip->firstIndex}, count:{clip->n} } */
-  function buildFrameTable(skinName) {
-    var sk = P.SKINS[skinName];
-    var frames = [];
-    var base = {};
-    var count = {};
-
-    for (var ci = 0; ci < CLIP_ORDER.length; ci++) {
-      var name = CLIP_ORDER[ci];
-      var clip = P.CLIPS[name];
-      if (!clip) continue;
-      var poses = P.expandClip(clip);
-      base[name] = frames.length;
-      count[name] = poses.length;
-      for (var i = 0; i < poses.length; i++) {
-        var pose = poses[i];
-        var body = P.Rig.bakePose(pose, sk, {});
-        // sword angle: authored where it matters, otherwise follow the
-        // forearm so an armed prince carries the blade naturally
-        var ang = null;
-        if (clip.sword && clip.sword.length) {
-          ang = clip.sword[Math.min(i, clip.sword.length - 1)];
-          if (ang === undefined) ang = null;
-        }
-        if (ang === null || ang === undefined) ang = pose[7];
-        var sword = P.Rig.bakeSword(pose, ang);
-        frames.push({ img: body, sword: sword });
+  Painter.prototype.cap = function (a, b, r0, r1, col) {
+    var s = this.s;
+    R.capsule(this.cv, a[0] * s, a[1] * s, b[0] * s, b[1] * s, r0 * s, r1 * s, col);
+  };
+  Painter.prototype.disc = function (a, r, col) {
+    var s = this.s;
+    R.disc(this.cv, a[0] * s, a[1] * s, r * s, col);
+  };
+  Painter.prototype.poly = function (pts, col) {
+    var s = this.s, f = [];
+    for (var i = 0; i < pts.length; i++) { f.push(pts[i][0] * s, pts[i][1] * s); }
+    R.fillPoly(this.cv, f, col);
+  };
+  Painter.prototype.limb = function (a, b, radii, col, rim) {
+    var n = radii.length, i;
+    if (rim !== undefined) {
+      for (i = 0; i < n - 1; i++) {
+        this.cap(mix(a, b, i / (n - 1)), mix(a, b, (i + 1) / (n - 1)),
+          radii[i] + 0.7, radii[i + 1] + 0.7, rim);
       }
     }
-    return { frames: frames, base: base, count: count };
-  }
-
-  /* A colour table that turns the prince's bitmaps into a guard's. The
-   * original halved its sprite budget by mirroring frames; this is the same
-   * instinct applied to palette instead of geometry. */
-  function buildWardrobeMap(from, to) {
-    var m = new Uint8Array(64);
-    for (var i = 0; i < 64; i++) m[i] = i;
-    var keys = ['clothD', 'clothM', 'clothL', 'clothH',
-                'skinD', 'skinM', 'skinL', 'hair', 'hair2',
-                'sashD', 'sashM', 'bootD', 'bootM'];
-    for (var k = 0; k < keys.length; k++) {
-      var a = from[keys[k]], b = to[keys[k]];
-      if (a && b) m[a] = b;
+    for (i = 0; i < n - 1; i++) {
+      this.cap(mix(a, b, i / (n - 1)), mix(a, b, (i + 1) / (n - 1)), radii[i], radii[i + 1], col);
     }
-    return m;
-  }
+  };
+  Painter.prototype.oval = function (c, rx, ry, ang, col) {
+    var d = [Math.cos(ang * D2R), Math.sin(ang * D2R)], n = [-d[1], d[0]], pts = [];
+    for (var i = 0; i < 16; i++) {
+      var t = i / 16 * TAU, u = Math.cos(t) * ry, v = Math.sin(t) * rx;
+      pts.push([c[0] + d[0] * u + n[0] * v, c[1] + d[1] * u + n[1] * v]);
+    }
+    this.poly(pts, col);
+  };
 
-  P.buildFrameTable = buildFrameTable;
-  P.buildWardrobeMap = buildWardrobeMap;
-  P.CLIP_ORDER = CLIP_ORDER;
+  function mix(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; }
+  function add(p, d, k) { return [p[0] + d[0] * k, p[1] + d[1] * k]; }
+  function dirv(ang) { return [Math.cos(ang * D2R), Math.sin(ang * D2R)]; }
+
+  Figure.prototype.draw = function (g) {
+    var pt = new Painter(g);
+    var sk = this.skin;
+    var q = this.pose();
+    var fw = this.facing;
+
+    // far side first
+    this.drawLeg(pt, q.legs[0], sk, true, fw);
+    this.drawArm(pt, q.arms[0], sk, true, fw);
+    this.drawTorso(pt, q, sk, fw);
+    this.drawHead(pt, q, sk, fw);
+    this.drawLeg(pt, q.legs[1], sk, false, fw);
+    this.drawArm(pt, q.arms[1], sk, false, fw);
+    if (this.armed) this.drawBlade(pt, q.arms[1].wrist, sk, fw);
+  };
+
+  Figure.prototype.drawLeg = function (pt, lg, sk, far, fw) {
+    var cloth = far ? sk.clothD : sk.clothM;
+    var hi = far ? sk.clothM : sk.clothL;
+    var skin = far ? sk.skinM : sk.skinL;
+    var rim = far ? null : sk.clothD;
+    pt.limb(lg.hip, lg.knee, [3.4, 3.1, 2.4], cloth, rim === null ? undefined : rim);
+    var mid = mix(lg.knee, lg.ankle, 0.58);
+    pt.limb(lg.knee, mid, [2.4, 2.6], cloth, rim === null ? undefined : rim);
+    pt.limb(mid, lg.ankle, [2.1, 1.5], skin);
+    void hi;
+    // foot: a wedge, aligned to the contact angle
+    var fa = fw < 0 ? 180 - lg.angle : lg.angle;
+    var d = dirv(fa), u = [d[1], -d[0]];        // u points up out of the sole
+    var A = lg.ankle;
+    pt.poly([
+      add(add(A, d, -1.8), u, 1.3),
+      add(add(A, d, 1.0), u, 1.2),
+      add(add(A, d, L.foot * 0.6), u, 0.4),
+      add(add(A, d, L.foot - 0.4), u, -0.9),
+      add(add(A, d, L.foot - 0.6), u, -1.7),
+      add(add(A, d, -1.7), u, -1.7)
+    ], skin);
+  };
+
+  Figure.prototype.drawArm = function (pt, a, sk, far, fw) {
+    var sleeve = far ? sk.clothD : sk.clothL;
+    var skin = far ? sk.skinD : sk.skinL;
+    var rim = far ? undefined : sk.clothD;
+    pt.disc(a.sh, L.shoulderW, sleeve);
+    var se = mix(a.sh, a.elbow, 0.55);
+    pt.limb(a.sh, se, [2.7, 2.6], sleeve, rim);
+    pt.limb(se, a.elbow, [2.2, 1.8], skin, rim);
+    pt.limb(a.elbow, a.wrist, [1.9, 2.0, 1.4], skin, rim);
+    var fa = Math.atan2(-(a.wrist[1] - a.elbow[1]), a.wrist[0] - a.elbow[0]) * R2D;
+    pt.oval(add(a.wrist, dirv(fa), 1.2), 1.25, 1.7, fa, skin);
+  };
+
+  Figure.prototype.drawTorso = function (pt, q, sk, fw) {
+    var axis = dirv(q.leanA), fwd = dirv(q.leanA + 90 * fw);
+    var hip = [q.hipX, q.hipY];
+    function P(u, perp) { return add(add(hip, axis, u * L.torso), fwd, perp); }
+    pt.poly([
+      P(-0.06, 2.7), P(0.26, 2.1), P(0.58, 3.1), P(0.84, 3.2), P(1.02, 2.2),
+      P(1.04, -2.3), P(0.86, -3.1), P(0.56, -3.0), P(0.26, -2.3), P(-0.06, -2.9)
+    ], sk.clothM);
+    pt.poly([
+      P(0.30, 2.0), P(0.58, 3.0), P(0.84, 3.1), P(1.0, 2.1),
+      P(0.98, 0.4), P(0.60, 0.7), P(0.32, 0.2)
+    ], sk.clothL);
+    pt.disc(hip, 3.0, sk.clothM);
+    var w0 = P(0.10, 0), w1 = P(0.30, 0);
+    pt.cap(w0, w1, 2.9, 3.0, sk.sashM);
+    pt.cap(w0, w1, 2.2, 2.3, sk.sashD);
+  };
+
+  Figure.prototype.drawHead = function (pt, q, sk, fw) {
+    var headA = q.headA, fwd = dirv(headA + 90 * fw), up = dirv(headA);
+    var hc = q.headC;
+    pt.cap(q.neck, add(hc, up, -L.headH * 0.82), 1.7, 1.6, sk.skinM);
+    pt.oval(hc, L.headW, L.headH, headA, sk.skinL);
+    pt.oval(add(add(hc, up, -1.4), fwd, 1.0), 2.5, 2.9, headA, sk.skinL);
+    pt.disc(add(add(hc, fwd, L.headW * 0.86), up, 0.2), 1.05, sk.skinL);
+    if (sk.helmet) {
+      pt.oval(add(hc, up, 0.9), L.headW * 1.02, L.headH * 0.78, headA, sk.helmet);
+      pt.disc(add(hc, dirv(headA - 90 * fw), 2.4), 2.4, C.STEEL_D);
+    } else {
+      pt.oval(add(hc, up, 0.55), L.headW, L.headH * 0.84, headA, sk.hair);
+      var nape = add(add(hc, dirv(headA - 90 * fw), 2.2), up, -1.3);
+      pt.oval(nape, 1.8, 2.3, headA, sk.hair);
+      pt.poly([
+        add(add(hc, fwd, 0.2), up, 2.6),
+        add(add(hc, fwd, L.headW * 0.95), up, 0.9),
+        add(add(hc, fwd, L.headW * 0.95), up, -1.8),
+        add(add(hc, fwd, 1.4), up, -4.0),
+        add(add(hc, fwd, -0.4), up, -2.0)
+      ], sk.skinL);
+    }
+    pt.disc(add(add(hc, fwd, L.headW * 0.60), up, 0.55), 0.72, C.OUTLINE);
+  };
+
+  Figure.prototype.drawBlade = function (pt, wrist, sk, fw) {
+    var ang = fw < 0 ? 180 - this.bladeA.v : this.bladeA.v;
+    var d = dirv(ang);
+    pt.cap(add(wrist, d, -2.4), add(wrist, d, 21), 1.5, 0.8, C.STEEL_L);
+    pt.cap(add(wrist, dirv(ang + 90), 2.6), add(wrist, dirv(ang - 90), 2.6), 1.0, 1.0, C.GOLD);
+  };
+
+  P.Figure = Figure;
+  P.FigureL = L;
+  P.Spring = Spring;
+  P.ik2 = ik2;
+  void len;
 })(POP);
 
 /* ===== src/game/seq.js ===== */
@@ -1657,6 +1284,30 @@ var POP = POP || {};
     var out = [];
     for (var i = 0; i < arguments.length; i++) out = out.concat(arguments[i]);
     return out;
+  }
+
+  /* Move lengths, in ticks. This is all that survives of what used to be a
+   * pose library: how long each move takes and how far it carries you. The
+   * *appearance* of a move is no longer data at all -- figure.js solves it
+   * from continuous state -- so there are no frames here to point at, only
+   * durations to schedule against.
+   */
+  var CLIP_LENGTHS = {
+    stand: 1, alertstand: 1, startrun: 6, runcyc: 8, runstop: 4, turn: 8,
+    standjump: 18, runjump: 11, jumpup: 9, hang: 12, hangstraight: 1,
+    hangdrop: 6, climbup: 15, freefall: 4, softland: 4, hardland: 8,
+    crouch: 1, step: 8, bump: 5, drink: 10,
+    engarde: 5, ready: 4, advance: 4, retreat: 4, strike: 4, block: 3,
+    stabbed: 6, dead: 5
+  };
+
+  function moveTable() {
+    var base = {}, count = {}, n = 0;
+    for (var k in CLIP_LENGTHS) {
+      if (!CLIP_LENGTHS.hasOwnProperty(k)) continue;
+      base[k] = n; count[k] = CLIP_LENGTHS[k]; n += CLIP_LENGTHS[k];
+    }
+    return { base: base, count: count };
   }
 
   /* ---- the table ----------------------------------------------------
@@ -2012,6 +1663,8 @@ var POP = POP || {};
     return { code: new Int16Array(code), start: seqStart, owner: owner };
   }
 
+  P.CLIP_LENGTHS = CLIP_LENGTHS;
+  P.moveTable = moveTable;
   P.OP = OP;
   P.ACT = ACT;
   P.SEQ = SEQ;
@@ -2496,7 +2149,6 @@ var POP = POP || {};
   function Char(game, kind) {
     this.game = game;
     this.kind = kind;              // 'kid' | 'guard'
-    this.ft = kind === 'kid' ? game.ftKid : game.ftGuard;
     this.x = 0;
     this.y = FLOOR0;
     this.facing = 1;
@@ -2514,6 +2166,7 @@ var POP = POP || {};
     this.alive = true;
     this.ctrl = { left: 0, right: 0, up: 0, down: 0, shift: 0 };
     this.hurtFlash = 0;
+    this.prevX = 0; this.prevY = 0;
     this.startSeq('stand');
   }
 
@@ -2642,6 +2295,9 @@ var POP = POP || {};
   /* One game tick. */
   Char.prototype.tick = function () {
     if (this.hurtFlash > 0) this.hurtFlash--;
+    // remembered so the renderer can interpolate between logic ticks; the
+    // sequence table steps at 20Hz but the figure is drawn at display rate
+    this.prevX = this.x; this.prevY = this.y;
 
     if (this.action === ACT.FREEFALL) {
       this.fallTick();
@@ -2841,10 +2497,25 @@ var POP = POP || {};
     this.startSeq('hang');
   };
 
-  /* Sprite reference point and the current pair of bitmaps. */
-  Char.prototype.sprites = function () {
-    var f = this.ft.frames[this.frame];
-    return f || this.ft.frames[0];
+  /* ---- what the procedural figure needs to know ----------------------
+   * The sequence table still decides *where* the body goes and which move
+   * it is committed to. It no longer decides what the body looks like --
+   * that is solved from these continuous signals instead of looked up.
+   */
+  var REACHING = { hang: 1, hangstraight: 1, hangdrop: 1, jumpup: 1 };
+  var FIGHTING = { engarde: 1, ready: 1, advance: 1, retreat: 1, strike: 1, block: 1 };
+
+  Char.prototype.figureCmd = function () {
+    var s = this.seqName;
+    return {
+      move: this.facing,
+      airborne: this.action === ACT.FREEFALL || this.action === ACT.INAIR,
+      crouch: s === 'crouch' ? 1 : (s === 'softland' || s === 'medland' || s === 'hardland') ? 0.7 : 0,
+      reach: REACHING[s] ? 1 : (s === 'climbup' ? 0.6 : 0),
+      guard: this.armed && !!FIGHTING[s],
+      thrust: s === 'strike' ? 1 : 0,
+      dead: !this.alive
+    };
   };
 
   P.Char = Char;
@@ -3038,21 +2709,22 @@ var POP = POP || {};
     this.shake = 0;
     this.flash = 0;
 
-    this.ftKid = P.buildFrameTable('prince');
-    this.ftGuard = this.ftKid;          // same bitmaps, different wardrobe
-    this.guardMap = P.buildWardrobeMap(P.SKINS.prince, P.SKINS.guard);
-    this.seq = P.assembleSeq(this.ftKid);
+    /* No sprite tables anywhere. The sequence table is assembled against
+     * move durations alone; the characters' appearance is solved live. */
+    this.seq = P.assembleSeq(P.moveTable());
 
     this.level = new P.Level(P.LEVEL1);
     this.audio = new P.Audio();
 
     this.kid = new P.Char(this, 'kid');
+    this.kid.fig = new P.Figure(P.SKINS.prince);
     var st = P.LEVEL1.start;
     this.kid.room = st.room;
     this.kid.x = st.col * GEO.TILE_W + 16;
     this.kid.y = GEO.floorY(st.row);
     this.kid.facing = st.facing;
     this.kid.startSeq('stand');
+    this.kid.fig.teleport(this.kid.x, this.kid.y);
 
     this.guards = [];
     this.spawnGuards();
@@ -3076,6 +2748,7 @@ var POP = POP || {};
       for (var i = 0; i < defs.length; i++) {
         var d = defs[i];
         var gd = new P.Char(this, 'guard');
+        gd.fig = new P.Figure(P.SKINS.guard);
         gd.room = +id;
         gd.x = d.col * GEO.TILE_W + 16;
         gd.y = GEO.floorY(d.row);
@@ -3084,6 +2757,7 @@ var POP = POP || {};
         gd.hp = gd.maxHp = 3;
         gd.ai = { cool: 0, engaged: false };
         gd.startSeq('alertstand');
+        gd.fig.teleport(gd.x, gd.y);
         this.guards.push(gd);
       }
     }
@@ -3301,6 +2975,7 @@ var POP = POP || {};
     var st = P.LEVEL1.start;
     this.level = new P.Level(P.LEVEL1);
     this.kid = new P.Char(this, 'kid');
+    this.kid.fig = new P.Figure(P.SKINS.prince);
     this.kid.room = st.room;
     this.kid.x = st.col * GEO.TILE_W + 16;
     this.kid.y = GEO.floorY(st.row);
@@ -3316,33 +2991,37 @@ var POP = POP || {};
 
   /* ---- render -------------------------------------------------------- */
 
-  Game.prototype.drawChar = function (ch) {
-    var g = this.g;
-    var f = ch.sprites();
-    if (!f) return;
-    var x = Math.round(ch.x), y = Math.round(ch.y);
-    var flip = ch.facing < 0;
-    var map = null;
-    if (ch.hurtFlash > 0 && (this.t & 1)) map = this.hurtMap || (this.hurtMap = buildHurtMap());
-    else if (ch.kind === 'guard') map = this.guardMap;
-    if (map) {
-      g.blitRemap(f.img, x, y, flip, map, null, 0, PLAYFIELD_H);
-      if (ch.armed) g.blitRemap(f.sword, x, y, flip, map, null, 0, PLAYFIELD_H);
-      return;
+  /* Drive the procedural figure from the character's continuous state and
+   * draw it live. `alpha` is the fraction through the current logic tick,
+   * so the body is rendered at display rate even though the sequence table
+   * still steps at 20Hz -- the pose is a function of time, not a frame. */
+  Game.prototype.drawChar = function (ch, alpha, dt) {
+    var fig = ch.fig;
+    if (!fig) return;
+    var x = ch.prevX + (ch.x - ch.prevX) * alpha;
+    var y = ch.prevY + (ch.y - ch.prevY) * alpha;
+    /* A room cut, a climb's chy,-63 or a respawn moves the body instantly.
+     * Interpolating across that would smear it, and -- worse -- the figure's
+     * feet are pinned in world space, so they must be re-pinned or the legs
+     * try to reach back to where the body used to be. */
+    var jumped = Math.abs(ch.x - ch.prevX) > 40 || Math.abs(ch.y - ch.prevY) > 40;
+    if (jumped || fig.lastRoom !== ch.room) {
+      x = ch.x; y = ch.y;
+      fig.teleport(x, y);
+      fig.lastRoom = ch.room;
     }
-    g.blit(f.img, x, y, flip, null, 0, PLAYFIELD_H);
-    if (ch.armed) g.blit(f.sword, x, y, flip, null, 0, PLAYFIELD_H);
+
+    fig.x = x;
+    fig.y = y;
+    fig.facing = ch.facing;
+    fig.vx = (ch.x - ch.prevX) * TICK_HZ;
+    fig.armed = ch.armed;
+    fig.setGround(y);
+    fig.update(dt, ch.figureCmd());
+    fig.draw(this.g);
   };
 
-  function buildHurtMap() {
-    var m = new Uint8Array(64);
-    for (var i = 0; i < 64; i++) m[i] = i;
-    // everything but the outline goes hot -- a palette trick, no extra art
-    for (var j = 1; j < 40; j++) if (j !== C.OUTLINE) m[j] = C.RED_M;
-    return m;
-  }
-
-  Game.prototype.render = function () {
+  Game.prototype.render = function (alpha, dt) {
     var g = this.g;
     var room = this.kid.room;
     if (this.roomDirty || room !== this.curRoom) {
@@ -3354,9 +3033,9 @@ var POP = POP || {};
     this.level.renderDynamic(g, room, this.t);
 
     for (var i = 0; i < this.guards.length; i++) {
-      if (this.guards[i].room === room) this.drawChar(this.guards[i]);
+      if (this.guards[i].room === room) this.drawChar(this.guards[i], alpha, dt);
     }
-    this.drawChar(this.kid);
+    this.drawChar(this.kid, alpha, dt);
 
     this.drawHud();
 
@@ -3402,14 +3081,14 @@ var POP = POP || {};
     if (!this.last) this.last = now;
     var dt = Math.min(250, now - this.last);
     this.last = now;
-    var drew = false;
     if (!this.paused) {
       this.acc += dt;
       var step = 1000 / TICK_HZ;
       var n = 0;
-      while (this.acc >= step && n < 5) { this.tick(); this.acc -= step; n++; drew = true; }
+      while (this.acc >= step && n < 5) { this.tick(); this.acc -= step; n++; }
     }
-    if (drew || !this.everDrew) { this.render(); this.everDrew = true; }
+    // the figure is solved every displayed frame, so render at display rate
+    this.render(Math.min(1, this.acc / (1000 / TICK_HZ)), Math.min(0.05, dt / 1000));
   };
 
   Game.prototype.setInput = function (k, v) {

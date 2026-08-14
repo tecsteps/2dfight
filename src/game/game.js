@@ -29,21 +29,22 @@ var POP = POP || {};
     this.shake = 0;
     this.flash = 0;
 
-    this.ftKid = P.buildFrameTable('prince');
-    this.ftGuard = this.ftKid;          // same bitmaps, different wardrobe
-    this.guardMap = P.buildWardrobeMap(P.SKINS.prince, P.SKINS.guard);
-    this.seq = P.assembleSeq(this.ftKid);
+    /* No sprite tables anywhere. The sequence table is assembled against
+     * move durations alone; the characters' appearance is solved live. */
+    this.seq = P.assembleSeq(P.moveTable());
 
     this.level = new P.Level(P.LEVEL1);
     this.audio = new P.Audio();
 
     this.kid = new P.Char(this, 'kid');
+    this.kid.fig = new P.Figure(P.SKINS.prince);
     var st = P.LEVEL1.start;
     this.kid.room = st.room;
     this.kid.x = st.col * GEO.TILE_W + 16;
     this.kid.y = GEO.floorY(st.row);
     this.kid.facing = st.facing;
     this.kid.startSeq('stand');
+    this.kid.fig.teleport(this.kid.x, this.kid.y);
 
     this.guards = [];
     this.spawnGuards();
@@ -67,6 +68,7 @@ var POP = POP || {};
       for (var i = 0; i < defs.length; i++) {
         var d = defs[i];
         var gd = new P.Char(this, 'guard');
+        gd.fig = new P.Figure(P.SKINS.guard);
         gd.room = +id;
         gd.x = d.col * GEO.TILE_W + 16;
         gd.y = GEO.floorY(d.row);
@@ -75,6 +77,7 @@ var POP = POP || {};
         gd.hp = gd.maxHp = 3;
         gd.ai = { cool: 0, engaged: false };
         gd.startSeq('alertstand');
+        gd.fig.teleport(gd.x, gd.y);
         this.guards.push(gd);
       }
     }
@@ -292,6 +295,7 @@ var POP = POP || {};
     var st = P.LEVEL1.start;
     this.level = new P.Level(P.LEVEL1);
     this.kid = new P.Char(this, 'kid');
+    this.kid.fig = new P.Figure(P.SKINS.prince);
     this.kid.room = st.room;
     this.kid.x = st.col * GEO.TILE_W + 16;
     this.kid.y = GEO.floorY(st.row);
@@ -307,33 +311,37 @@ var POP = POP || {};
 
   /* ---- render -------------------------------------------------------- */
 
-  Game.prototype.drawChar = function (ch) {
-    var g = this.g;
-    var f = ch.sprites();
-    if (!f) return;
-    var x = Math.round(ch.x), y = Math.round(ch.y);
-    var flip = ch.facing < 0;
-    var map = null;
-    if (ch.hurtFlash > 0 && (this.t & 1)) map = this.hurtMap || (this.hurtMap = buildHurtMap());
-    else if (ch.kind === 'guard') map = this.guardMap;
-    if (map) {
-      g.blitRemap(f.img, x, y, flip, map, null, 0, PLAYFIELD_H);
-      if (ch.armed) g.blitRemap(f.sword, x, y, flip, map, null, 0, PLAYFIELD_H);
-      return;
+  /* Drive the procedural figure from the character's continuous state and
+   * draw it live. `alpha` is the fraction through the current logic tick,
+   * so the body is rendered at display rate even though the sequence table
+   * still steps at 20Hz -- the pose is a function of time, not a frame. */
+  Game.prototype.drawChar = function (ch, alpha, dt) {
+    var fig = ch.fig;
+    if (!fig) return;
+    var x = ch.prevX + (ch.x - ch.prevX) * alpha;
+    var y = ch.prevY + (ch.y - ch.prevY) * alpha;
+    /* A room cut, a climb's chy,-63 or a respawn moves the body instantly.
+     * Interpolating across that would smear it, and -- worse -- the figure's
+     * feet are pinned in world space, so they must be re-pinned or the legs
+     * try to reach back to where the body used to be. */
+    var jumped = Math.abs(ch.x - ch.prevX) > 40 || Math.abs(ch.y - ch.prevY) > 40;
+    if (jumped || fig.lastRoom !== ch.room) {
+      x = ch.x; y = ch.y;
+      fig.teleport(x, y);
+      fig.lastRoom = ch.room;
     }
-    g.blit(f.img, x, y, flip, null, 0, PLAYFIELD_H);
-    if (ch.armed) g.blit(f.sword, x, y, flip, null, 0, PLAYFIELD_H);
+
+    fig.x = x;
+    fig.y = y;
+    fig.facing = ch.facing;
+    fig.vx = (ch.x - ch.prevX) * TICK_HZ;
+    fig.armed = ch.armed;
+    fig.setGround(y);
+    fig.update(dt, ch.figureCmd());
+    fig.draw(this.g);
   };
 
-  function buildHurtMap() {
-    var m = new Uint8Array(64);
-    for (var i = 0; i < 64; i++) m[i] = i;
-    // everything but the outline goes hot -- a palette trick, no extra art
-    for (var j = 1; j < 40; j++) if (j !== C.OUTLINE) m[j] = C.RED_M;
-    return m;
-  }
-
-  Game.prototype.render = function () {
+  Game.prototype.render = function (alpha, dt) {
     var g = this.g;
     var room = this.kid.room;
     if (this.roomDirty || room !== this.curRoom) {
@@ -345,9 +353,9 @@ var POP = POP || {};
     this.level.renderDynamic(g, room, this.t);
 
     for (var i = 0; i < this.guards.length; i++) {
-      if (this.guards[i].room === room) this.drawChar(this.guards[i]);
+      if (this.guards[i].room === room) this.drawChar(this.guards[i], alpha, dt);
     }
-    this.drawChar(this.kid);
+    this.drawChar(this.kid, alpha, dt);
 
     this.drawHud();
 
@@ -393,14 +401,14 @@ var POP = POP || {};
     if (!this.last) this.last = now;
     var dt = Math.min(250, now - this.last);
     this.last = now;
-    var drew = false;
     if (!this.paused) {
       this.acc += dt;
       var step = 1000 / TICK_HZ;
       var n = 0;
-      while (this.acc >= step && n < 5) { this.tick(); this.acc -= step; n++; drew = true; }
+      while (this.acc >= step && n < 5) { this.tick(); this.acc -= step; n++; }
     }
-    if (drew || !this.everDrew) { this.render(); this.everDrew = true; }
+    // the figure is solved every displayed frame, so render at display rate
+    this.render(Math.min(1, this.acc / (1000 / TICK_HZ)), Math.min(0.05, dt / 1000));
   };
 
   Game.prototype.setInput = function (k, v) {

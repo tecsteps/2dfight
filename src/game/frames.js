@@ -71,6 +71,22 @@ var POP = POP || {};
     return m;
   }
 
+  /* The sequence table addresses frames by number, a holdover from the
+   * original's FRAMEDEF. Nothing is baked any more, but the assembler still
+   * needs each clip's length to resolve those slots, so hand it the clip
+   * lengths alone -- no bitmaps, no bake, no memory. */
+  function nominalFrameTable() {
+    var base = {}, count = {}, n = 0;
+    for (var i = 0; i < CLIP_ORDER.length; i++) {
+      var name = CLIP_ORDER[i], clip = P.CLIPS[name];
+      if (!clip) continue;
+      var len = clip.frames ? clip.frames.length : clip.n;
+      base[name] = n; count[name] = len; n += len;
+    }
+    return { frames: [], base: base, count: count };
+  }
+
+  P.nominalFrameTable = nominalFrameTable;
   P.buildFrameTable = buildFrameTable;
   P.buildWardrobeMap = buildWardrobeMap;
   P.CLIP_ORDER = CLIP_ORDER;

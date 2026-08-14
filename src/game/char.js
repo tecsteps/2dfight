@@ -32,7 +32,6 @@ var POP = POP || {};
   function Char(game, kind) {
     this.game = game;
     this.kind = kind;              // 'kid' | 'guard'
-    this.ft = kind === 'kid' ? game.ftKid : game.ftGuard;
     this.x = 0;
     this.y = FLOOR0;
     this.facing = 1;
@@ -50,6 +49,7 @@ var POP = POP || {};
     this.alive = true;
     this.ctrl = { left: 0, right: 0, up: 0, down: 0, shift: 0 };
     this.hurtFlash = 0;
+    this.prevX = 0; this.prevY = 0;
     this.startSeq('stand');
   }
 
@@ -178,6 +178,9 @@ var POP = POP || {};
   /* One game tick. */
   Char.prototype.tick = function () {
     if (this.hurtFlash > 0) this.hurtFlash--;
+    // remembered so the renderer can interpolate between logic ticks; the
+    // sequence table steps at 20Hz but the figure is drawn at display rate
+    this.prevX = this.x; this.prevY = this.y;
 
     if (this.action === ACT.FREEFALL) {
       this.fallTick();
@@ -377,10 +380,25 @@ var POP = POP || {};
     this.startSeq('hang');
   };
 
-  /* Sprite reference point and the current pair of bitmaps. */
-  Char.prototype.sprites = function () {
-    var f = this.ft.frames[this.frame];
-    return f || this.ft.frames[0];
+  /* ---- what the procedural figure needs to know ----------------------
+   * The sequence table still decides *where* the body goes and which move
+   * it is committed to. It no longer decides what the body looks like --
+   * that is solved from these continuous signals instead of looked up.
+   */
+  var REACHING = { hang: 1, hangstraight: 1, hangdrop: 1, jumpup: 1 };
+  var FIGHTING = { engarde: 1, ready: 1, advance: 1, retreat: 1, strike: 1, block: 1 };
+
+  Char.prototype.figureCmd = function () {
+    var s = this.seqName;
+    return {
+      move: this.facing,
+      airborne: this.action === ACT.FREEFALL || this.action === ACT.INAIR,
+      crouch: s === 'crouch' ? 1 : (s === 'softland' || s === 'medland' || s === 'hardland') ? 0.7 : 0,
+      reach: REACHING[s] ? 1 : (s === 'climbup' ? 0.6 : 0),
+      guard: this.armed && !!FIGHTING[s],
+      thrust: s === 'strike' ? 1 : 0,
+      dead: !this.alive
+    };
   };
 
   P.Char = Char;

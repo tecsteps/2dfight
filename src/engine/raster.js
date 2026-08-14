@@ -72,7 +72,7 @@ var POP = POP || {};
   function span(cv, y, xa, xb, color) {
     var o = y * cv.w;
     cv.data.fill(color, o + xa, o + xb + 1);
-    cv.part.fill(cv.partId, o + xa, o + xb + 1);
+    if (cv.part) cv.part.fill(cv.partId, o + xa, o + xb + 1);
   }
 
   function disc(cv, cx, cy, r, color) {

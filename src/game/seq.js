@@ -78,6 +78,30 @@ var POP = POP || {};
     return out;
   }
 
+  /* Move lengths, in ticks. This is all that survives of what used to be a
+   * pose library: how long each move takes and how far it carries you. The
+   * *appearance* of a move is no longer data at all -- figure.js solves it
+   * from continuous state -- so there are no frames here to point at, only
+   * durations to schedule against.
+   */
+  var CLIP_LENGTHS = {
+    stand: 1, alertstand: 1, startrun: 6, runcyc: 8, runstop: 4, turn: 8,
+    standjump: 18, runjump: 11, jumpup: 9, hang: 12, hangstraight: 1,
+    hangdrop: 6, climbup: 15, freefall: 4, softland: 4, hardland: 8,
+    crouch: 1, step: 8, bump: 5, drink: 10,
+    engarde: 5, ready: 4, advance: 4, retreat: 4, strike: 4, block: 3,
+    stabbed: 6, dead: 5
+  };
+
+  function moveTable() {
+    var base = {}, count = {}, n = 0;
+    for (var k in CLIP_LENGTHS) {
+      if (!CLIP_LENGTHS.hasOwnProperty(k)) continue;
+      base[k] = n; count[k] = CLIP_LENGTHS[k]; n += CLIP_LENGTHS[k];
+    }
+    return { base: base, count: count };
+  }
+
   /* ---- the table ----------------------------------------------------
    * Sequence names and structure mirror the original's list.
    */
@@ -431,6 +455,8 @@ var POP = POP || {};
     return { code: new Int16Array(code), start: seqStart, owner: owner };
   }
 
+  P.CLIP_LENGTHS = CLIP_LENGTHS;
+  P.moveTable = moveTable;
   P.OP = OP;
   P.ACT = ACT;
   P.SEQ = SEQ;
