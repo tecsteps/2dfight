@@ -56,6 +56,12 @@ var FX = FX || {};
   // the viewer *toward this direction*, which is what makes a lit side and a
   // dark side instead of a uniform glowing outline
   var BX = 0.66, BY = -0.34, BZ = -0.67;
+  /* A warm bounce off the floor. Every light in the rig came from above, so
+   * the underside of a raised limb fell to flat ambient and a lifted leg
+   * looked like it had been cut out of the picture. Real ground bounce is
+   * weak, warm, and comes from below-front. */
+  var OX = 0.15, OY = 0.80, OZ = 0.58;
+  var boR = 122, boG = 74, boB = 52, boK = 0.30;
 
   /* Highlight rolloff. A hard clamp at 255 turns every lit area brighter
    * than white into one flat plateau -- a white gi under a key light lost
@@ -160,6 +166,10 @@ var FX = FX || {};
       rim = rim * rim * rim * rb * m.rim * 2.0;
     }
 
+    // warm ground bounce
+    var bo = nx * OX + ny * OY + nz * OZ;
+    bo = bo > 0 ? bo * boK : 0;
+
     var occ = ao === undefined ? 1 : ao;
     // per-pixel ambient occlusion from the body's own masses
     var oa = this.occ;
@@ -179,11 +189,11 @@ var FX = FX || {};
 
     // radiance, with the albedo factored out of the ambient/key/fill sum --
     // three divisions per pixel used to live here
-    var r = (m.nr * (this.ambR + this.keyR * d + this.fillR * f)
+    var r = (m.nr * (this.ambR + this.keyR * d + this.fillR * f + boR * bo)
       + this.keyR * sp + this.rimR * rim + 62 * sss) * occ;
-    var g = (m.ng * (this.ambG + this.keyG * d + this.fillG * f)
+    var g = (m.ng * (this.ambG + this.keyG * d + this.fillG * f + boG * bo)
       + this.keyG * sp + this.rimG * rim + 26 * sss) * occ;
-    var b = (m.nb * (this.ambB + this.keyB * d + this.fillB * f)
+    var b = (m.nb * (this.ambB + this.keyB * d + this.fillB * f + boB * bo)
       + this.keyB * sp + this.rimB * rim + 14 * sss) * occ;
 
     if (this.tint > 0) {
@@ -294,6 +304,8 @@ var FX = FX || {};
         }
         var rim = 0, rb = nx * BX + ny * BY + nz * BZ;
         if (rb > 0) { rim = 1 - nz; rim = rim * rim * rim * rb * mrim * 2.0; }
+        var bo = nx * OX + ny * OY + nz * OZ;
+        bo = bo > 0 ? bo * boK : 0;
         var occ = ao;
         for (var oi = 0; oi < nOcc5; oi += 5) {
           var oz = occA[oi + 3];
@@ -305,9 +317,9 @@ var FX = FX || {};
           occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
         }
         var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
-        var cr = (mnr * (ambR + keyR * dd + fillR * ff) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
-        var cg = (mng * (ambG + keyG * dd + fillG * ff) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
-        var cb = (mnb * (ambB + keyB * dd + fillB * ff) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff + boR * bo) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff + boG * bo) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff + boB * bo) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
         if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
         if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
         if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);
@@ -422,6 +434,8 @@ var FX = FX || {};
         }
         var rim = 0, rb = nx * BX + ny * BY + nz * BZ;
         if (rb > 0) { rim = 1 - nz; rim = rim * rim * rim * rb * mrim * 2.0; }
+        var bo = nx * OX + ny * OY + nz * OZ;
+        bo = bo > 0 ? bo * boK : 0;
         var occ = ao;
         for (var oi = 0; oi < nOcc5; oi += 5) {
           var oz = occA[oi + 3];
@@ -433,9 +447,9 @@ var FX = FX || {};
           occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
         }
         var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
-        var cr = (mnr * (ambR + keyR * dd + fillR * ff) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
-        var cg = (mng * (ambG + keyG * dd + fillG * ff) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
-        var cb = (mnb * (ambB + keyB * dd + fillB * ff) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff + boR * bo) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff + boG * bo) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff + boB * bo) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
         if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
         if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
         if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);

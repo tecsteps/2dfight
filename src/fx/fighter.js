@@ -64,7 +64,13 @@ var FX = FX || {};
     var dx = bx - ax, dy = by - ay;
     var raw = Math.sqrt(dx * dx + dy * dy) || 0.0001;
     var d = raw;
-    var dmin = Math.abs(l1 - l2) + 0.01, dmax = l1 + l2 - 0.01;
+    /* Never let a joint reach full extension. At dmax = l1 + l2 the two
+     * segments go exactly collinear and the elbow or knee vanishes from the
+     * silhouette entirely -- an extended punch became one straight tube. A
+     * six-percent limit leaves about twelve degrees of flexion, which is
+     * both what a real joint does under load and enough to put a visible
+     * notch in the outline. */
+    var dmin = Math.abs(l1 - l2) + 0.01, dmax = (l1 + l2) * 0.94;
     if (d < dmin) d = dmin; else if (d > dmax) d = dmax;
     var ux = dx / raw, uy = dy / raw;
     var a = (l1 * l1 - l2 * l2 + d * d) / (2 * d);
@@ -637,6 +643,11 @@ var FX = FX || {};
       e2.vy += (-hy2 * hk) / Math.max(dt, 0.0001) * 0.30;
       // never let a panel swing above the belt
       if (e2.y < hemAy + 8) { e2.y = hemAy + 8; if (e2.vy < 0) e2.vy = 0; }
+      // and never further out than it is long -- cloth hangs, it does not fly
+      var ox2 = e2.x - hemAx, oy2 = e2.y - hemAy;
+      var lim = Math.abs(oy2) * 1.1 + 6;
+      if (ox2 > lim) { e2.x = hemAx + lim; e2.vx *= 0.4; }
+      else if (ox2 < -lim) { e2.x = hemAx - lim; e2.vx *= 0.4; }
     }
 
     var bx = this.x - this.facing * 3, by = hipY + 3;

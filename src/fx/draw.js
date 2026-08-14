@@ -36,17 +36,18 @@ var FX = FX || {};
     // lipstick on both fighters and muddled the character read entirely.
     var lip = [Math.min(255, sk[0] * 0.95), sk[1] * 0.83, sk[2] * 0.80];
     return {
-      skin: F.mat(sk[0], sk[1], sk[2], 0.22, 30, 0.5, 1.0),
+      skin: F.mat(sk[0], sk[1], sk[2], 0.16, 16, 0.52, 1.0),
       // sockets, the underside of the jaw, the shadow beside the nose
       skinDark: F.mat(dark[0], dark[1], dark[2], 0.16, 24, 0.4, 1.0),
       skinDeep: F.mat(deep[0], deep[1], deep[2], 0.10, 18, 0.3, 0.9),
       // the planes that catch light: nose bridge, cheekbone, brow
-      skinLit: F.mat(lit[0], lit[1], lit[2], 0.30, 34, 0.6, 1.0),
+      skinLit: F.mat(lit[0], lit[1], lit[2], 0.20, 20, 0.6, 1.0),
       lip: F.mat(lip[0], lip[1], lip[2], 0.34, 26, 0.4, 0.8),
       sclera: F.mat(232, 228, 232, 0.30, 26, 0.25),
       iris: F.mat(46, 38, 52, 0.80, 64, 0.3),
-      gi: F.mat(o.gi[0], o.gi[1], o.gi[2], 0.02, 4, 0.34),
-      gi2: F.mat(o.gi2[0], o.gi2[1], o.gi2[2], 0.02, 4, 0.30),
+      // cloth has sheen at the edge, not a highlight in the middle
+      gi: F.mat(o.gi[0], o.gi[1], o.gi[2], 0.015, 3, 0.62),
+      gi2: F.mat(o.gi2[0], o.gi2[1], o.gi2[2], 0.015, 3, 0.54),
       trim: F.mat(o.trim[0], o.trim[1], o.trim[2], 0.16, 20, 0.5),
       /* Hair used to be spec 0.34 / gloss 34, which at this resolution put a
        * single hard highlight on the crown and made it read as moulded
@@ -60,10 +61,10 @@ var FX = FX || {};
        * chroma, so on a white gi the two legs fused into one shape from hip
        * to ankle and the far arm vanished into the chest during every
        * strike. Distance desaturates; it does not only darken. */
-      giFar: F.mat(o.gi[0] * 0.78 + 9, o.gi[1] * 0.78 + 10, o.gi[2] * 0.78 + 13, 0.02, 4, 0.30),
-      gi2Far: F.mat(o.gi2[0] * 0.78 + 9, o.gi2[1] * 0.78 + 10, o.gi2[2] * 0.78 + 13, 0.02, 4, 0.26),
-      skinFar: F.mat(sk[0] * 0.78 + 9, sk[1] * 0.78 + 10, sk[2] * 0.78 + 13, 0.16, 26, 0.40, 0.9),
-      trimFar: F.mat(o.trim[0] * 0.78 + 9, o.trim[1] * 0.78 + 10, o.trim[2] * 0.78 + 13, 0.12, 18, 0.40),
+      giFar: F.mat(o.gi[0] * 0.62 + 14, o.gi[1] * 0.62 + 15, o.gi[2] * 0.62 + 20, 0.02, 4, 0.26),
+      gi2Far: F.mat(o.gi2[0] * 0.62 + 14, o.gi2[1] * 0.62 + 15, o.gi2[2] * 0.62 + 20, 0.02, 4, 0.22),
+      skinFar: F.mat(sk[0] * 0.62 + 14, sk[1] * 0.62 + 15, sk[2] * 0.62 + 20, 0.14, 22, 0.34, 0.9),
+      trimFar: F.mat(o.trim[0] * 0.62 + 14, o.trim[1] * 0.62 + 15, o.trim[2] * 0.62 + 20, 0.10, 16, 0.34),
       name: o.name, tint: o.tint || [255, 210, 120],
       hairStyle: o.hairStyle,
       // per-character face proportions, so the two heads are not one head
@@ -221,7 +222,11 @@ var FX = FX || {};
     var hxv = e.x - b[0], hyv = e.y - b[1];
     var hl = Math.sqrt(hxv * hxv + hyv * hyv) || 1;
     var pxv = -hyv / hl, pyv = hxv / hl;              // across the panel
-    var wsp = 4.8;
+    /* Narrow the panel as it swings away from vertical. Swung out sideways
+     * during a sweep, a full-width panel presented its whole face edge-on
+     * and rendered as a hard-edged black parallelogram behind the leg. */
+    var upr = Math.max(0, hyv / hl);                  // 1 hanging, 0 horizontal
+    var wsp = 4.8 * (0.30 + 0.70 * upr);
     var h0 = [e.x - pxv * wsp - dir * 0.6, e.y - pyv * wsp];
     var h1 = [e.x + pxv * wsp + dir * 2.6, e.y + pyv * wsp];
     var z = back ? Z.farLeg + 5 : Z.nearLeg - 3.4;
@@ -248,12 +253,24 @@ var FX = FX || {};
      * segments overlap rather than butt together. Restarting a segment at a
      * different radius, one depth step in front of the last, left a hard
      * crescent of light at every knee and elbow. */
-    var mid = lerp(lg.knee, lg.ankle, 0.46);
-    sh.capsule(lg.hip[0], lg.hip[1], lg.knee[0], lg.knee[1], 8.2 * B, 6.4 * B, z, sk.gi, ao);
-    sh.capsule(lg.knee[0], lg.knee[1], mid[0], mid[1], 6.4 * B, 5.2 * B, z, sk.gi, ao);
-    // shin starts back inside the trouser cuff, at the cuff's own radius
-    var cuff = lerp(lg.knee, lg.ankle, 0.34);
-    sh.capsule(cuff[0], cuff[1], lg.ankle[0], lg.ankle[1], 5.2, 3.2, z, sk.skin, ao);
+    /* The leg's profile is deliberately non-monotonic.
+     *
+     * It used to taper straight from 8.2 at the hip to 3.2 at the ankle, so
+     * an extended kick was one smooth cone with no knee anywhere in the
+     * outline -- the shape carried no information about where the joint was
+     * or which way it bent. A real leg swells at the thigh, pinches at the
+     * knee, swells again at the calf a third of the way down the shin, then
+     * runs thin to the ankle. That silhouette is what makes a kick read. */
+    var thM = lerp(lg.hip, lg.knee, 0.45);
+    sh.capsule(lg.hip[0], lg.hip[1], thM[0], thM[1], 8.2 * B, 7.6 * B, z, sk.gi, ao);
+    sh.capsule(thM[0], thM[1], lg.knee[0], lg.knee[1], 7.6 * B, 5.0 * B, z, sk.gi, ao);
+    // trouser cuff just below the knee
+    var cuff = lerp(lg.knee, lg.ankle, 0.30);
+    sh.capsule(lg.knee[0], lg.knee[1], cuff[0], cuff[1], 5.0 * B, 5.6 * B, z, sk.gi, ao);
+    // calf: widest a third of the way down, starting inside the cuff
+    var calf = lerp(lg.knee, lg.ankle, 0.44);
+    sh.capsule(lg.knee[0], lg.knee[1], calf[0], calf[1], 4.6, 5.9, z, sk.skin, ao);
+    sh.capsule(calf[0], calf[1], lg.ankle[0], lg.ankle[1], 5.9, 2.8, z, sk.skin, ao);
     /* Foot. A single capsule off the ankle gave every character a rounded
      * stump, and a stump has no direction -- you cannot tell a planted foot
      * from a pointed one, which is most of what sells a kick. This is a
@@ -274,7 +291,12 @@ var FX = FX || {};
     var inst = ft(L.foot * 0.30, 2.0);
     sh.capsule(ank[0], ank[1] - 1.6, inst[0], inst[1], 3.4, 2.6, z - 1.4, sk.skin, ao);
     // ankle wrap
-    sh.sphere(lg.ankle[0], lg.ankle[1], 3.5, z - 1, sk.trim, ao);
+    /* Ankle wrap, in the character's trim colour and at a size that reads.
+     * A bare foot against a pale gi is a ten-percent value difference, so
+     * the foot had no ankle and every kick ended in a mitten. One banded
+     * primitive gives the leg a joint, a colour accent and a direction. */
+    var wrp = lerp(lg.knee, lg.ankle, 0.84);
+    sh.capsule(wrp[0], wrp[1], lg.ankle[0], lg.ankle[1], 3.6, 4.5, z - 1, sk.trim, ao);
   }
 
   function drawArm(sh, sk0, a, far, z, ao, fw) {
@@ -284,12 +306,19 @@ var FX = FX || {};
     // at a 7.0 front radius the capsule was still doing it.
     var delt = lerp(a.sh, a.elbow, 0.42);
     sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 5.8 * B, 5.2 * B, z + 1, sk.gi, ao);
-    var sleeve = lerp(a.sh, a.elbow, 0.60);
-    sh.capsule(a.sh[0], a.sh[1], sleeve[0], sleeve[1], 6.2 * B, 5.0 * B, z, sk.gi, ao);
-    // continuous radii through the sleeve cuff and the elbow
-    var cuf = lerp(a.sh, a.elbow, 0.50);
-    sh.capsule(cuf[0], cuf[1], a.elbow[0], a.elbow[1], 5.0, 4.2, z, sk.skin, ao);
-    sh.capsule(a.elbow[0], a.elbow[1], a.wrist[0], a.wrist[1], 4.2, 3.5, z, sk.skin, ao);
+    /* Same non-monotonic profile as the leg. A monotonic 6.2 -> 3.5 taper
+     * over the whole arm made every punch a single smooth sausage with the
+     * elbow invisible -- most obvious on the cross and the super, where the
+     * shoulder, elbow and wrist go nearly collinear. */
+    var bic = lerp(a.sh, a.elbow, 0.44);
+    sh.capsule(a.sh[0], a.sh[1], bic[0], bic[1], 5.8 * B, 6.6 * B, z, sk.gi, ao);
+    var scuf = lerp(a.sh, a.elbow, 0.68);
+    sh.capsule(bic[0], bic[1], scuf[0], scuf[1], 6.6 * B, 4.6 * B, z, sk.gi, ao);
+    // elbow, then the forearm flaring below it and running thin to the wrist
+    sh.capsule(scuf[0], scuf[1], a.elbow[0], a.elbow[1], 4.6 * B, 4.0 * B, z, sk.skin, ao);
+    var fa = lerp(a.elbow, a.wrist, 0.28);
+    sh.capsule(a.elbow[0], a.elbow[1], fa[0], fa[1], 4.0, 4.9, z, sk.skin, ao);
+    sh.capsule(fa[0], fa[1], a.wrist[0], a.wrist[1], 4.9, 2.9, z, sk.skin, ao);
     /* Wrist wrap and fist. A sphere on the end of the forearm is a ball,
      * and a ball has no knuckles and no direction -- a jab and a block ended
      * in exactly the same shape. A fist is a squarish block of knuckles
