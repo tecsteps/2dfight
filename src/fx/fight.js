@@ -106,7 +106,7 @@ var FX = FX || {};
     for (i = 0; i * BAY + 12 < W; i++) {
       var bx = (12 + i * BAY) * S, bw2 = 44 * S;
       var by = wallTop + 9 * S, bh2 = wallH - 20 * S;
-      bg.gradientV(bx, by, bw2, bh2, F.rgb(46, 33, 40), F.rgb(26, 19, 25));
+      bg.gradientV(bx, by, bw2, bh2, F.rgb(58, 42, 48), F.rgb(34, 25, 31));
       bg.fillRect(bx, by, bw2, 1.4 * S, F.rgb(84, 62, 62));          // lit lintel
       bg.fillRect(bx, by + bh2 - 1.4 * S, bw2, 1.4 * S, F.rgb(12, 8, 12));
       // a lit window deep in the bay
@@ -135,13 +135,19 @@ var FX = FX || {};
      * they cost one dark shape and one warm rim each. */
     for (i = 0; i * 11.6 < W + 12; i++) {
       var cx2 = (6 + i * 11.6 + hash(i, 21) * 5) * S;
-      var hh = (7 + hash(i, 5) * 3.5) * S;
-      var cy2 = wallTop - hh * 0.55;
+      if (hash(i, 53) < 0.10) continue;          // gaps along the rail
+      var hh = (6 + hash(i, 5) * 6.5) * S;       // and a real spread of heights
+      var cy2 = wallTop - hh * (0.42 + hash(i, 61) * 0.30);
       var bob = hash(i, 9);
-      bg.blendDisc(cx2, cy2 - hh * 0.5, hh * 0.42, 16, 11, 20, 0.94);      // head
-      bg.blendDisc(cx2, cy2 + hh * 0.35, hh * 0.66, 16, 11, 20, 0.94);     // shoulders
+      var lean2 = (hash(i, 71) - 0.5) * hh * 0.30;
+      bg.blendDisc(cx2 + lean2, cy2 - hh * 0.5, hh * 0.40, 16, 11, 20, 0.94);   // head
+      bg.blendDisc(cx2, cy2 + hh * 0.35, hh * 0.64, 16, 11, 20, 0.94);          // shoulders
+      // an arm raised, on a few of them
+      if (hash(i, 83) > 0.82) {
+        bg.blendDisc(cx2 + lean2 * 2 + hh * 0.4, cy2 - hh * 1.05, hh * 0.22, 16, 11, 20, 0.9);
+      }
       // warm rim from the sky behind them
-      bg.blendDisc(cx2 - hh * 0.12, cy2 - hh * 0.62, hh * 0.3, 206, 128, 92, 0.22 + bob * 0.2);
+      bg.blendDisc(cx2 + lean2 - hh * 0.12, cy2 - hh * 0.62, hh * 0.28, 206, 128, 92, 0.22 + bob * 0.2);
     }
     // the balustrade they stand behind
     bg.fillRect(0, wallTop - 1.5 * S, w, 3.2 * S, F.rgb(92, 68, 68));
@@ -169,11 +175,31 @@ var FX = FX || {};
     bg.fillRect(gx0 - 22 * S, gy0 - 22 * S, 3 * S, 24 * S, F.rgb(64, 48, 44));
     bg.fillRect(gx0 + 19 * S, gy0 - 22 * S, 3 * S, 24 * S, F.rgb(64, 48, 44));
     bg.fillRect(gx0 - 24 * S, gy0 - 24 * S, 48 * S, 3 * S, F.rgb(78, 58, 52));
-    for (var gr = 0; gr < 5; gr++) {          // the gong, in beaten bronze
-      var rr2 = (17 - gr * 3.2) * S;
-      bg.blendDisc(gx0, gy0, rr2, 188 - gr * 12, 142 - gr * 6, 62 + gr * 8, 0.92);
+    /* The gong. blendDisc falls off toward its edge, so stacking them made
+     * a soft yellow smudge rather than an object; a disc needs a hard rim
+     * and a defined highlight to read as metal. */
+    bg.shadowEllipse(gx0 + 2 * S, gy0 + 3 * S, 19 * S, 19 * S, 0.55);
+    for (var gy2 = -18; gy2 <= 18; gy2++) {
+      var hw2 = Math.sqrt(Math.max(0, 18 * 18 - gy2 * gy2));
+      var tg = (gy2 + 18) / 36;
+      bg.fillRect(gx0 - hw2 * S, gy0 + gy2 * S, hw2 * 2 * S, S,
+        F.rgb(150 - tg * 74, 112 - tg * 56, 52 - tg * 22));
     }
-    bg.addDisc(gx0 - 4 * S, gy0 - 5 * S, 7 * S, 255, 216, 150, 0.10);
+    // a raised boss in the centre, and a rim -- flat bands across it read as
+    // a slot rather than as beaten metal
+    for (var gy3 = -7; gy3 <= 7; gy3++) {
+      var hw3 = Math.sqrt(Math.max(0, 49 - gy3 * gy3));
+      var tb = (gy3 + 7) / 14;
+      bg.fillRect(gx0 - hw3 * S, gy0 + gy3 * S, hw3 * 2 * S, S,
+        F.rgb(168 - tb * 82, 128 - tb * 62, 60 - tb * 26));
+    }
+    for (var ga = 0; ga < 40; ga++) {         // rim highlight
+      var tha = ga / 40 * Math.PI * 2;
+      bg.blendPx((gx0 + Math.cos(tha) * 17.4 * S) | 0, (gy0 + Math.sin(tha) * 17.4 * S) | 0,
+        206, 168, 92, 0.55 * Math.max(0, Math.cos(tha + 2.3)));
+    }
+    bg.addDisc(gx0 - 5 * S, gy0 - 6 * S, 8 * S, 255, 214, 150, 0.30);
+    bg.addDisc(gx0 - 5 * S, gy0 - 6 * S, 3.5 * S, 255, 236, 200, 0.34);
 
     var bnx = 300 * S;                         // and a hanging banner
     bg.blendRect(bnx - 9 * S, wallTop + 4 * S, 18 * S, 56 * S, 128, 34, 40, 0.94);
@@ -183,12 +209,12 @@ var FX = FX || {};
     bg.blendRect(bnx - 2.5 * S, wallTop + 34 * S, 5 * S, 5 * S, 226, 196, 140, 0.9);
 
     /* ---- floor ---- */
-    bg.gradientV(0, fy, w, h - fy, F.rgb(104, 80, 72), F.rgb(26, 20, 22));
+    bg.gradientV(0, fy, w, h - fy, F.rgb(132, 102, 88), F.rgb(52, 39, 38));
     var fh = h - fy;
     for (y = 0; y < fh; y++) {
       var d = y / fh;
       if (y % Math.round(8 * S) === 0) {
-        bg.fillRect(0, fy + y, w, Math.max(1, 0.5 * S), F.rgb(74 - d * 34, 56 - d * 26, 52 - d * 24));
+        bg.fillRect(0, fy + y, w, Math.max(1, 0.5 * S), F.rgb(96 - d * 40, 72 - d * 30, 64 - d * 26));
       }
     }
     // the lanterns land on the floor: warm pools directly below each one
@@ -196,8 +222,8 @@ var FX = FX || {};
       var px2 = LANTERNS[i] * S;
       for (var q = 0; q < 4; q++) {
         var rr = (34 - q * 7) * S;
-        bg.addDisc(px2, fy + 9 * S, rr, 255, 152, 74, 0.055);
-        bg.addDisc(px2, fy + 9 * S, rr * 0.5, 255, 190, 120, 0.03);
+        bg.addDisc(px2, fy + 9 * S, rr, 255, 152, 74, 0.075);
+        bg.addDisc(px2, fy + 9 * S, rr * 0.5, 255, 190, 120, 0.045);
       }
     }
     // grain
@@ -222,8 +248,8 @@ var FX = FX || {};
       for (x = 0; x < w; x++) {
         var vx = (x / w - 0.5) * 2, vy = (y / h - 0.5) * 2;
         var r2 = vx * vx * 0.72 + vy * vy * 0.92;
-        if (r2 < 0.42) continue;
-        bg.blendPx(x, y, 6, 4, 12, Math.min(0.66, (r2 - 0.42) * 0.9));
+        if (r2 < 0.50) continue;
+        bg.blendPx(x, y, 6, 4, 12, Math.min(0.46, (r2 - 0.50) * 0.72));
       }
     }
   }
@@ -743,10 +769,15 @@ var FX = FX || {};
     this.costN = 0;
     /* The gap between the two thresholds has to be wider than the cost ratio
      * between two rungs, or a step down lands somewhere that immediately
-     * asks to step back up. Adjacent rungs differ by about 1.55x in area. */
-    if (this.frameCost > 15.5 && this.scaleIx < SCALE_LADDER.length - 1) {
+     * asks to step back up -- but no wider than necessary, or the ladder
+     * sticks on a rung it does not need. Adjacent rungs differ by 1.55x in
+     * area, and 8.2 x 1.55 = 12.7, comfortably inside the 13.5 ceiling.
+     * The ceiling is 13.5 rather than 16.7 because this only measures the
+     * render -- the simulation and the browser's own frame work have to fit
+     * in the same budget. */
+    if (this.frameCost > 13.5 && this.scaleIx < SCALE_LADDER.length - 1) {
       this.scaleIx++; this.buildSurfaces(); this.costHold = 180;
-    } else if (this.frameCost < 8.0 && this.scaleIx > 0) {
+    } else if (this.frameCost < 8.2 && this.scaleIx > 0) {
       this.scaleIx--; this.buildSurfaces(); this.costHold = 180;
     }
   };

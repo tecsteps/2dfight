@@ -67,7 +67,10 @@ var FX = FX || {};
       name: o.name, tint: o.tint || [255, 210, 120],
       hairStyle: o.hairStyle,
       // per-character face proportions, so the two heads are not one head
-      brow: o.brow || 1, jaw: o.jaw || 1, nose: o.nose || 1
+      brow: o.brow || 1, jaw: o.jaw || 1, nose: o.nose || 1,
+      /* ...and per-character build. A two-character roster's first job is
+       * silhouette differentiation, and colour alone does not do it. */
+      build: o.build || { chest: 1, waist: 1, hip: 1, shoulder: 1, limb: 1 }
     };
   }
   F.mkSkin = mkSkin;
@@ -81,7 +84,9 @@ var FX = FX || {};
       skin: [232, 176, 138], gi: [206, 202, 196], gi2: [158, 154, 152],
       trim: [206, 46, 62], hair: [34, 30, 40], tint: [255, 220, 150],
       hairStyle: { n: 3, seg: 2.6, r0: 3.3, taper: 0.86, back: 0.62, up: 3.2, grav: 520 },
-      brow: 1.15, jaw: 1.10, nose: 1.0
+      brow: 1.15, jaw: 1.10, nose: 1.0,
+      // KAI: compact and planted -- deeper chest, thicker limbs
+      build: { chest: 1.10, waist: 1.06, hip: 1.04, shoulder: 1.08, limb: 1.06 }
     }),
     /* RYO: blue gi, gold belt, a long braid that swings. Narrower jaw and a
      * lighter brow so the two silhouettes are not the same face. */
@@ -90,7 +95,9 @@ var FX = FX || {};
       skin: [206, 150, 112], gi: [58, 92, 168], gi2: [40, 66, 124],
       trim: [242, 196, 72], hair: [58, 40, 30], tint: [150, 200, 255],
       hairStyle: { n: 4, seg: 3.2, r0: 3.4, taper: 0.84, back: 0.86, up: 0.4, grav: 700 },
-      brow: 0.86, jaw: 0.92, nose: 1.12
+      brow: 0.86, jaw: 0.92, nose: 1.12,
+      // RYO: lean and rangy -- narrower through the body, longer in the limb
+      build: { chest: 0.92, waist: 0.94, hip: 0.96, shoulder: 0.94, limb: 0.94 }
     })
   };
 
@@ -236,14 +243,14 @@ var FX = FX || {};
   }
 
   function drawLeg(sh, sk0, lg, far, z, ao, fw) {
-    var sk = matsOf(sk0, far);
+    var sk = matsOf(sk0, far), B = sk0.build.limb;
     /* Segment radii are continuous across every joint now, and consecutive
      * segments overlap rather than butt together. Restarting a segment at a
      * different radius, one depth step in front of the last, left a hard
      * crescent of light at every knee and elbow. */
     var mid = lerp(lg.knee, lg.ankle, 0.46);
-    sh.capsule(lg.hip[0], lg.hip[1], lg.knee[0], lg.knee[1], 8.2, 6.4, z, sk.gi, ao);
-    sh.capsule(lg.knee[0], lg.knee[1], mid[0], mid[1], 6.4, 5.2, z, sk.gi, ao);
+    sh.capsule(lg.hip[0], lg.hip[1], lg.knee[0], lg.knee[1], 8.2 * B, 6.4 * B, z, sk.gi, ao);
+    sh.capsule(lg.knee[0], lg.knee[1], mid[0], mid[1], 6.4 * B, 5.2 * B, z, sk.gi, ao);
     // shin starts back inside the trouser cuff, at the cuff's own radius
     var cuff = lerp(lg.knee, lg.ankle, 0.34);
     sh.capsule(cuff[0], cuff[1], lg.ankle[0], lg.ankle[1], 5.2, 3.2, z, sk.skin, ao);
@@ -271,14 +278,14 @@ var FX = FX || {};
   }
 
   function drawArm(sh, sk0, a, far, z, ao, fw) {
-    var sk = matsOf(sk0, far);
+    var sk = matsOf(sk0, far), B = sk0.build.limb;
     // deltoid: a cap angled down the upper arm, not a ball stuck on the
     // chest. The ball read unmistakably as a breast on both fighters, and
     // at a 7.0 front radius the capsule was still doing it.
     var delt = lerp(a.sh, a.elbow, 0.42);
-    sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 5.8, 5.2, z + 1, sk.gi, ao);
+    sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 5.8 * B, 5.2 * B, z + 1, sk.gi, ao);
     var sleeve = lerp(a.sh, a.elbow, 0.60);
-    sh.capsule(a.sh[0], a.sh[1], sleeve[0], sleeve[1], 6.2, 5.0, z, sk.gi, ao);
+    sh.capsule(a.sh[0], a.sh[1], sleeve[0], sleeve[1], 6.2 * B, 5.0 * B, z, sk.gi, ao);
     // continuous radii through the sleeve cuff and the elbow
     var cuf = lerp(a.sh, a.elbow, 0.50);
     sh.capsule(cuf[0], cuf[1], a.elbow[0], a.elbow[1], 5.0, 4.2, z, sk.skin, ao);
@@ -307,16 +314,31 @@ var FX = FX || {};
 
   function drawTorso(sh, p, f, sk, fw) {
     var la = p.leanA * Math.PI / 180;
+    var B = sk.build;
     // pelvis, abdomen, chest -- three masses give the taper a real body has
-    sh.ellipsoid(p.hip[0], p.hip[1], L.hipD, L.hipH2, la + Math.PI / 2, Z.torso, sk.gi, 0.95);
-    sh.ellipsoid(p.waist[0], p.waist[1], L.waistD, L.waistH, la + Math.PI / 2, Z.torso, sk.gi, 0.98);
-    sh.ellipsoid(p.chest[0], p.chest[1], L.chestD, L.chestH, la + Math.PI / 2, Z.torso, sk.gi, 1);
-    // trapezius: neck out to each shoulder, so the head stops sitting on a
-    // flat shelf
+    sh.ellipsoid(p.hip[0], p.hip[1], L.hipD * B.hip, L.hipH2, la + Math.PI / 2, Z.torso, sk.gi, 0.95);
+    sh.ellipsoid(p.waist[0], p.waist[1], L.waistD * B.waist, L.waistH, la + Math.PI / 2, Z.torso, sk.gi, 0.98);
+    sh.ellipsoid(p.chest[0], p.chest[1], L.chestD * B.chest, L.chestH, la + Math.PI / 2, Z.torso, sk.gi, 1);
+    /* Trapezius: neck out to each shoulder. It used to swell from 5.2 at the
+     * neck to 7.4 at the shoulder, putting a rounded mass on each side of
+     * the sternum -- which, on a smooth chest, is exactly the shape of a
+     * bust. The real muscle is a sheet: thick at the neck, thin at the tip. */
     for (var t2 = 0; t2 < 2; t2++) {
       sh.capsule(p.neck[0], p.neck[1], p.shoulders[t2][0], p.shoulders[t2][1],
-        5.2, 7.4, Z.torso - 2, sk.gi, 1);
+        6.0 * B.shoulder, 4.4 * B.shoulder, Z.torso - 2, sk.gi, 1);
     }
+    /* The pectoral shelf: a wide flat plane across the chest with a shadowed
+     * lower edge. A chest without one is a dome, and a dome under cloth
+     * reads as a bust no matter what colour it is. */
+    var pec = lerp(p.chest, p.neck, 0.20);
+    var pax = Math.cos(la + Math.PI / 2), pay = Math.sin(la + Math.PI / 2);
+    sh.capsule(pec[0] - pax * L.chestD * 0.62 * B.chest, pec[1] - pay * L.chestD * 0.62 * B.chest,
+      pec[0] + pax * L.chestD * 0.62 * B.chest, pec[1] + pay * L.chestD * 0.62 * B.chest,
+      3.0, 3.0, Z.torso - 3.6, sk.gi, 1);
+    var pecB = lerp(p.chest, p.waist, 0.18);
+    sh.capsule(pecB[0] - pax * L.chestD * 0.56 * B.chest, pecB[1] - pay * L.chestD * 0.56 * B.chest,
+      pecB[0] + pax * L.chestD * 0.56 * B.chest, pecB[1] + pay * L.chestD * 0.56 * B.chest,
+      1.5, 1.2, Z.torso - 4.4, sk.gi2, 0.86);
     // latissimus: shoulder down to the waist. This is the V, and it fills
     // the armpit that was previously a hole.
     for (var t3 = 0; t3 < 2; t3++) {
@@ -328,6 +350,22 @@ var FX = FX || {};
     // the gi's open front: a darker panel down the centreline
     var top = lerp(p.chest, p.neck, 0.42), bot = lerp(p.hip, p.waist, 0.5);
     sh.capsule(top[0] + fw * 2.6, top[1], bot[0] + fw * 1.6, bot[1], 3.2, 4.4, Z.torso - 3, sk.gi2, 1);
+
+    /* Cloth folds. A gi is loose fabric over a body, and a smooth ellipsoid
+     * is neither -- unbroken, the chest mass reads as a bust rather than as
+     * a garment. Two shallow diagonal creases from the near shoulder toward
+     * the opposite hip are the cheapest thing that says "cloth". */
+    for (var fd = 0; fd < 2; fd++) {
+      var f0 = lerp(p.shoulders[1], p.chest, 0.30 + fd * 0.26);
+      var f1 = lerp(p.waist, p.hip, 0.18 + fd * 0.30);
+      sh.capsule(f0[0] + fw * (2.0 - fd * 0.7), f0[1],
+        f1[0] - fw * (0.6 + fd * 0.9), f1[1],
+        1.35, 1.05, Z.torso - 4.2, sk.gi2, 0.92);
+    }
+    // and one across the ribs, following the twist
+    var rb0 = lerp(p.chest, p.waist, 0.52);
+    sh.capsule(rb0[0] - fw * 4.6, rb0[1] - 1.2, rb0[0] + fw * 4.2, rb0[1] + 1.0,
+      1.1, 0.85, Z.torso - 4.0, sk.gi2, 0.9);
 
     // belt
     var b0 = lerp(p.hip, p.waist, 0.62);

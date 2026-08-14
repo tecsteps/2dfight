@@ -34,8 +34,13 @@ var FX = FX || {};
   var L = {
     headRX: 7.4, headRY: 8.8, neck: 4.6,
     torso: 41,
-    chestD: 7.8, waistD: 5.8, hipD: 7.2,       // half-depth, front to back
-    chestH: 12.5, waistH: 10.0, hipH2: 9.2,    // half-height of each mass
+    /* Half-depth, front to back. The old set went 7.8 / 5.8 / 7.2 -- widest
+     * at the chest, narrowest at the waist, wide again at the hips -- which
+     * is an hourglass, and combined with a smooth unbroken chest mass both
+     * fighters read unmistakably as women in a white gi. A male martial
+     * artist tapers: broad chest, narrower waist, narrower hips still. */
+    chestD: 8.6, waistD: 6.6, hipD: 6.8,
+    chestH: 11.4, waistH: 10.0, hipH2: 9.2,    // half-height of each mass
     shoulderSep: 9.6, shoulderR: 8.2,
     uArm: 23, lArm: 20, hand: 4.6,
     uLeg: 32, lLeg: 29, foot: 13,
