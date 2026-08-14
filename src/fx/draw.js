@@ -61,10 +61,15 @@ var FX = FX || {};
        * chroma, so on a white gi the two legs fused into one shape from hip
        * to ankle and the far arm vanished into the chest during every
        * strike. Distance desaturates; it does not only darken. */
-      giFar: F.mat(o.gi[0] * 0.62 + 14, o.gi[1] * 0.62 + 15, o.gi[2] * 0.62 + 20, 0.02, 4, 0.26),
-      gi2Far: F.mat(o.gi2[0] * 0.62 + 14, o.gi2[1] * 0.62 + 15, o.gi2[2] * 0.62 + 20, 0.02, 4, 0.22),
-      skinFar: F.mat(sk[0] * 0.62 + 14, sk[1] * 0.62 + 15, sk[2] * 0.62 + 20, 0.14, 22, 0.34, 0.9),
-      trimFar: F.mat(o.trim[0] * 0.62 + 14, o.trim[1] * 0.62 + 15, o.trim[2] * 0.62 + 20, 0.10, 16, 0.34),
+      /* A far limb is further away, not a different garment. At 0.62 plus
+       * ambient this was a 2.2x value drop between one arm and the other on
+       * the same character -- one white trouser leg and one grey-brown one.
+       * Distance mostly desaturates; commercial work uses 15-25% of value,
+       * not 55%. */
+      giFar: F.mat(o.gi[0] * 0.84 + 10, o.gi[1] * 0.84 + 11, o.gi[2] * 0.84 + 14, 0.02, 4, 0.28),
+      gi2Far: F.mat(o.gi2[0] * 0.84 + 10, o.gi2[1] * 0.84 + 11, o.gi2[2] * 0.84 + 14, 0.02, 4, 0.24),
+      skinFar: F.mat(sk[0] * 0.84 + 10, sk[1] * 0.84 + 11, sk[2] * 0.84 + 14, 0.14, 22, 0.36, 0.9),
+      trimFar: F.mat(o.trim[0] * 0.84 + 10, o.trim[1] * 0.84 + 11, o.trim[2] * 0.84 + 14, 0.10, 16, 0.36),
       name: o.name, tint: o.tint || [255, 210, 120],
       hairStyle: o.hairStyle,
       // per-character face proportions, so the two heads are not one head
@@ -190,8 +195,8 @@ var FX = FX || {};
     sh.addOcc(p.legs[1].knee[0], p.legs[1].knee[1], 13, Z.torso, 0.40);
 
     drawHem(sh, p, f, sk, fw, 1);             // the panel behind both legs
-    drawLeg(sh, sk, p.legs[0], 1, Z.farLeg, 0.66, fw);
-    drawArm(sh, sk, p.arms[far], 1, zFarArm, 0.68, fw);
+    drawLeg(sh, sk, p.legs[0], 1, Z.farLeg, 0.82, fw);
+    drawArm(sh, sk, p.arms[far], 1, zFarArm, 0.82, fw);
 
     drawTorso(sh, p, f, sk, fw);
     drawHead(sh, p, f, sk, fw);
@@ -305,7 +310,7 @@ var FX = FX || {};
     // chest. The ball read unmistakably as a breast on both fighters, and
     // at a 7.0 front radius the capsule was still doing it.
     var delt = lerp(a.sh, a.elbow, 0.42);
-    sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 5.8 * B, 5.2 * B, z + 1, sk.gi, ao);
+    sh.capsule(a.sh[0], a.sh[1], delt[0], delt[1], 4.9 * B, 4.4 * B, z + 1, sk.gi, ao);
     /* Same non-monotonic profile as the leg. A monotonic 6.2 -> 3.5 taper
      * over the whole arm made every punch a single smooth sausage with the
      * elbow invisible -- most obvious on the cross and the super, where the
@@ -370,15 +375,27 @@ var FX = FX || {};
       1.5, 1.2, Z.torso - 4.4, sk.gi2, 0.86);
     // latissimus: shoulder down to the waist. This is the V, and it fills
     // the armpit that was previously a hole.
+    /* Latissimus. These used to start a fifth of the way down from the
+     * shoulder at radius 4.8, which filled the armpit completely -- with the
+     * deltoid bridging what was left, a fully extended jab, the guard arm
+     * and the torso rendered as one unbroken blob with no negative space
+     * anywhere on the figure. An arm has to be able to leave the body. */
     for (var t3 = 0; t3 < 2; t3++) {
-      var top3 = lerp(p.shoulders[t3], p.waist, 0.22);
+      var top3 = lerp(p.shoulders[t3], p.waist, 0.36);
       sh.capsule(top3[0], top3[1], p.waist[0], p.waist[1],
-        4.8, 3.0, Z.torso + 3, sk.gi, 0.9);
+        3.0, 2.2, Z.torso + 3, sk.gi, 0.9);
     }
 
-    // the gi's open front: a darker panel down the centreline
-    var top = lerp(p.chest, p.neck, 0.42), bot = lerp(p.hip, p.waist, 0.5);
-    sh.capsule(top[0] + fw * 2.6, top[1], bot[0] + fw * 1.6, bot[1], 3.2, 4.4, Z.torso - 3, sk.gi2, 1);
+    /* The gi's front. A dark line straight down the middle of a convex
+     * chest splits it into two lobes -- which is the shape of a bust, and no
+     * amount of pectoral shelf undoes it. A real gi crosses: two lapels
+     * running from the shoulders down to meet at the belt knot. */
+    var top = lerp(p.chest, p.neck, 0.34), bot = lerp(p.hip, p.waist, 0.55);
+    sh.capsule(top[0] + fw * 5.4, top[1], bot[0] + fw * 0.8, bot[1],
+      2.4, 3.4, Z.torso - 3, sk.gi2, 1);
+    var top2 = lerp(p.chest, p.neck, 0.22);
+    sh.capsule(top2[0] - fw * 1.6, top2[1], bot[0] + fw * 0.4, bot[1],
+      1.8, 2.8, Z.torso - 3.6, sk.gi2, 0.94);
 
     /* Cloth folds. A gi is loose fabric over a body, and a smooth ellipsoid
      * is neither -- unbroken, the chest mass reads as a bust rather than as
@@ -469,15 +486,21 @@ var FX = FX || {};
     /* ---- skull and face masses ---- */
     // cranium, set back: the brain case is behind the face, not centred on it
     fp(-0.9, 1.5, R * 0.94, RY * 0.94, HZ, FS, sk.skin, 1);
-    // cheek / maxilla
-    fp(2.3, -1.0, R * 0.76, RY * 0.70, HZ, FS - 0.25, sk.skin, 1);
-    // jaw, and a chin that leaves the outline
-    fp(1.8, -5.2, 4.4 * JW, 3.1, HZ, FS - 0.35, sk.skin, 0.98);
-    fp(4.5, -4.9, 1.9 * JW, 1.7, HZ, FS - 0.55, sk.skinLit, 1);
+    /* Cheek and jaw.
+     *
+     * The cheek's front surface used to sit at 2.3 + 0.76*7.4 = 7.9 while
+     * the nose tip reached 7.85 -- five hundredths of a unit *behind* it. So
+     * in near profile the nose never broke the outline and the swollen cheek
+     * did, which with a jaw 8.8 wide slung 5.2 below centre gave both
+     * fighters a cheek-pouch-over-jowl profile: caricatured old men. */
+    fp(1.5, -1.0, R * 0.56, RY * 0.70, HZ, FS - 0.25, sk.skin, 1);
+    // jaw: narrower, dropped, and carried forward to a chin
+    fp(2.6, -5.9, 4.4 * JW, 2.3, HZ, FS - 0.35, sk.skin, 0.98);
+    fp(5.0, -5.4, 1.8 * JW, 1.6, HZ, FS - 0.55, sk.skinLit, 1);
     // under-jaw shadow, sitting behind the jaw so it only shows at the edge
-    fc(-2.0, -6.0, 3.2, -6.8, 2.2, 1.8, FS + 0.4, sk.skinDeep, 0.72);
+    fc(-2.0, -6.6, 3.4, -7.3, 2.0, 1.6, FS + 0.4, sk.skinDeep, 0.72);
     // cheekbone: the plane that catches light and gives the face structure
-    fc(0.6, 1.4, 4.6, 0.2, 2.0, 1.4, FS - 0.45, sk.skinLit, 1);
+    fc(0.4, 1.4, 4.0, 0.2, 1.7, 1.2, FS - 0.45, sk.skinLit, 1);
 
     /* ---- brow, nose, mouth: the silhouette breakers ---- */
     /* Brow ridge, lit on top, and the shadow it drops into the socket.
@@ -492,8 +515,8 @@ var FX = FX || {};
      * outline by about a tenth of the head radius. It used to overhang by
      * forty percent, which with the heavy brow gave both fighters a
      * Punch-and-Judy profile. */
-    fc(4.4, 2.9, R * 0.84 * NS, -0.5, 1.2, 1.35, FS - 0.95, sk.skinLit, 1);
-    fp(R * 0.88 * NS, -1.0, 1.35, 1.15, HZ, FS - 1.10, sk.skin, 1);
+    fc(4.4, 2.9, R * 1.00 * NS, -0.5, 1.2, 1.20, FS - 0.95, sk.skinLit, 1);
+    fp(R * 1.06 * NS, -1.0, 1.15, 0.95, HZ, FS - 1.10, sk.skin, 1);
     // the wing of the nostril, and the shadow under it
     fp(R * 0.62 * NS, -1.9, 0.85, 0.62, HZ, FS - 0.85, sk.skinDark, 0.92);
 

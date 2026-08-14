@@ -29,7 +29,7 @@ var FX = FX || {};
    * gets the full 1439x810 and a slow device stays playable instead of
    * running at 20fps in the name of a fixed number. */
   var SCALE_LADDER = [4.05, 3.24, 2.6, 2.05, 1.6];
-  var SCALE_START = 1;                // 3.24 -> 1439x810; step up if it holds
+  var SCALE_START = 2;                // 2.6 -> 1154x650; step up if it holds
   var SCALE = SCALE_LADDER[SCALE_START];
   var GROUND = 216;
   /* Top of the temple wall -- and therefore of the balustrade and the crowd
@@ -139,7 +139,9 @@ var FX = FX || {};
      * where a fight is happening" like an audience, and against a light sky
      * they cost one dark shape and one warm rim each. */
     for (i = 0; i * 11.6 < W + 12; i++) {
-      var cx2 = (6 + i * 11.6 + hash(i, 21) * 5) * S;
+      // jitter the pitch, not only the heights: a fixed 11.6-unit spacing
+      // reads as a row of beads however much the heights vary
+      var cx2 = (6 + i * 11.6 + (hash(i, 21) - 0.5) * 9) * S;
       if (hash(i, 53) < 0.10) continue;          // gaps along the rail
       var hh = (6 + hash(i, 5) * 6.5) * S;       // and a real spread of heights
       var cy2 = wallTop - hh * (0.42 + hash(i, 61) * 0.30);
@@ -148,15 +150,22 @@ var FX = FX || {};
       bg.blendDisc(cx2 + lean2, cy2 - hh * 0.5, hh * 0.40, 16, 11, 20, 0.94);   // head
       bg.blendDisc(cx2, cy2 + hh * 0.35, hh * 0.64, 16, 11, 20, 0.94);          // shoulders
       // an arm raised, on a few of them
-      if (hash(i, 83) > 0.82) {
+      if (hash(i, 83) > 0.60) {
         bg.blendDisc(cx2 + lean2 * 2 + hh * 0.4, cy2 - hh * 1.05, hh * 0.22, 16, 11, 20, 0.9);
       }
       // warm rim from the sky behind them
       bg.blendDisc(cx2 + lean2 - hh * 0.12, cy2 - hh * 0.62, hh * 0.28, 206, 128, 92, 0.22 + bob * 0.2);
     }
     // the balustrade they stand behind
-    bg.fillRect(0, wallTop - 1.5 * S, w, 3.2 * S, F.rgb(92, 68, 68));
-    bg.fillRect(0, wallTop - 1.5 * S, w, 1.1 * S, F.rgb(140, 108, 98));
+    // the rail, broken into sections with posts rather than one unbroken
+    // line running the full width of the frame
+    for (var rs = 0; rs * 58 < W + 58; rs++) {
+      var rx0 = rs * 58 * S, rw = 52 * S;
+      bg.fillRect(rx0, wallTop - 1.5 * S, rw, 3.2 * S, F.rgb(92, 68, 68));
+      bg.fillRect(rx0, wallTop - 1.5 * S, rw, 1.1 * S, F.rgb(140, 108, 98));
+      bg.fillRect(rx0 + rw, wallTop - 4 * S, 6 * S, 7 * S, F.rgb(110, 84, 78));
+      bg.fillRect(rx0 + rw, wallTop - 4 * S, 6 * S, 1.4 * S, F.rgb(156, 124, 110));
+    }
 
     /* ---- lanterns ---- */
     for (i = 0; i < LANTERNS.length; i++) {
@@ -184,19 +193,25 @@ var FX = FX || {};
      * a soft yellow smudge rather than an object; a disc needs a hard rim
      * and a defined highlight to read as metal. */
     bg.shadowEllipse(gx0 + 2 * S, gy0 + 3 * S, 19 * S, 19 * S, 0.55);
-    for (var gy2 = -18; gy2 <= 18; gy2++) {
-      var hw2 = Math.sqrt(Math.max(0, 18 * 18 - gy2 * gy2));
-      var tg = (gy2 + 18) / 36;
-      bg.fillRect(gx0 - hw2 * S, gy0 + gy2 * S, hw2 * 2 * S, S,
-        F.rgb(150 - tg * 74, 112 - tg * 56, 52 - tg * 22));
+    /* Stepped in device rows, not world rows. Stepping the loop in world
+     * units made every row S device pixels tall and quantised the width to
+     * the same grid, so the one round object in the frame was a visible
+     * three-pixel staircase in a picture that is otherwise coverage-blended. */
+    var gR = 18 * S;
+    for (var gy2 = -gR; gy2 <= gR; gy2++) {
+      var hw2 = Math.sqrt(Math.max(0, gR * gR - gy2 * gy2));
+      var tg = (gy2 + gR) / (2 * gR);
+      bg.blendRect(gx0 - hw2, gy0 + gy2, hw2 * 2, 1,
+        150 - tg * 74, 112 - tg * 56, 52 - tg * 22, 1);
     }
     // a raised boss in the centre, and a rim -- flat bands across it read as
     // a slot rather than as beaten metal
-    for (var gy3 = -7; gy3 <= 7; gy3++) {
-      var hw3 = Math.sqrt(Math.max(0, 49 - gy3 * gy3));
-      var tb = (gy3 + 7) / 14;
-      bg.fillRect(gx0 - hw3 * S, gy0 + gy3 * S, hw3 * 2 * S, S,
-        F.rgb(168 - tb * 82, 128 - tb * 62, 60 - tb * 26));
+    var bR = 7 * S;
+    for (var gy3 = -bR; gy3 <= bR; gy3++) {
+      var hw3 = Math.sqrt(Math.max(0, bR * bR - gy3 * gy3));
+      var tb = (gy3 + bR) / (2 * bR);
+      bg.blendRect(gx0 - hw3, gy0 + gy3, hw3 * 2, 1,
+        168 - tb * 82, 128 - tb * 62, 60 - tb * 26, 1);
     }
     for (var ga = 0; ga < 40; ga++) {         // rim highlight
       var tha = ga / 40 * Math.PI * 2;
@@ -216,10 +231,24 @@ var FX = FX || {};
     /* ---- floor ---- */
     bg.gradientV(0, fy, w, h - fy, F.rgb(132, 102, 88), F.rgb(52, 39, 38));
     var fh = h - fy;
-    for (y = 0; y < fh; y++) {
-      var d = y / fh;
-      if (y % Math.round(8 * S) === 0) {
-        bg.fillRect(0, fy + y, w, Math.max(1, 0.5 * S), F.rgb(96 - d * 40, 72 - d * 30, 64 - d * 26));
+    /* Cross seams with the pitch compressing toward the back, plus
+     * longitudinal boards converging on a vanishing point. A constant pitch
+     * and no converging lines gave the ground no perspective at all, so it
+     * read as a low wall the fighters stood in front of. */
+    var acc2 = 0;
+    while (acc2 < fh) {
+      var d = acc2 / fh;
+      bg.blendRect(0, fy + fh - acc2, w, Math.max(1, 0.5 * S),
+        96 - d * 40, 72 - d * 30, 64 - d * 26, 0.85);
+      acc2 += (2.6 + 6.2 * (1 - d)) * S;
+    }
+    var vpx = w * 0.5, vpy = fy - 96 * S;
+    for (var bd = -8; bd <= 8; bd++) {
+      var fx2 = vpx + bd * 46 * S;
+      for (var yy2 = 0; yy2 < fh; yy2++) {
+        var u2 = (fy + yy2 - vpy) / (fy - vpy);
+        bg.blendPx((vpx + (fx2 - vpx) * u2) | 0, fy + yy2,
+          132, 100, 84, 0.16 * (0.35 + 0.65 * (yy2 / fh)));
       }
     }
     // the lanterns land on the floor: warm pools directly below each one
@@ -280,9 +309,12 @@ var FX = FX || {};
         r: spike ? 1.1 : 1 + Math.random() * 2.4,
         c: col || [255, 226, 150], g: 380, add: 1 });
     }
-    // one short bright bloom at the contact point, so the hit has a centre
-    this.p.push({ x: x, y: y, vx: 0, vy: 0, life: 0.09, t: 0,
-      r: 7 + power * 7, c: col || [255, 226, 150], g: 0, add: 1, bloom: 1 });
+    /* And one oriented flash at the contact point. An isotropic disc is a
+     * lamp; an impact is a shape, and its long axis is the direction the
+     * blow travelled. */
+    this.p.push({ x: x, y: y, vx: 0, vy: 0, life: 0.10, t: 0,
+      r: 7 + power * 7, c: col || [255, 226, 150], g: 0, add: 1, bloom: 1,
+      dx: Math.cos(base), dy: Math.sin(base) });
   };
   Fx.prototype.dust = function (x, y, n, dir) {
     for (var i = 0; i < n; i++) {
@@ -323,26 +355,34 @@ var FX = FX || {};
       var al = (1 - u) * (1 - u) * 0.9;
       // a thin expanding shell, drawn additively
       var x0 = a.x * S + ox, y0 = a.y * S + oy;
-      // a filled shell with real thickness, falling off on both sides
-      var th2 = Math.max(1.4, rad * 0.20);
-      var steps = Math.max(40, (rad * 3.2) | 0);
-      for (var k = 0; k < steps; k++) {
-        var th = k / steps * Math.PI * 2;
-        var cth = Math.cos(th), sth = Math.sin(th);
-        for (var q2 = -1; q2 <= 1; q2++) {
-          var rq = rad + q2 * th2 * 0.5;
-          var fq = al * (q2 === 0 ? 1 : 0.45);
-          surf.addPx((x0 + cth * rq) | 0, (y0 + sth * rq * 0.62) | 0,
-            a.c[0], a.c[1], a.c[2], fq);
-        }
-      }
+      /* A solid shell, drawn as one annulus. It used to walk the
+       * circumference writing single unblended pixels, which at a 150-pixel
+       * radius is a ~940-pixel perimeter sampled 480 times -- a dotted
+       * ellipse that read as a debug wireframe rather than a shockwave. */
+      surf.addRing(x0, y0, rad, Math.max(1.6, rad * 0.16), 0.62,
+        a.c[0], a.c[1], a.c[2], al * 0.9);
     }
     for (i = 0; i < this.p.length; i++) {
       a = this.p[i];
       var t = 1 - a.t / a.life;
       var r = a.r * (a.add ? t : 1 + (1 - t) * 1.4) * S;
       var px2 = a.x * S + ox, py2 = a.y * S + oy;
-      if (a.bloom) surf.addDisc(px2, py2, Math.max(1, a.r * S * (0.5 + t)), a.c[0], a.c[1], a.c[2], t * 1.9);
+      if (a.bloom) {
+        // a four-point star: long axis along the blow, short axis across it
+        var LL = a.r * S * (0.55 + (1 - t) * 1.5), WW = LL / 3.4;
+        var ca2 = a.dx, sa2 = a.dy;
+        surf.addStreak(px2 - ca2 * LL, py2 - sa2 * LL, px2 + ca2 * LL, py2 + sa2 * LL,
+          WW, a.c[0], a.c[1], a.c[2], t * 1.5);
+        surf.addStreak(px2 + sa2 * WW * 1.7, py2 - ca2 * WW * 1.7,
+          px2 - sa2 * WW * 1.7, py2 + ca2 * WW * 1.7,
+          WW * 0.8, a.c[0], a.c[1], a.c[2], t * 1.1);
+        for (var sk2 = -1; sk2 <= 1; sk2 += 2) {
+          var sa3 = Math.atan2(sa2, ca2) + sk2 * 0.32;
+          surf.addStreak(px2, py2, px2 + Math.cos(sa3) * LL * 2.2,
+            py2 + Math.sin(sa3) * LL * 2.2, WW * 0.42,
+            a.c[0], a.c[1], a.c[2], t * 0.8);
+        }
+      }
       else if (a.add) surf.addDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 1.5);
       else surf.blendDisc(px2, py2, Math.max(1, r), a.c[0], a.c[1], a.c[2], t * 0.34);
     }
@@ -457,10 +497,18 @@ var FX = FX || {};
      * from the solved pose cost about nothing and mean the hit lands where
      * the picture says it does. */
     var lowMove = !!d.low;
-    if (F.tipToBody(tip, df) > 16) return;
-    // crouching ducks highs, and a low cannot catch an airborne fighter
-    var dfCrouch = df.crouchS.v > 0.55;
-    if (!lowMove && dfCrouch && !d.super) return;
+    /* Proximity slop, proportional to the move. A flat 16 units on top of
+     * the body capsules' own radii gave every attack 27 units of free range,
+     * so a 14-frame jab and a 37-frame roundhouse connected at the same
+     * distance to within three percent and there was no spacing decision to
+     * make at all. */
+    if (F.tipToBody(tip, df) > 3 + (d.reach || 40) * 0.10) return;
+    /* A low cannot catch an airborne fighter. Crouching, though, used to be
+     * blanket immunity to everything that was not itself a low -- measured,
+     * a fighter simply holding down took zero damage from eight of the ten
+     * attacks, which is a free dodge, no mixup and no chip. The crouched
+     * pose is already shorter, so the geometry above does the ducking: a
+     * high aimed at standing head height misses a crouching head on its own. */
     if (lowMove && !df.onGround) return;
 
     at.hitLanded = true;
@@ -469,9 +517,13 @@ var FX = FX || {};
      * so it never floats past them. Sparks used to spawn from a formula that
      * put them a dozen units in front of the foot and eighteen short of the
      * body, touching neither fighter. */
+    /* The contact point is the limb tip. Clamping it to a fixed plane at
+     * the victim's near surface put the spark up to 26 units behind the fist
+     * that was supposed to have made it. The only clamp left stops it
+     * passing out the far side of the body. */
     var hx = tip[0], hy = tip[1];
-    var face = df.x - at.facing * HALF_W;
-    if ((hx - face) * at.facing > 0) hx = face;
+    var far2 = df.x + at.facing * HALF_W;
+    if ((hx - far2) * at.facing > 0) hx = far2;
 
     // blocking: correct guard height, facing the attacker
     var guarding = (df.move === 'block' || df.move === 'blockLow') &&
@@ -592,8 +644,18 @@ var FX = FX || {};
     /* Hitstop. Measured across five seeded rounds this was still freezing
      * 12.5% of the match with only a 4.5-to-18 frame spread; add hitstun and
      * knockdowns and nobody was fighting for 40% of the round. */
-    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.20 : 0.02 + d.hs * 0.16);
-    if (d.super) this.fx.flash = 0.8;
+    /* A 2.7-to-4.7 frame spread across a 4-to-15 damage range is below the
+     * threshold at which anyone can feel the difference. Commercial
+     * reference is roughly 9-11 frames for lights and 14-16 for heavies. */
+    /* Two reviews pulled this in opposite directions and both were right:
+     * one measured 12.5% of the match frozen, the other measured a 2.7-to-
+     * 4.7 frame spread that nobody could feel. The answer is a longer stop
+     * per hit with a real spread between light and heavy -- 5.6 frames on a
+     * jab, 9.2 on a roundhouse, 19 on a super -- rather than more or less of
+     * an undifferentiated one. */
+    this.fx.hitstop = Math.max(this.fx.hitstop, d.super ? 0.32 : 0.045 + d.hs * 0.30);
+    // a real white frame on the super's contact
+    if (d.super) this.fx.flash = 1.6;
     if (this.onSound) this.onSound(d.super ? 'super' : (d.dmg >= 10 ? 'heavy' : 'hit'));
   };
 
@@ -703,7 +765,7 @@ var FX = FX || {};
        * latches tapHeld and means the double-tap detector can never fire
        * from an AI command -- so it had literally never dashed. An explicit
        * intent bypasses the tap decoder. */
-      if (dist > 150 && f.canAct() && f.onGround && Math.random() < 0.22) {
+      if (dist > 110 && f.canAct() && f.onGround && Math.random() < 0.5) {
         f.start('dash'); f.vx = f.facing * 300;
         this.fx.dust(f.x, GROUND, 6, f.facing);
         this.aiT[i] = 0.30; this.aiHold[i] = c; return c;
@@ -742,7 +804,10 @@ var FX = FX || {};
   };
 
   Match.prototype.step = function (dt) {
-    this.tick = (this.tick || 0) + 1;
+    /* Only advance the clock when the world does. The buffer window is
+     * counted in ticks, so incrementing through hitstop meant a press made
+     * inside a super's freeze expired before the freeze ended. */
+    if (this.fx.hitstop <= 0) this.tick = (this.tick || 0) + 1;
 
     /* Sample the player's buttons every tick, including frozen ones.
      *
@@ -759,6 +824,13 @@ var FX = FX || {};
     if (this.fx.hitstop > 0) {
       this.fx.hitstop -= dt;
       if (this.fx.flash > 0) this.fx.flash = Math.max(0, this.fx.flash - dt * 6);
+      /* The victim's own body flash is decayed in Fighter.update, which does
+       * not run while the world is frozen -- so the struck fighter sat at
+       * full tint for the entire hitstop and the one frame the player is
+       * made to look at was a featureless white blob with the pose, the
+       * costume and the face all bleached out of it. */
+      this.a.flash = Math.max(0, this.a.flash - dt * 9);
+      this.b.flash = Math.max(0, this.b.flash - dt * 9);
       return;
     }
     this.fx.update(dt);
@@ -789,10 +861,14 @@ var FX = FX || {};
      * scaled to 55%, and the HUD read "20 HIT" over two idle fighters. */
     for (var ci2 = 0; ci2 < 2; ci2++) {
       var cf2 = ci2 ? this.b : this.a, vf = ci2 ? this.a : this.b;
-      if (cf2.combo > 0) {
-        cf2.comboIdle = (vf.stun > 0 || this.fx.hitstop > 0) ? 0 : (cf2.comboIdle || 0) + 1;
-        if (cf2.comboIdle > 34) { cf2.combo = 0; cf2.comboIdle = 0; }
-      }
+      /* A combo ends the moment the victim can act again. Counting idle
+       * frames instead meant two jabs three quarters of a second apart --
+       * with the victim free for a third of a second in between -- still
+       * read as a two-hit combo while the damage scaler disagreed. */
+      if (cf2.combo > 0 && vf.stun <= 0 && this.fx.hitstop <= 0 && vf.onGround) {
+        cf2.comboIdle = (cf2.comboIdle || 0) + 1;
+        if (cf2.comboIdle > 4) { cf2.combo = 0; cf2.comboIdle = 0; }
+      } else cf2.comboIdle = 0;
     }
 
 
@@ -879,7 +955,7 @@ var FX = FX || {};
    * outright -- only a button held continuously all the way through a move
    * ever came out, and then a frame after the move had already ended. Every
    * commercial fighter buffers; this is the cheap version of it. */
-  var BUF_TICKS = 6;
+  var BUF_TICKS = 9;
   Match.prototype.stamp = function (f, c) {
     var k = c.p ? 'p' : c.k ? 'k' : c.g ? 'g' : c.s ? 's' : c.u ? 'u' : null;
     if (!k) { f.bufHeld = 0; return; }
@@ -951,7 +1027,10 @@ var FX = FX || {};
     if (sup) {
       var sp2 = sup.progress();
       // full darkness through the startup, releasing over the recovery
-      var k2 = sp2 < 0.52 ? Math.min(1, sp2 / 0.18) : Math.max(0, 1 - (sp2 - 0.52) / 0.34);
+      /* Hold full strength through the hit window, which is [0.34, 0.58].
+       * Releasing at 0.52 meant the contact frame -- the one frame the whole
+       * treatment exists for -- landed as it was already fading out. */
+      var k2 = sp2 < 0.62 ? Math.min(1, sp2 / 0.16) : Math.max(0, 1 - (sp2 - 0.62) / 0.28);
       surf.blendRect(0, 0, surf.w, surf.h, 6, 4, 16, 0.62 * k2);
       // radial light thrown off the attacker
       var gx2 = sup.x * S + pan, gy2 = (sup.y - 62) * S + oy;
@@ -1008,7 +1087,10 @@ var FX = FX || {};
       var f = order[i];
       // 20 world units is comfortably more than the body's own depth range
       this.sh.zBias = i === 0 ? 20 : -20;
+      var rimBoost = (f === sup);
+      if (rimBoost) { this.sh.rimR = 255; this.sh.rimG = 236; this.sh.rimB = 210; }
       F.drawFighter(this.sh, f);
+      if (rimBoost) { this.sh.rimR = 255; this.sh.rimG = 188; this.sh.rimB = 130; }
       // motion arc: the working limb's recent path, additively. Free from a
       // solved pose; a sprite sheet would need extra art for every frame.
       /* Motion arc: the working limb's recent path. Additive streaks stack
@@ -1033,7 +1115,8 @@ var FX = FX || {};
     this.fx.draw(surf, pan, oy);
     this.sh.ox = 0; this.sh.oy = 0;
     if (this.fx.flash > 0) {
-      surf.blendRect(0, 0, surf.w, surf.h, 255, 244, 230, this.fx.flash * 0.5);
+      surf.blendRect(0, 0, surf.w, surf.h, 255, 248, 236,
+        Math.min(0.88, this.fx.flash * 0.55));
     }
     this.hud(surf);
     surf.present();

@@ -48,14 +48,24 @@ var FX = FX || {};
   }
   F.mat = mat;
 
-  // light: front, above, from the character's left
-  var LX = -0.36, LY = -0.66, LZ = 0.66;
-  // a second, cooler fill from the opposite side keeps shadows from going flat
-  var FX2 = 0.55, FY2 = -0.15, FZ2 = 0.82;
-  // back-left kicker: the rim only fires where the surface turns away from
-  // the viewer *toward this direction*, which is what makes a lit side and a
-  // dark side instead of a uniform glowing outline
-  var BX = 0.66, BY = -0.34, BZ = -0.67;
+  /* The light rig has to agree with the stage it stands in.
+   *
+   * It used to key from screen-left with a cold blue rim, while the stage
+   * puts its sun at 0.70 of screen width -- to the right -- under a warm
+   * orange sky. Both fighters were therefore lit from the wrong side and
+   * rimmed in blue against an orange sunset, which is most of the reason
+   * they read as pasted onto the stage rather than standing in it.
+   *
+   * Key: frontal, above, from the right, where the sun is. */
+  var LX = 0.36, LY = -0.60, LZ = 0.72;
+  // Fill: the cool sky bounce, from the opposite side, keeping the shadow
+  // side from going flat and dead.
+  var FX2 = -0.55, FY2 = -0.20, FZ2 = 0.80;
+  // Kicker: behind and to the right, the sun again. The rim only fires
+  // where the surface turns away from the viewer *toward this direction*,
+  // which is what makes a lit side and a dark side rather than a uniform
+  // glowing outline around everything.
+  var BX = 0.62, BY = -0.30, BZ = -0.72;
   /* A warm bounce off the floor. Every light in the rig came from above, so
    * the underside of a raised limb fell to flat ambient and a lifted leg
    * looked like it had been cut out of the picture. Real ground bounce is
@@ -80,7 +90,8 @@ var FX = FX || {};
     this.ambR = 42; this.ambG = 46; this.ambB = 60;   // ambient/sky bounce
     this.keyR = 255; this.keyG = 238; this.keyB = 214;
     this.fillR = 90; this.fillG = 120; this.fillB = 168;
-    this.rimR = 190; this.rimG = 214; this.rimB = 255;
+    // warm, because the thing behind the fighters is a sunset
+    this.rimR = 255; this.rimG = 188; this.rimB = 130;
     this.tint = 0;                                     // 0..1 hit flash
     this.tintR = 255; this.tintG = 255; this.tintB = 255;
     /* Occluders live in a flat array rather than as objects: five property
@@ -197,10 +208,16 @@ var FX = FX || {};
       + this.keyB * sp + this.rimB * rim + 14 * sss) * occ;
 
     if (this.tint > 0) {
-      // additive, clamped -- lerping to a flat colour turned the struck
-      // fighter into a paper cutout
-      var t = this.tint * 0.62;
-      r += this.tintR * t; g += this.tintG * t; b += this.tintB * t;
+      /* Multiply, don't add. Adding a large constant to every channel drove
+       * the whole body past the knee at once, so a struck fighter -- gi,
+       * skin, hair, face and HUD portrait alike -- went to one chalky white
+       * with every gradient and every facial feature erased. Scaling the lit
+       * colour brightens it by the same proportion everywhere and leaves the
+       * form intact. */
+      var t = this.tint * 0.55;
+      r *= 1 + t * (this.tintR / 255) * 1.9;
+      g *= 1 + t * (this.tintG / 255) * 1.9;
+      b *= 1 + t * (this.tintB / 255) * 1.9;
     }
     if (r > KNEE) r = KNEE + (r - KNEE) / (1 + (r - KNEE) * KSH);
     if (g > KNEE) g = KNEE + (g - KNEE) / (1 + (g - KNEE) * KSH);
@@ -254,8 +271,11 @@ var FX = FX || {};
     var mspec = m.spec, mgloss = m.gloss, mrim = m.rim, msss = m.sss;
     var occA = this.occ, nOcc5 = this.nOcc * 5;
     var ghost = this.ghost;
-    var tt = this.tint > 0 ? this.tint * 0.62 : 0;
-    var tR = this.tintR * tt, tG = this.tintG * tt, tB = this.tintB * tt;
+    // hit flash, as a per-channel multiplier so the shading survives it
+    var tt = this.tint > 0 ? this.tint * 0.55 : 0;
+    var tR = 1 + tt * (this.tintR / 255) * 1.9;
+    var tG = 1 + tt * (this.tintG / 255) * 1.9;
+    var tB = 1 + tt * (this.tintB / 255) * 1.9;
     if (ao === undefined) ao = 1;
 
     for (var y = y0; y < y1; y++) {
@@ -317,9 +337,9 @@ var FX = FX || {};
           occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
         }
         var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
-        var cr = (mnr * (ambR + keyR * dd + fillR * ff + boR * bo) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
-        var cg = (mng * (ambG + keyG * dd + fillG * ff + boG * bo) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
-        var cb = (mnb * (ambB + keyB * dd + fillB * ff + boB * bo) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff + boR * bo) + keyR * sp + rimR * rim + 62 * ss) * occ * tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff + boG * bo) + keyG * sp + rimG * rim + 26 * ss) * occ * tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff + boB * bo) + keyB * sp + rimB * rim + 14 * ss) * occ * tB;
         if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
         if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
         if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);
@@ -370,8 +390,11 @@ var FX = FX || {};
     var mspec = m.spec, mgloss = m.gloss, mrim = m.rim, msss = m.sss;
     var occA = this.occ, nOcc5 = this.nOcc * 5;
     var ghost = this.ghost;
-    var tt = this.tint > 0 ? this.tint * 0.62 : 0;
-    var tR = this.tintR * tt, tG = this.tintG * tt, tB = this.tintB * tt;
+    // hit flash, as a per-channel multiplier so the shading survives it
+    var tt = this.tint > 0 ? this.tint * 0.55 : 0;
+    var tR = 1 + tt * (this.tintR / 255) * 1.9;
+    var tG = 1 + tt * (this.tintG / 255) * 1.9;
+    var tB = 1 + tt * (this.tintB / 255) * 1.9;
     if (ao === undefined) ao = 1;
 
     for (var y = y0; y < y1; y++) {
@@ -447,9 +470,9 @@ var FX = FX || {};
           occ -= occ * occA[oi + 4] * (1 - od2 / or2) * dz * 0.0625;
         }
         var ss = msss ? msss * (1 - dd) * (nz * 0.6 + 0.4) : 0;
-        var cr = (mnr * (ambR + keyR * dd + fillR * ff + boR * bo) + keyR * sp + rimR * rim + 62 * ss) * occ + tR;
-        var cg = (mng * (ambG + keyG * dd + fillG * ff + boG * bo) + keyG * sp + rimG * rim + 26 * ss) * occ + tG;
-        var cb = (mnb * (ambB + keyB * dd + fillB * ff + boB * bo) + keyB * sp + rimB * rim + 14 * ss) * occ + tB;
+        var cr = (mnr * (ambR + keyR * dd + fillR * ff + boR * bo) + keyR * sp + rimR * rim + 62 * ss) * occ * tR;
+        var cg = (mng * (ambG + keyG * dd + fillG * ff + boG * bo) + keyG * sp + rimG * rim + 26 * ss) * occ * tG;
+        var cb = (mnb * (ambB + keyB * dd + fillB * ff + boB * bo) + keyB * sp + rimB * rim + 14 * ss) * occ * tB;
         if (cr > KNEE) cr = KNEE + (cr - KNEE) / (1 + (cr - KNEE) * KSH);
         if (cg > KNEE) cg = KNEE + (cg - KNEE) / (1 + (cg - KNEE) * KSH);
         if (cb > KNEE) cb = KNEE + (cb - KNEE) / (1 + (cb - KNEE) * KSH);

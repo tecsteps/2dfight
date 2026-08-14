@@ -134,10 +134,14 @@ var FX = FX || {};
     jab:       { dur: 0.24, hit: [0.34, 0.56], dmg: 4,  reach: 46, hy: 12,  arm: 0, push: 52,  hs: 0.16 },
     cross:     { dur: 0.36, hit: [0.34, 0.56], dmg: 8,  reach: 50, hy: 10,  arm: 1, push: 132, hs: 0.24 },
     hook:      { dur: 0.46, hit: [0.34, 0.56], dmg: 10, reach: 44, hy: 14,  arm: 1, push: 155, hs: 0.28, arc: 1 },
-    uppercut:  { dur: 0.56, hit: [0.34, 0.56], dmg: 13, reach: 38, hy: 36,  arm: 1, push: 120, hs: 0.34, launch: 490 },
+    uppercut:  { dur: 0.56, hit: [0.34, 0.56], dmg: 13, reach: 38, hy: 30,  arm: 1, push: 60,  hs: 0.34, launch: 630 },
     lowKick:   { dur: 0.34, hit: [0.34, 0.56], dmg: 7,  reach: 56, hy: -30, leg: 1, push: 96,  hs: 0.22, low: 1 },
-    highKick:  { dur: 0.50, hit: [0.34, 0.56], dmg: 12, reach: 60, hy: 8,   leg: 1, push: 190, hs: 0.30 },
-    roundhouse:{ dur: 0.62, hit: [0.34, 0.56], dmg: 15, reach: 62, hy: 4,   leg: 1, push: 300, hs: 0.36, arc: 1.6, launch: 380 },
+    /* A chambered snap, not a second turning kick. At reach 60 / hy 8 this
+     * sat at exactly the same maximum leg extension as the roundhouse and
+     * the two moves rendered as the same picture -- two of seven normals
+     * indistinguishable. Shorter and higher makes it a different shape. */
+    highKick:  { dur: 0.50, hit: [0.34, 0.56], dmg: 12, reach: 46, hy: 26,  leg: 1, push: 190, hs: 0.30 },
+    roundhouse:{ dur: 0.62, hit: [0.34, 0.56], dmg: 15, reach: 62, hy: 4,   leg: 1, push: 110, hs: 0.36, arc: 1.6, launch: 500 },
     sweep:     { dur: 0.50, hit: [0.34, 0.56], dmg: 8,  reach: 56, hy: -40, leg: 1, push: 90,  hs: 0.26, low: 1, trip: 1 },
 
     /* Air normals. Without them there is no jump-in, no air-to-air and no
@@ -147,7 +151,7 @@ var FX = FX || {};
     airKick:   { dur: 0.40, hit: [0.34, 0.70], dmg: 11, reach: 56, hy: -18, leg: 1, push: 150, hs: 0.30, air: 1 },
 
     special:   { dur: 0.80, hit: [0.34, 0.58], dmg: 26, reach: 58, hy: 8, arm: 1,
-                 push: 560, hs: 0.5, launch: 560, super: 1 },
+                 push: 260, hs: 0.5, launch: 700, super: 1 },
 
     /* The grab reached 43 units and the two bodies were held 44 apart, so
      * it missed by one unit, always -- about a 4% connect rate, entirely on
@@ -159,10 +163,12 @@ var FX = FX || {};
     hitHigh:   { dur: 0.30, stun: 1 },
     hitLow:    { dur: 0.30, stun: 1 },
     hitHeavy:  { dur: 0.45, stun: 1 },
-    knockdown: { dur: 1.25, stun: 1 },
+    // 75 frames of knockdown plus 33 of getup was 1.8s of dead time for
+    // every launcher and every trip -- over a third of the match
+    knockdown: { dur: 0.68, stun: 1 },
     // wake-up is invulnerable while getting up, then not -- whole-move
     // invulnerability makes okizeme impossible by construction
-    getup:     { dur: 0.55, inv: [0, 0.42] },
+    getup:     { dur: 0.40, inv: [0, 0.42] },
     victory:   { dur: 0, loop: true },
     defeat:    { dur: 0, loop: true }
   };
@@ -334,7 +340,7 @@ var FX = FX || {};
 
     // gravity and ground
     if (!this.onGround) {
-      this.vy += 1500 * dt;
+      this.vy += 2600 * dt;
       this.y += this.vy * dt;
       /* Ceiling, so a juggle cannot carry anyone out of frame. It applies
        * only to fighters who were put in the air by a hit -- clamping a
@@ -481,7 +487,7 @@ var FX = FX || {};
      * which put it squarely on the character's own jaw -- twenty-five head
      * primitives rendered and then covered by a skin-coloured ball. The
      * hands now sit at sternum height and well in front of the face. */
-    var g = [[9 + br * 2.2, 1 + br2 * 1.8], [21 + brA * 2.6, 6 + br2 * 2.0]];
+    var g = [[13 + br * 2.2, 1 + br2 * 1.8], [25 + brA * 2.6, 5 + br2 * 2.0]];
 
     // Block: both forearms stacked vertically in front of the chest and
     // face. The old target swung the elbow up and behind, so the arm arced
@@ -499,7 +505,11 @@ var FX = FX || {};
     else if (m === 'victory') { g = [[4, 20 + br * 2], [10, 24 + br * 2]]; }
     else if (m === 'grab') {
       var e = Math.sin(Math.PI * clamp01(p * 1.3));
-      g = [[7 + 22 * e, 1 + 4 * e], [16 + 20 * e, 5 + 2 * e]];
+      // driven by the move's own reach, like every other move. Hard-coding
+      // it to 36 while MOVES.grab.reach said 50 left the hand between half a
+      // unit and two units short at every distance -- it never once landed.
+      var gr = d.reach || 50;
+      g = [[7 + (gr - 14) * e, 1 + 4 * e], [16 + (gr - 16) * e, 5 + 2 * e]];
     } else if (m === 'throw') {
       var tp = smooth(p);
       g = [[8 + 16 * Math.sin(Math.PI * tp), 4 + 22 * tp], [16 + 14 * Math.sin(Math.PI * tp), 8 + 20 * tp]];
@@ -521,7 +531,9 @@ var FX = FX || {};
         hx2 = 8 + reach * 0.86 * ex * Math.sin(a + 0.6);
         hy2 = 7 + (hy - 7) * ex + Math.cos(a) * 14 * ex;
       }
-      if (m === 'uppercut') { hy2 = 7 + (hy + 14) * ex; hx2 = 8 + (reach - 8) * ex * 0.8; }
+      // the arc used to finish 57 units above the chest, which put the fist
+      // clear over the head of anything it was aimed at
+      if (m === 'uppercut') { hy2 = 7 + (hy - 4) * ex; hx2 = 8 + (reach - 8) * ex * 0.85; }
       g = [[8, 7], [17, 11]];
       g[i] = [hx2, hy2];
       // the other hand pulls back as a counterweight
@@ -622,7 +634,9 @@ var FX = FX || {};
     for (var s = 0; s < 2; s++) {
       var fs = this.feet[s];
       fs.planted = true;
-      var rate = (m === 'dash' || this.kick.on) ? 18 : 7;
+      // the kick branch used to yank the support foot at rate 18, sliding it
+      // nearly three units in a single frame with no lift
+      var rate = m === 'dash' ? 18 : (this.kick.on ? 5 : 7);
       fs.wx += (want[s] - fs.wx) * Math.min(1, dt * rate);
       fs.wy += (gy - fs.wy) * Math.min(1, dt * 14);
       // a heel that breathes is the cheapest sign of life there is
@@ -740,6 +754,17 @@ var FX = FX || {};
     for (var i = 0; i < 2; i++) {
       var lx = this.hand[i].x.v, ly = this.hand[i].y.v;
       var hx = chest[0] + fw * lx, hy = chest[1] - ly;
+      /* Clamp the hand to what the arm can actually reach.
+       *
+       * ik2 constrains the elbow, but the wrist was placed at the raw target
+       * regardless -- so the forearm was simply drawn at whatever length was
+       * left over. Measured peak stretch on a jab was 32.1 units against an
+       * lArm of 20: sixty percent, which is why a fully extended punch
+       * rendered as one unbroken rubber tube with no elbow in it. */
+      var adx = hx - shoulders[i][0], ady = hy - shoulders[i][1];
+      var ad = Math.sqrt(adx * adx + ady * ady) || 0.0001;
+      var amax = (L.uArm + L.lArm) * 0.94;
+      if (ad > amax) { hx = shoulders[i][0] + adx / ad * amax; hy = shoulders[i][1] + ady / ad * amax; }
       // both branches used to return 1, so the rear elbow broke outward
       // like the lead one instead of tucking in
       var pole = (i === 0 ? -1 : 1) * fw;

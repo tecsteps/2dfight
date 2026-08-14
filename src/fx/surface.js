@@ -279,6 +279,41 @@ var FX = FX || {};
     }
   };
 
+  /* An additive elliptical annulus -- shockwave rings.
+   *
+   * Walking the circumference and stamping a disc at each step is both
+   * gappy and ruinously expensive: a 150-pixel ring needs ~1500 steps to
+   * close, and each stamp shades its own disc, so one ring costs millions of
+   * pixel writes. One pass over the bounding box shading by distance from
+   * the ring's radius is exact, gapless, and costs the area of the ring. */
+  Surface.prototype.addRing = function (cx, cy, rad, thick, squash, r, g, b, a) {
+    if (rad <= 0 || a <= 0) return;
+    var ry = rad * squash, ty = thick * squash;
+    var x0 = Math.max(0, Math.ceil(cx - rad - thick));
+    var x1 = Math.min(this.w - 1, Math.floor(cx + rad + thick));
+    var y0 = Math.max(0, Math.ceil(cy - ry - ty));
+    var y1 = Math.min(this.h - 1, Math.floor(cy + ry + ty));
+    if (x1 < x0 || y1 < y0) return;
+    var isq = 1 / squash, it = 1 / thick, px = this.px, W = this.w;
+    for (var y = y0; y <= y1; y++) {
+      var dy = (y - cy) * isq, dy2 = dy * dy, o = y * W;
+      for (var x = x0; x <= x1; x++) {
+        var dx = x - cx;
+        var dd = Math.sqrt(dx * dx + dy2) - rad;
+        if (dd < 0) dd = -dd;
+        if (dd >= thick) continue;
+        var f = 1 - dd * it;
+        var al = a * f * f;
+        var i = o + x, v = px[i];
+        var nr = (v & 255) + r * al;
+        var ng = ((v >>> 8) & 255) + g * al;
+        var nb = ((v >>> 16) & 255) + b * al;
+        px[i] = 0xff000000 | ((nb > 255 ? 255 : nb | 0) << 16) |
+          ((ng > 255 ? 255 : ng | 0) << 8) | (nr > 255 ? 255 : nr | 0);
+      }
+    }
+  };
+
   F.Surface = Surface;
   F.rgb = rgb;
   F.rgba = rgba;
