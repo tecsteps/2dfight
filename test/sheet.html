@@ -1,0 +1,74 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>frame sheet</title>
+<style>body{background:#111;margin:0}canvas{image-rendering:pixelated;width:100%}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script src="../src/engine/gfx.js"></script>
+<script src="../src/engine/raster.js"></script>
+<script src="../src/game/rig.js"></script>
+<script src="../src/game/poses.js"></script>
+<script src="../src/game/frames.js"></script>
+<script>
+var skin = new URLSearchParams(location.search).get('skin') || 'prince';
+var showSword = new URLSearchParams(location.search).get('sword') === '1';
+var only = new URLSearchParams(location.search).get('clip');
+
+var t0 = performance.now();
+var FT = POP.buildFrameTable(skin);
+var bakeMs = performance.now() - t0;
+
+// sprites are baked in device pixels, so the sheet works in device pixels
+// too: a Gfx with scale 1 is a plain 1:1 canvas
+var Z = +(new URLSearchParams(location.search).get('zoom') || 1);
+var R = POP.RES;
+var CELL_W = 46 * R * Z, CELL_H = 74 * R * Z, COLS = +(new URLSearchParams(location.search).get('cols') || 20);
+var clips = only ? only.split(',') : POP.CLIP_ORDER;
+var rows = 0;
+clips.forEach(function (n) { rows += Math.ceil(FT.count[n] / COLS); });
+
+var g = new POP.Gfx(CELL_W * COLS, CELL_H * rows + 4, 1);
+
+// pixel-replicating blit so the bake can be inspected at the pixel level
+function blitZ(spr, x, y, z) {
+  if (z === 1) { g.blit(spr, x, y); return; }
+  for (var sy = 0; sy < spr.h; sy++) {
+    for (var sx = 0; sx < spr.w; sx++) {
+      var v = spr.data[sy * spr.w + sx];
+      if (!v) continue;
+      var px = x + (spr.ox + sx) * z, py = y + (spr.oy + sy) * z;
+      g.fillRect(px, py, z, z, v);
+    }
+  }
+}
+g.attach(document.getElementById('c'));
+g.clear(2);
+
+var C = POP.C;
+var row = 0;
+clips.forEach(function (name) {
+  var b = FT.base[name], n = FT.count[name];
+  for (var i = 0; i < n; i++) {
+    var col = i % COLS;
+    var r = row + Math.floor(i / COLS);
+    var cx = col * CELL_W + CELL_W / 2 | 0;
+    var cy = r * CELL_H + CELL_H - 8;
+    // floor line so foot placement is checkable
+    g.hline(col * CELL_W, cy, CELL_W, C.BRICK_D);
+    g.vline(cx, r * CELL_H + 2, CELL_H - 10, C.BRICK_S);
+    var f = FT.frames[b + i];
+    blitZ(f.img, cx, cy, Z);
+    if (showSword) blitZ(f.sword, cx, cy, Z);
+  }
+  row += Math.ceil(n / COLS);
+});
+g.present();
+
+window.__stats = {
+  bakeMs: Math.round(bakeMs),
+  frames: FT.frames.length,
+  clips: FT.count,
+  bytes: FT.frames.reduce(function (a, f) { return a + f.img.data.length + f.sword.data.length; }, 0)
+};
+document.title = 'baked ' + FT.frames.length + ' frames in ' + Math.round(bakeMs) + 'ms';
+</script>
+</body></html>

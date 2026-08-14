@@ -1,0 +1,3384 @@
+<title>Prince of Persia — Software Renderer</title>
+<style>
+
+  :root { --ink:#e8d5b5; --bg:#0b0908; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    overflow:hidden; height:100%; overscroll-behavior:none; touch-action:none; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #wrap { display:flex; align-items:center; justify-content:center; }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    display:block;
+    background:#000;
+    box-shadow: 0 0 0 1px #2b211a, 0 8px 40px rgba(0,0,0,.8);
+  }
+  #pad { display:none; width:100%; padding:8px 8px calc(8px + env(safe-area-inset-bottom));
+    gap:8px; justify-content:space-between; align-items:flex-end; }
+  .cluster { display:flex; gap:8px; }
+  .btn { width:60px; height:52px; border-radius:8px; border:1px solid #54402f;
+    background:#1a1410; color:var(--ink); font-size:19px; display:flex;
+    align-items:center; justify-content:center; user-select:none; font-weight:700; }
+  .btn.on { background:#54402f; border-color:#a3856a; }
+  .btn.wide { width:74px; }
+  #hint { font-size:11px; opacity:.5; padding:6px; text-align:center; letter-spacing:.04em; }
+  @media (pointer:coarse), (max-width: 760px) {
+    #pad { display:flex; }
+    #hint { display:none; }
+  }
+
+</style>
+<div id="wrap"><canvas id="screen"></canvas></div>
+  <div id="hint">&larr; &rarr; move &nbsp;·&nbsp; &uarr; jump / climb &nbsp;·&nbsp; &darr; crouch / block &nbsp;·&nbsp; shift step &nbsp;·&nbsp; M mute &nbsp;·&nbsp; R restart</div>
+  <div id="pad">
+    <div class="cluster">
+      <div class="btn" data-key="left">&#9664;</div>
+      <div class="btn" data-key="right">&#9654;</div>
+    </div>
+    <div class="cluster">
+      <div class="btn wide" data-key="shift">step</div>
+      <div class="btn" data-key="down">&#9660;</div>
+      <div class="btn" data-key="up">&#9650;</div>
+    </div>
+  </div>
+<script>
+/* ===== src/engine/gfx.js ===== */
+/*
+ * gfx.js -- software framebuffer.
+ *
+ * The whole point of this engine: we own every pixel. There is exactly one
+ * canvas call in the entire renderer (putImageData). Everything above it is
+ * an indexed-colour byte buffer and a hand-written blitter, the way a 1989
+ * game would have done it against a VGA mode 13h framebuffer.
+ *
+ * No SVG. No WebGL. No drawImage, no fillRect, no ctx.translate.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  var W = 320, H = 200;
+
+  /* Render scale. The game's whole coordinate system -- the sequence table's
+   * chx deltas, tile sizes, room layout -- stays in the original 320x200
+   * space. RES only decides how many real pixels each of those units is
+   * drawn with, so the figure gains detail without a single movement number
+   * changing. Sprites are baked at RES; the blitter and every primitive
+   * multiply logical coordinates up on the way in. */
+  var RES = 3;
+
+  /* ---- palette -------------------------------------------------------
+   * Index 0 is the transparency key in sprites; as a screen colour it is
+   * plain black. Everything else is a fixed dungeon/character palette in
+   * the spirit of the VGA release.
+   */
+  var PAL_RGB = [
+    0x000000, // 0  transparent key / black
+    0x0d0a08, // 1  void
+    0x1a1410, // 2  deep shadow
+    0x2b211a, // 3  brick shadow
+    0x3d2f24, // 4  brick dark
+    0x54402f, // 5  brick mid-dark
+    0x6b523c, // 6  brick mid
+    0x87694e, // 7  brick light
+    0xa3856a, // 8  brick highlight
+    0xc7a888, // 9  stone highlight
+    0xe8d5b5, // 10 bright stone / cream
+    0x7a5238, // 11 skin shadow
+    0x9c6642, // 12 skin mid
+    0xc9905e, // 13 skin light
+    0x6d7480, // 14 cloth shadow
+    0x9aa2ad, // 15 cloth mid
+    0xd2d8de, // 16 cloth light
+    0xf2f5f8, // 17 cloth highlight
+    0x1d1a17, // 18 outline / hair dark
+    0x8a1c14, // 19 red dark (sash, guard)
+    0xc4302010 & 0xffffff, // placeholder, overwritten below
+    0x000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  ];
+  // explicit tail so the table stays readable
+  PAL_RGB[20] = 0xc43a24; // red mid
+  PAL_RGB[21] = 0xe86a3c; // torch flame / red light
+  PAL_RGB[22] = 0xf5c05a; // torch core / gold
+  PAL_RGB[23] = 0xfff0b0; // torch hot
+  PAL_RGB[24] = 0x243a5e; // guard blue dark
+  PAL_RGB[25] = 0x3a5a8c; // guard blue mid
+  PAL_RGB[26] = 0x5c82b8; // guard blue light
+  PAL_RGB[27] = 0x707070; // steel dark
+  PAL_RGB[28] = 0xa8a8a8; // steel mid
+  PAL_RGB[29] = 0xe0e4e8; // steel light
+  PAL_RGB[30] = 0x2a4a2a; // green (potion glass)
+  PAL_RGB[31] = 0x3aa03a; // green light
+  // hair is deliberately NOT the outline colour: when they matched, the
+  // outline ring fused with the hair and every head grew a halo
+  PAL_RGB[32] = 0x30211a; // hair dark
+  PAL_RGB[33] = 0x4a3324; // hair mid
+  PAL_RGB[34] = 0x141c30; // night sky
+  PAL_RGB[35] = 0x6a2a1a; // torch bracket
+
+  P.W = W;
+  P.H = H;
+  P.RES = RES;
+
+  // named indices used by the rest of the game
+  P.C = {
+    TRANS: 0, BLACK: 0, VOID: 1, SHADOW: 2,
+    BRICK_S: 3, BRICK_D: 4, BRICK_MD: 5, BRICK_M: 6, BRICK_L: 7, BRICK_H: 8,
+    STONE_H: 9, CREAM: 10,
+    SKIN_D: 11, SKIN_M: 12, SKIN_L: 13,
+    CLOTH_D: 14, CLOTH_M: 15, CLOTH_L: 16, CLOTH_H: 17,
+    OUTLINE: 18,
+    RED_D: 19, RED_M: 20, FLAME: 21, GOLD: 22, HOT: 23,
+    BLUE_D: 24, BLUE_M: 25, BLUE_L: 26,
+    STEEL_D: 27, STEEL_M: 28, STEEL_L: 29,
+    GREEN_D: 30, GREEN_L: 31,
+    HAIR_D: 32, HAIR_M: 33, SKY: 34, BRACKET: 35
+  };
+
+  function Gfx(w, h, scale) {
+    this.s = scale === undefined ? RES : scale;
+    this.lw = w || W;
+    this.lh = h || H;
+    this.w = this.lw * this.s;
+    this.h = this.lh * this.s;
+    this.buf = new Uint8Array(this.w * this.h);  // framebuffer: one byte/pixel
+    this.bg = new Uint8Array(this.w * this.h);   // cached room background
+    this.pal32 = new Uint32Array(256);
+    this.canvas = null;
+    this.ctx = null;
+    this.imgData = null;
+    this.px32 = null;
+    this.buildPalette(0);
+  }
+
+  /* Build the ABGR lookup. `flash` lets us do palette tricks -- the cheap
+   * old-school way to make the screen react without touching a single pixel. */
+  Gfx.prototype.buildPalette = function (flashAmount, flashR, flashG, flashB) {
+    var f = flashAmount || 0;
+    var fr = flashR === undefined ? 255 : flashR;
+    var fg = flashG === undefined ? 255 : flashG;
+    var fb = flashB === undefined ? 255 : flashB;
+    for (var i = 0; i < 40; i++) {
+      var c = PAL_RGB[i] || 0;
+      var r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+      if (f > 0) {
+        r = (r + (fr - r) * f) | 0;
+        g = (g + (fg - g) * f) | 0;
+        b = (b + (fb - b) * f) | 0;
+      }
+      this.pal32[i] = (255 << 24) | (b << 16) | (g << 8) | r;
+    }
+  };
+
+  Gfx.prototype.attach = function (canvas) {
+    this.canvas = canvas;
+    canvas.width = this.w;
+    canvas.height = this.h;
+    this.ctx = canvas.getContext('2d', { alpha: false });
+    this.imgData = this.ctx.createImageData(this.w, this.h);
+    this.px32 = new Uint32Array(this.imgData.data.buffer);
+  };
+
+  /* The one and only canvas call. Expand indexed bytes through the palette
+   * into the ImageData and hand it to the browser. */
+  Gfx.prototype.present = function () {
+    var b = this.buf, p = this.px32, pal = this.pal32, n = this.w * this.h;
+    for (var i = 0; i < n; i++) p[i] = pal[b[i]];
+    this.ctx.putImageData(this.imgData, 0, 0);
+  };
+
+  Gfx.prototype.clear = function (c) { this.buf.fill(c | 0); };
+  Gfx.prototype.clearBg = function (c) { this.bg.fill(c | 0); };
+
+  /* Restore the framebuffer from the cached room background. This is the
+   * classic "erase by redrawing the background" step that every sprite game
+   * did before compositing was free. */
+  Gfx.prototype.restore = function () { this.buf.set(this.bg); };
+
+  // logical-space pixel: becomes an s-by-s block
+  Gfx.prototype.px = function (x, y, c) { this.fillRect(x, y, 1, 1, c); };
+
+  // device-space pixel, for code that is already working in real pixels
+  Gfx.prototype.pxRaw = function (x, y, c, target) {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h) return;
+    (target || this.buf)[y * this.w + x] = c;
+  };
+
+  Gfx.prototype.fillRect = function (x, y, w, h, c, target) {
+    var t = target || this.buf, W = this.w, s = this.s;
+    var x0 = Math.round(x * s), y0 = Math.round(y * s);
+    var x1 = Math.round((x + w) * s), y1 = Math.round((y + h) * s);
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > W) x1 = W; if (y1 > this.h) y1 = this.h;
+    if (x1 <= x0) return;
+    for (var yy = y0; yy < y1; yy++) t.fill(c, yy * W + x0, yy * W + x1);
+  };
+
+  Gfx.prototype.hline = function (x, y, w, c, target) { this.fillRect(x, y, w, 1, c, target); };
+
+  Gfx.prototype.vline = function (x, y, h, c, target) { this.fillRect(x, y, 1, h, c, target); };
+
+  /* ---- the blitter ---------------------------------------------------
+   * Sprite = { w, h, ox, oy, data:Uint8Array } with 0 as the transparency
+   * key. (x, y) is the sprite's reference point (feet-centre for actors);
+   * ox/oy shift from that point to the top-left of the stored bitmap.
+   *
+   * `flip` mirrors horizontally about the reference point, which is how a
+   * single set of right-facing frames serves both directions -- exactly the
+   * trick the original used to halve its sprite budget.
+   */
+  Gfx.prototype.blit = function (spr, x, y, flip, target, clipTop, clipBot) {
+    if (!spr) return;
+    var t = target || this.buf, W = this.w, H = this.h, s = this.s;
+    var sw = spr.w, sh = spr.h, d = spr.data;
+    var px = Math.round(x * s), py = Math.round(y * s);
+    var dx0 = flip ? (px - spr.ox - sw + 1) : (px + spr.ox);
+    var dy0 = py + spr.oy;
+
+    var top = clipTop === undefined ? 0 : clipTop * s;
+    var bot = clipBot === undefined ? H : clipBot * s;
+
+    var sy0 = 0, sy1 = sh;
+    if (dy0 < top) sy0 = top - dy0;
+    if (dy0 + sh > bot) sy1 = bot - dy0;
+
+    for (var sy = sy0; sy < sy1; sy++) {
+      var ty = dy0 + sy;
+      var srow = sy * sw;
+      var trow = ty * W;
+      if (!flip) {
+        var sx0 = 0, sx1 = sw;
+        if (dx0 < 0) sx0 = -dx0;
+        if (dx0 + sw > W) sx1 = W - dx0;
+        for (var sx = sx0; sx < sx1; sx++) {
+          var v = d[srow + sx];
+          if (v) t[trow + dx0 + sx] = v;
+        }
+      } else {
+        // mirrored: source column sx lands at dx0 + (sw-1-sx)
+        for (var fx = 0; fx < sw; fx++) {
+          var v2 = d[srow + fx];
+          if (!v2) continue;
+          var tx = dx0 + (sw - 1 - fx);
+          if (tx < 0 || tx >= W) continue;
+          t[trow + tx] = v2;
+        }
+      }
+    }
+  };
+
+  /* Blit remapped through a colour table -- used for the guard (same rig,
+   * different wardrobe) and for silhouette/flash effects. */
+  Gfx.prototype.blitRemap = function (spr, x, y, flip, map, target, clipTop, clipBot) {
+    if (!spr) return;
+    var t = target || this.buf, W = this.w, H = this.h, s = this.s;
+    var sw = spr.w, sh = spr.h, d = spr.data;
+    var px = Math.round(x * s), py = Math.round(y * s);
+    var dx0 = flip ? (px - spr.ox - sw + 1) : (px + spr.ox);
+    var dy0 = py + spr.oy;
+    var top = clipTop === undefined ? 0 : clipTop * s;
+    var bot = clipBot === undefined ? H : clipBot * s;
+    var sy0 = 0, sy1 = sh;
+    if (dy0 < top) sy0 = top - dy0;
+    if (dy0 + sh > bot) sy1 = bot - dy0;
+    for (var sy = sy0; sy < sy1; sy++) {
+      var trow = (dy0 + sy) * W, srow = sy * sw;
+      for (var sx = 0; sx < sw; sx++) {
+        var v = d[srow + sx];
+        if (!v) continue;
+        var tx = flip ? dx0 + (sw - 1 - sx) : dx0 + sx;
+        if (tx < 0 || tx >= W) continue;
+        t[trow + tx] = map[v] || v;
+      }
+    }
+  };
+
+  P.Gfx = Gfx;
+  P.PAL_RGB = PAL_RGB;
+})(POP);
+
+/* ===== src/engine/raster.js ===== */
+/*
+ * raster.js -- the bake-time rasteriser.
+ *
+ * This is the tool half of the engine. At startup we draw every character
+ * pose once, at 3x, with scanline polygon fills, then majority-vote it down
+ * to 1x and grow a dark outline. The result is a plain indexed bitmap.
+ *
+ * After boot this file is never touched again: the runtime only ever blits
+ * finished bytes. That split -- an offline-ish art pipeline feeding a dumb
+ * fast blitter -- is exactly how the original was structured, except their
+ * pipeline ran on a VHS deck and a light table.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  /* Supersample factor used while baking. At RES=1 this wanted to be 3 to
+   * keep thin limbs solid; now that sprites are baked at RES the effective
+   * oversample is RES*SS, so 2 is plenty and costs a third less. */
+  var SS = 2;
+
+  /* The canvas carries a parallel part-id plane. Every fill stamps the
+   * current partId alongside the colour, so afterwards we know which pixel
+   * belongs to which limb -- that is what lets us draw outlines *between*
+   * overlapping body parts, not just around the silhouette. Without it a
+   * white-clothed figure collapses into one unreadable blob. */
+  function Canvas(w, h) {
+    this.w = w; this.h = h;
+    this.data = new Uint8Array(w * h);
+    this.part = new Uint8Array(w * h);
+    this.partId = 1;
+  }
+  Canvas.prototype.clear = function () { this.data.fill(0); this.part.fill(0); };
+
+  P.RasterCanvas = Canvas;
+
+  /* --- scanline convex/simple polygon fill, even-odd ------------------ */
+  function fillPoly(cv, pts, color) {
+    var n = pts.length / 2;
+    if (n < 3) return;
+    var minY = 1e9, maxY = -1e9, i;
+    for (i = 0; i < n; i++) {
+      var y = pts[i * 2 + 1];
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    var y0 = Math.max(0, Math.ceil(minY));
+    var y1 = Math.min(cv.h - 1, Math.floor(maxY));
+    var xs = [];
+    for (var sy = y0; sy <= y1; sy++) {
+      var cy = sy + 0.5;
+      xs.length = 0;
+      for (i = 0; i < n; i++) {
+        var ax = pts[i * 2], ay = pts[i * 2 + 1];
+        var j = (i + 1) % n;
+        var bx = pts[j * 2], by = pts[j * 2 + 1];
+        if ((ay <= cy && by > cy) || (by <= cy && ay > cy)) {
+          xs.push(ax + (cy - ay) / (by - ay) * (bx - ax));
+        }
+      }
+      if (xs.length < 2) continue;
+      xs.sort(function (a, b) { return a - b; });
+      for (var k = 0; k + 1 < xs.length; k += 2) {
+        var xa = Math.max(0, Math.ceil(xs[k] - 0.5));
+        var xb = Math.min(cv.w - 1, Math.floor(xs[k + 1] - 0.5));
+        if (xb < xa) continue;
+        span(cv, sy, xa, xb, color);
+      }
+    }
+  }
+
+  function span(cv, y, xa, xb, color) {
+    var o = y * cv.w;
+    cv.data.fill(color, o + xa, o + xb + 1);
+    cv.part.fill(cv.partId, o + xa, o + xb + 1);
+  }
+
+  function disc(cv, cx, cy, r, color) {
+    if (r <= 0) return;
+    var y0 = Math.max(0, Math.ceil(cy - r)), y1 = Math.min(cv.h - 1, Math.floor(cy + r));
+    var r2 = r * r;
+    for (var y = y0; y <= y1; y++) {
+      var dy = y + 0.5 - cy;
+      var t = r2 - dy * dy;
+      if (t <= 0) continue;
+      var hw = Math.sqrt(t);
+      var xa = Math.max(0, Math.ceil(cx - hw - 0.5));
+      var xb = Math.min(cv.w - 1, Math.floor(cx + hw - 0.5));
+      if (xb < xa) continue;
+      span(cv, y, xa, xb, color);
+    }
+  }
+
+  /* Tapered capsule: a limb. Quad body plus round caps so joints hinge
+   * cleanly without gaps at any angle. */
+  function capsule(cv, x0, y0, x1, y1, r0, r1, color) {
+    var dx = x1 - x0, dy = y1 - y0;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 0.0001) { disc(cv, x0, y0, Math.max(r0, r1), color); return; }
+    var nx = -dy / len, ny = dx / len;
+    fillPoly(cv, [
+      x0 + nx * r0, y0 + ny * r0,
+      x1 + nx * r1, y1 + ny * r1,
+      x1 - nx * r1, y1 - ny * r1,
+      x0 - nx * r0, y0 - ny * r0
+    ], color);
+    disc(cv, x0, y0, r0, color);
+    disc(cv, x1, y1, r1, color);
+  }
+
+  function ellipse(cv, cx, cy, rx, ry, color) {
+    var y0 = Math.max(0, Math.ceil(cy - ry)), y1 = Math.min(cv.h - 1, Math.floor(cy + ry));
+    for (var y = y0; y <= y1; y++) {
+      var dy = (y + 0.5 - cy) / ry;
+      var t = 1 - dy * dy;
+      if (t <= 0) continue;
+      var hw = rx * Math.sqrt(t);
+      var xa = Math.max(0, Math.ceil(cx - hw - 0.5));
+      var xb = Math.min(cv.w - 1, Math.floor(cx + hw - 0.5));
+      if (xb < xa) continue;
+      span(cv, y, xa, xb, color);
+    }
+  }
+
+  /* --- downsample by majority vote ------------------------------------
+   * Straight point-sampling at 1x turns thin limbs into dotted lines. A
+   * majority vote over the SSxSS block keeps limbs solid and quantises the
+   * shading into clean bands, which is what pixel art wants.
+   */
+  /* There are only SS*SS samples per output pixel -- at SS=2 that is four.
+   * Clearing and scanning a 64-bucket histogram for four samples costs
+   * around fifty times more than tallying them directly, and with tens of
+   * thousands of output pixels per pose that was most of the bake. */
+  function downsample(hi, w, h, coverage) {
+    var out = new Uint8Array(w * h);
+    var outPart = new Uint8Array(w * h);
+    var need = coverage === undefined ? Math.max(1, Math.round(SS * SS * 0.42)) : coverage;
+    var N = SS * SS;
+    var cv = new Uint8Array(N), cn = new Uint8Array(N);
+    var pv = new Uint8Array(N), pn = new Uint8Array(N);
+    var hw = hi.w, hd = hi.data, hp = hi.part;
+
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var nc = 0, np = 0, opaque = 0, i;
+        for (var sy = 0; sy < SS; sy++) {
+          var row = (y * SS + sy) * hw + x * SS;
+          for (var sx = 0; sx < SS; sx++) {
+            var v = hd[row + sx];
+            if (!v) continue;
+            opaque++;
+            var f = -1;
+            for (i = 0; i < nc; i++) if (cv[i] === v) { f = i; break; }
+            if (f < 0) { cv[nc] = v; cn[nc] = 1; nc++; } else cn[f]++;
+            var p = hp[row + sx];
+            f = -1;
+            for (i = 0; i < np; i++) if (pv[i] === p) { f = i; break; }
+            if (f < 0) { pv[np] = p; pn[np] = 1; np++; } else pn[f]++;
+          }
+        }
+        if (opaque < need) continue;
+        var best = 0, bestN = 0;
+        for (i = 0; i < nc; i++) if (cn[i] > bestN) { bestN = cn[i]; best = cv[i]; }
+        var bp = 0, bpN = 0;
+        for (i = 0; i < np; i++) if (pn[i] > bpN) { bpN = pn[i]; bp = pv[i]; }
+        out[y * w + x] = best;
+        outPart[y * w + x] = bp;
+      }
+    }
+    return { color: out, part: outPart };
+  }
+
+  /* Grow a 1px dark border around the silhouette. The original sprites read
+   * clearly against busy brickwork because of exactly this. */
+  function outline(data, w, h, color, part) {
+    var out = new Uint8Array(data);
+    var i, x, y;
+    // internal edges first: where two different parts touch, darken the one
+    // that was drawn earlier (further back), so the nearer limb reads on top
+    if (part) {
+      for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+          i = y * w + x;
+          var pa = part[i];
+          if (!pa) continue;
+          var pb;
+          if (x < w - 1) {
+            pb = part[i + 1];
+            if (pb && pb !== pa) out[pb > pa ? i : i + 1] = color;
+          }
+          if (y < h - 1) {
+            pb = part[i + w];
+            if (pb && pb !== pa) out[pb > pa ? i : i + w] = color;
+          }
+        }
+      }
+    }
+    // then the silhouette
+    for (y = 0; y < h; y++) {
+      for (x = 0; x < w; x++) {
+        i = y * w + x;
+        if (data[i]) continue;
+        var hit = false;
+        if (x > 0 && data[i - 1]) hit = true;
+        else if (x < w - 1 && data[i + 1]) hit = true;
+        else if (y > 0 && data[i - w]) hit = true;
+        else if (y < h - 1 && data[i + w]) hit = true;
+        if (hit) out[i] = color;
+      }
+    }
+    return out;
+  }
+
+  /* Crop to the used bounding box and record where the reference point
+   * ended up, so the blitter can put it back exactly. */
+  function crop(data, w, h, refX, refY) {
+    var minX = w, minY = h, maxX = -1, maxY = -1;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (!data[y * w + x]) continue;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (maxX < 0) return { w: 1, h: 1, ox: 0, oy: 0, data: new Uint8Array(1) };
+    var cw = maxX - minX + 1, ch = maxY - minY + 1;
+    var out = new Uint8Array(cw * ch);
+    for (var yy = 0; yy < ch; yy++) {
+      for (var xx = 0; xx < cw; xx++) {
+        out[yy * cw + xx] = data[(minY + yy) * w + (minX + xx)];
+      }
+    }
+    return { w: cw, h: ch, ox: minX - refX, oy: minY - refY, data: out };
+  }
+
+  P.Raster = {
+    SS: SS,
+    fillPoly: fillPoly,
+    disc: disc,
+    capsule: capsule,
+    ellipse: ellipse,
+    downsample: downsample,
+    outline: outline,
+    crop: crop
+  };
+})(POP);
+
+/* ===== src/engine/font.js ===== */
+/*
+ * font.js -- a 4x6 bitmap font, punched out as strings and packed at boot.
+ *
+ * Text in a software renderer is just another blit. No fillText anywhere.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  var GLYPHS = {
+    'A': '.##.#..##..####.#..##..#', 'B': '###.#..####.#..##..####.',
+    'C': '.####..##...#...#..#.###', 'D': '###.#..##..##..##..####.',
+    'E': '#####...###.#...#...####', 'F': '#####...###.#...#...#...',
+    'G': '.####...#.###..##..#.###', 'H': '#..##..######..##..##..#',
+    'I': '###..#...#...#...#..###.', 'J': '..#...#...#...#.#.#..#..',
+    'K': '#..##.#.##..#.#.#..##..#', 'L': '#...#...#...#...#...####',
+    'M': '#..######.####..##..##..', 'N': '#..###.##.###..##..##..#',
+    'O': '.##.#..##..##..##..#.##.', 'P': '###.#..##..####.#...#...',
+    'Q': '.##.#..##..##.####..##.#', 'R': '###.#..####.#.#.#..##..#',
+    'S': '.####...#.##...#...###..', 'T': '####.#...#...#...#...#..',
+    'U': '#..##..##..##..##..#.##.', 'V': '#..##..##..##..#.##..##.',
+    'W': '#..##..##..############.', 'X': '#..##..#.##..##.#..##..#',
+    'Y': '#..##..#.##...#...#...#.', 'Z': '####...#..#..#..#...####',
+    '0': '.##.#..##.###.##..#.##..', '1': '.#..##...#...#...#..###.',
+    '2': '.##.#..#...#.##.#...####', '3': '###....#.##....##..#.##.',
+    '4': '..#..##.#.#.#####...#...', '5': '#####...###....##..#.##.',
+    '6': '.##.#...###.#..##..#.##.', '7': '####...#..#..#..#...#...',
+    '8': '.##.#..#.##.#..##..#.##.', '9': '.##.#..##..#.####..#.##.',
+    ' ': '........................', '.': '................##..##..',
+    ',': '.................#...#..', '!': '.#...#...#...#.......#..',
+    '-': '.........####...........', ':': '....##..##......##..##..',
+    "'": '.#...#..................', '/': '...#...#..#..#..#...#...',
+    '?': '.##.#..#...#..#.....#...', '+': '....'+'.#..'+'###.'+'.#..'+'....'+'....'
+  };
+
+  var W = 4, H = 6;
+  var cache = null;
+
+  function build() {
+    cache = {};
+    for (var ch in GLYPHS) {
+      if (!GLYPHS.hasOwnProperty(ch)) continue;
+      var s = GLYPHS[ch];
+      var d = new Uint8Array(W * H);
+      for (var i = 0; i < W * H; i++) d[i] = s[i] === '#' ? 1 : 0;
+      cache[ch] = d;
+    }
+  }
+
+  /* Draw a string. `col` is the palette index the set pixels take. */
+  function text(g, str, x, y, col, shadowCol) {
+    if (!cache) build();
+    str = String(str).toUpperCase();
+    for (var i = 0; i < str.length; i++) {
+      var d = cache[str[i]];
+      if (!d) { continue; }
+      for (var yy = 0; yy < H; yy++) {
+        for (var xx = 0; xx < W; xx++) {
+          if (!d[yy * W + xx]) continue;
+          if (shadowCol !== undefined) g.px(x + i * (W + 1) + xx + 1, y + yy + 1, shadowCol);
+          g.px(x + i * (W + 1) + xx, y + yy + col * 0, col);
+        }
+      }
+    }
+  }
+
+  function width(str) { return String(str).length * (W + 1) - 1; }
+
+  P.Font = { text: text, width: width, W: W, H: H };
+})(POP);
+
+/* ===== src/engine/audio.js ===== */
+/*
+ * audio.js -- a tiny synth for the tap opcodes.
+ *
+ * The sequence table fires `tap,N` on specific frames -- footfalls, the
+ * landing thump, blade on blade. Those cues are part of the animation, so
+ * they are worth having even in rough form. Everything here is oscillators
+ * and envelopes; there are no samples to load.
+ *
+ * Nothing starts until the first user gesture, per browser autoplay rules.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  function Audio() {
+    this.ctx = null;
+    this.on = true;
+    this.ready = false;
+  }
+
+  Audio.prototype.enable = function () {
+    if (this.ready) { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.22;
+      this.master.connect(this.ctx.destination);
+      this.ready = true;
+    } catch (e) { /* no audio, no problem */ }
+  };
+
+  Audio.prototype.mute = function (m) {
+    this.on = !m;
+    if (this.master) this.master.gain.value = m ? 0 : 0.22;
+  };
+
+  Audio.prototype.tone = function (type, f0, f1, dur, vol) {
+    if (!this.ready || !this.on) return;
+    var c = this.ctx, t = c.currentTime;
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  };
+
+  Audio.prototype.noise = function (dur, vol, f) {
+    if (!this.ready || !this.on) return;
+    var c = this.ctx, t = c.currentTime;
+    var n = Math.floor(c.sampleRate * dur);
+    var buf = c.createBuffer(1, n, c.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    var s = c.createBufferSource(); s.buffer = buf;
+    var bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f || 900;
+    var g = c.createGain(); g.gain.value = vol;
+    s.connect(bp); bp.connect(g); g.connect(this.master);
+    s.start(t);
+  };
+
+  /* tap ids as used in the sequence table */
+  Audio.prototype.play = function (id, audible) {
+    if (!this.ready || !this.on || !audible) return;
+    switch (id) {
+      case 0: this.noise(0.09, 0.5, 380); break;             // land
+      case 1: this.noise(0.045, 0.22, 1500); break;          // footstep
+      case 2: this.noise(0.05, 0.2, 700); break;             // grab ledge
+      case 3: this.tone('square', 200, 420, 0.09, 0.16); break; // jump
+      case 4: this.noise(0.14, 0.55, 260); break;            // heavy land
+      case 5: this.noise(0.25, 0.7, 160); break;             // bad land
+      case 6: this.noise(0.07, 0.35, 300); break;            // bump
+      case 7: this.tone('sawtooth', 900, 300, 0.08, 0.1); break; // swing
+      case 8: this.tone('square', 2100, 900, 0.16, 0.16);        // parry
+        this.tone('square', 3100, 1400, 0.11, 0.09); break;
+      case 9: this.tone('sawtooth', 300, 90, 0.3, 0.2); break;   // hit
+      case 10: this.tone('triangle', 660, 990, 0.16, 0.16);      // pickup
+        this.tone('triangle', 990, 1320, 0.16, 0.12); break;
+      case 11: this.tone('sine', 400, 300, 0.05, 0.05); break;   // whiff
+      case 12: this.noise(0.3, 0.5, 200); break;                 // slab falls
+      default: break;
+    }
+  };
+
+  P.Audio = Audio;
+})(POP);
+
+/* ===== src/game/rig.js ===== */
+/*
+ * rig.js -- the articulated figure the sprites are baked from.
+ *
+ * Mechner filmed his brother on VHS and traced the frames. We can't film
+ * anybody, so the substitute is a jointed figure driven by absolute limb
+ * angles, posed by hand to match the motion the rotoscope produced. Same
+ * end product: a stack of finished bitmaps. The runtime never sees this.
+ *
+ * Angle convention: degrees, screen-style (y down), so 90 = straight down,
+ * -90 = straight up, 0 = forward (the direction the sprite faces), 180 =
+ * behind. Every angle is absolute, not relative to its parent -- authoring
+ * a pose then means describing the silhouette you want, not doing forward
+ * kinematics in your head.
+ *
+ * Pose layout (14 numbers):
+ *   [ hipX, hipY, torso, head,
+ *     farShoulder, farElbow, nearShoulder, nearElbow,
+ *     farHip, farKnee, farFoot, nearHip, nearKnee, nearFoot ]
+ * hipY is height above the floor line, hipX is offset from the body axis.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  var R = P.Raster, C = P.C;
+  var SS = R.SS;
+  var RES = P.RES;             // device pixels per logical pixel
+  var Z = RES * SS;            // total oversample while drawing
+
+  // bake canvas in logical units; reference point is the feet on the floor
+  var BW = 88, BH = 96, REF_X = 44, REF_Y = 76;
+
+  P.Bake = { W: BW, H: BH, REF_X: REF_X, REF_Y: REF_Y, RES: RES };
+
+  // limb lengths, 1x pixels
+  var L = {
+    torso: 14.8, neck: 2.6, headR: 4.0,
+    uArm: 8.6, lArm: 7.6, hand: 2.2,
+    uLeg: 13.5, lLeg: 12.5, foot: 6,
+    sword: 25
+  };
+
+  var D2R = Math.PI / 180;
+
+  function adv(x, y, ang, len) {
+    var a = ang * D2R;
+    return [x + Math.cos(a) * len, y - Math.sin(a) * len];
+  }
+
+  // pose space (x right, y up from floor) -> supersampled canvas space
+  function cx(x) { return (REF_X + x) * Z; }
+  function cy(y) { return (REF_Y - y) * Z; }
+
+  /* Part ids, ordered back-to-front. The outline pass darkens whichever
+   * side of a boundary has the lower id, so a near limb always cuts a clean
+   * dark edge into whatever it overlaps. */
+  var PART = { FAR_LEG: 1, FAR_ARM: 2, TORSO: 3, HEAD: 4, NEAR_LEG: 5, NEAR_ARM: 6, SWORD: 7 };
+
+  function cap(cv, a, b, r0, r1, col) {
+    R.capsule(cv, cx(a[0]), cy(a[1]), cx(b[0]), cy(b[1]), r0 * Z, r1 * Z, col);
+  }
+  function dot(cv, a, r, col) { R.disc(cv, cx(a[0]), cy(a[1]), r * Z, col); }
+
+  /* Wardrobes. Same rig, different bytes -- the guard is the prince in a
+   * blue coat and a helmet, which is also roughly what the original did. */
+  P.SKINS = {
+    prince: {
+      clothD: C.CLOTH_D, clothM: C.CLOTH_M, clothL: C.CLOTH_L, clothH: C.CLOTH_H,
+      skinD: C.SKIN_D, skinM: C.SKIN_M, skinL: C.SKIN_L,
+      hair: C.HAIR_D, hair2: C.HAIR_M,
+      sashD: C.RED_D, sashM: C.RED_M,
+      bootD: C.BRICK_S, bootM: C.BRICK_D,
+      helmet: 0
+    },
+    guard: {
+      clothD: C.BLUE_D, clothM: C.BLUE_M, clothL: C.BLUE_L, clothH: C.BLUE_L,
+      skinD: C.SKIN_D, skinM: C.SKIN_D, skinL: C.SKIN_M,
+      hair: C.HAIR_D, hair2: C.HAIR_M,
+      sashD: C.RED_D, sashM: C.RED_M,
+      bootD: C.BRICK_S, bootM: C.BRICK_D,
+      helmet: C.STEEL_M
+    },
+    skeleton: {
+      clothD: C.BRICK_S, clothM: C.BRICK_D, clothL: C.BRICK_MD, clothH: C.CREAM,
+      skinD: C.BRICK_D, skinM: C.STONE_H, skinL: C.CREAM,
+      hair: C.OUTLINE, hair2: C.BRICK_S,
+      sashD: C.BRICK_S, sashM: C.BRICK_D,
+      bootD: C.BRICK_S, bootM: C.BRICK_D,
+      helmet: 0
+    }
+  };
+
+  /* Draw one leg chain. `far` picks the darker shade set so the two legs
+   * separate visually without any depth buffer. */
+  function drawLeg(cv, hip, angs, sk, far) {
+    cv.partId = far ? PART.FAR_LEG : PART.NEAR_LEG;
+    var cloth = far ? sk.clothD : sk.clothM;
+    var clothHi = far ? sk.clothM : sk.clothL;
+    var boot = far ? sk.bootD : sk.bootM;
+    var knee = adv(hip[0], hip[1], angs[0], L.uLeg);
+    var ankle = adv(knee[0], knee[1], angs[1], L.lLeg);
+    // baggy trouser on the thigh, tapering at the knee
+    cap(cv, hip, knee, 3.9, 3.1, cloth);
+    // shin: trouser to mid-calf, then boot
+    var mid = [knee[0] + (ankle[0] - knee[0]) * 0.55, knee[1] + (ankle[1] - knee[1]) * 0.55];
+    cap(cv, knee, mid, 3.1, 2.5, clothHi);
+    cap(cv, mid, ankle, 2.4, 2.0, boot);
+    var toe = adv(ankle[0], ankle[1], angs[2], L.foot);
+    cap(cv, ankle, toe, 2.2, 1.5, boot);
+  }
+
+  function drawArm(cv, sh, angs, sk, far) {
+    cv.partId = far ? PART.FAR_ARM : PART.NEAR_ARM;
+    var sleeve = far ? sk.clothD : sk.clothL;
+    var skin = far ? sk.skinM : sk.skinL;
+    var elbow = adv(sh[0], sh[1], angs[0], L.uArm);
+    var wrist = adv(elbow[0], elbow[1], angs[1], L.lArm);
+    // short sleeve down to mid-upper-arm, bare forearm below
+    var sleeveEnd = [sh[0] + (elbow[0] - sh[0]) * 0.58, sh[1] + (elbow[1] - sh[1]) * 0.58];
+    cap(cv, sh, sleeveEnd, 3.0, 2.3, sleeve);
+    cap(cv, sleeveEnd, elbow, 1.9, 1.6, skin);
+    cap(cv, elbow, wrist, 1.6, 1.35, skin);
+    dot(cv, wrist, 1.5, skin);
+    return wrist;
+  }
+
+  function drawSword(cv, wrist, ang, sk) {
+    cv.partId = PART.SWORD;
+    var tip = adv(wrist[0], wrist[1], ang, L.sword);
+    var base = adv(wrist[0], wrist[1], ang, -3);
+    // crossguard
+    var g1 = adv(wrist[0], wrist[1], ang + 90, 3.2);
+    var g2 = adv(wrist[0], wrist[1], ang - 90, 3.2);
+    cap(cv, base, wrist, 1.6, 1.6, C.STEEL_D);
+    cap(cv, g1, g2, 1.2, 1.2, C.GOLD);
+    cap(cv, wrist, tip, 1.9, 0.9, C.STEEL_L);
+  }
+
+  /* Draw a full pose. Painter's order: far limbs, body, near limbs. */
+  function drawPose(cv, p, sk, opts) {
+    opts = opts || {};
+    var hipX = p[0], hipY = p[1];
+    var hip = [hipX, hipY];
+    var torsoA = p[2], headA = p[3];
+
+    var neck = adv(hipX, hipY, torsoA, L.torso);
+    var headBase = adv(neck[0], neck[1], headA, L.neck);
+    var headC = adv(headBase[0], headBase[1], headA, L.headR * 0.9);
+
+    // shoulders sit slightly below the neck joint along the torso axis
+    var sh = [neck[0] - Math.cos(torsoA * D2R) * 1.2, neck[1] + Math.sin(torsoA * D2R) * 1.2];
+    // hips splay a touch so the two legs don't start from one point
+    var hipF = [hipX - 0.6, hipY], hipN = [hipX + 0.6, hipY];
+
+    drawLeg(cv, hipF, [p[8], p[9], p[10]], sk, true);
+    var farWrist = drawArm(cv, sh, [p[4], p[5]], sk, true);
+    if (opts.swordFar) drawSword(cv, farWrist, opts.swordFar, sk);
+
+    // torso: wide at the chest, narrow at the waist
+    cv.partId = PART.TORSO;
+    var chest = [hipX + (neck[0] - hipX) * 0.60, hipY + (neck[1] - hipY) * 0.60];
+    cap(cv, hip, chest, 3.9, 4.5, sk.clothM);
+    cap(cv, chest, neck, 4.3, 2.3, sk.clothL);
+    // sash at the waist
+    var w1 = [hipX + (chest[0] - hipX) * 0.04, hipY + (chest[1] - hipY) * 0.04];
+    var w2 = [hipX + (chest[0] - hipX) * 0.32, hipY + (chest[1] - hipY) * 0.32];
+    cap(cv, w1, w2, 4.2, 4.3, sk.sashM);
+    cap(cv, w1, w2, 3.0, 3.1, sk.sashD);
+
+    // neck + head
+    cv.partId = PART.HEAD;
+    cap(cv, neck, headBase, 1.9, 1.9, sk.skinM);
+    R.disc(cv, cx(headC[0]), cy(headC[1]), L.headR * Z, sk.skinL);
+    // brow/nose bump on the forward side
+    var nose = adv(headC[0], headC[1], headA + 90, L.headR * 0.82);
+    R.disc(cv, cx(nose[0]), cy(nose[1]), 1.0 * Z, sk.skinL);
+    // hair cap over the back and top of the skull
+    if (sk.helmet) {
+      var hTop = adv(headC[0], headC[1], headA, L.headR * 0.55);
+      R.disc(cv, cx(hTop[0]), cy(hTop[1]), L.headR * 0.95 * Z, sk.helmet);
+      var hBack = adv(headC[0], headC[1], headA - 90, L.headR * 0.75);
+      R.disc(cv, cx(hBack[0]), cy(hBack[1]), L.headR * 0.8 * Z, C.STEEL_D);
+    } else {
+      var top = adv(headC[0], headC[1], headA, L.headR * 0.26);
+      R.disc(cv, cx(top[0]), cy(top[1]), L.headR * 0.86 * Z, sk.hair);
+      var back = adv(headC[0], headC[1], headA - 90, L.headR * 0.50);
+      R.disc(cv, cx(back[0]), cy(back[1]), L.headR * 0.76 * Z, sk.hair2);
+      // face has to survive the hair discs -- redraw the forward cheek
+      var face = adv(headC[0], headC[1], headA + 90, L.headR * 0.50);
+      R.disc(cv, cx(face[0]), cy(face[1]), L.headR * 0.64 * Z, sk.skinL);
+    }
+    // eye
+    var eye = adv(headC[0], headC[1], headA + 74, L.headR * 0.58);
+    R.disc(cv, cx(eye[0]), cy(eye[1]), 0.75 * Z, C.OUTLINE);
+
+    drawLeg(cv, hipN, [p[11], p[12], p[13]], sk, false);
+    var nearWrist = drawArm(cv, sh, [p[6], p[7]], sk, false);
+    if (opts.sword) drawSword(cv, nearWrist, opts.sword, sk);
+  }
+
+  /* Horizontal squash of a finished bitmap, nearest-neighbour, about the
+   * reference column. Used for the turn: rather than draw three-quarter
+   * views we compress the side view edge-on, which is exactly the sort of
+   * bitmap trick the era ran on. */
+  function squashX(spr, f) {
+    var nw = Math.max(1, Math.round(spr.w * f));
+    var out = new Uint8Array(nw * spr.h);
+    for (var y = 0; y < spr.h; y++) {
+      for (var x = 0; x < nw; x++) {
+        var sx = Math.min(spr.w - 1, Math.floor((x + 0.5) / f));
+        out[y * nw + x] = spr.data[y * spr.w + sx];
+      }
+    }
+    // keep the reference column in the same place after the squash
+    var newOx = Math.round(spr.ox * f);
+    return { w: nw, h: spr.h, ox: newOx, oy: spr.oy, data: out };
+  }
+
+  /* Bake one pose into a finished, cropped, outlined indexed sprite. */
+  var _cv = null;
+  function bakePose(pose, sk, opts) {
+    if (!_cv) _cv = new P.RasterCanvas(BW * Z, BH * Z);
+    _cv.clear();
+    drawPose(_cv, pose, sk, opts);
+    var lo = R.downsample(_cv, BW * RES, BH * RES);
+    var px = R.outline(lo.color, BW * RES, BH * RES, C.OUTLINE, lo.part);
+    var spr = R.crop(px, BW * RES, BH * RES, REF_X * RES, REF_Y * RES);
+    var xs = pose[14];
+    if (xs !== undefined && xs < 0.999) spr = squashX(spr, xs);
+    return spr;
+  }
+
+  /* Where the near hand ends up for a given pose -- needed because the
+   * sword is a separate bitmap, exactly as it was in the original frame
+   * table (which carried an `image` and a `sword` field per frame). */
+  function nearWrist(p) {
+    var neck = adv(p[0], p[1], p[2], L.torso);
+    var sh = [neck[0] - Math.cos(p[2] * D2R) * 1.5, neck[1] + Math.sin(p[2] * D2R) * 1.5];
+    var elbow = adv(sh[0], sh[1], p[6], L.uArm);
+    return adv(elbow[0], elbow[1], p[7], L.lArm);
+  }
+
+  /* Bake just the blade, so an unarmed prince and an armed one share one
+   * set of body frames. */
+  function bakeSword(pose, angle) {
+    if (!_cv) _cv = new P.RasterCanvas(BW * Z, BH * Z);
+    _cv.clear();
+    var w = nearWrist(pose);
+    drawSword(_cv, w, angle, P.SKINS.prince);
+    var lo = R.downsample(_cv, BW * RES, BH * RES);
+    var px = R.outline(lo.color, BW * RES, BH * RES, C.OUTLINE, lo.part);
+    var spr = R.crop(px, BW * RES, BH * RES, REF_X * RES, REF_Y * RES);
+    var xs = pose[14];
+    if (xs !== undefined && xs < 0.999) spr = squashX(spr, xs);
+    return spr;
+  }
+
+  P.Rig = {
+    L: L,
+    drawPose: drawPose,
+    bakePose: bakePose,
+    bakeSword: bakeSword,
+    nearWrist: nearWrist,
+    squashX: squashX,
+    adv: adv
+  };
+})(POP);
+
+/* ===== src/game/poses.js ===== */
+/*
+ * poses.js -- the pose library, and the clips built out of it.
+ *
+ * These stand in for the rotoscope. Where the original traced VHS frames of
+ * David Mechner running around a parking lot in white clothes, this is the
+ * same motion described as joint angles and hand-tuned until the silhouette
+ * reads right. Frame counts and timing are taken from the real SEQTABLE.S,
+ * so the *rhythm* is the original's even though the drawings are ours.
+ *
+ * A clip is either an explicit frame list or a set of keys interpolated out
+ * to a frame count. Interpolation here is authoring convenience only -- by
+ * the time the game runs, every frame is a finished bitmap.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  /* pose: hipX hipY torso head | farSh farEl nearSh nearEl
+   *       | farHip farKnee farFoot | nearHip nearKnee nearFoot | xscale */
+  function pz(hx, hy, t, hd, fs, fe, ns, ne, fh, fk, ff, nh, nk, nf, xs) {
+    return [hx, hy, t, hd, fs, fe, ns, ne, fh, fk, ff, nh, nk, nf,
+      xs === undefined ? 1 : xs];
+  }
+
+  function lerp(a, b, u) {
+    var o = new Array(15);
+    for (var i = 0; i < 15; i++) o[i] = a[i] + (b[i] - a[i]) * u;
+    return o;
+  }
+
+  /* ---- individual poses --------------------------------------------- */
+
+  var STAND = pz(0, 27, -88, -90, 95, 98, 87, 92, 88, 90, 5, 93, 91, 2);
+  var STAND_A = pz(0, 26, -85, -88, 100, 112, 80, 84, 86, 92, 5, 96, 94, 2);
+
+  // eight-frame run cycle. Frames 5-8 are 1-4 with the legs and arms
+  // swapped, which also swaps which leg gets the lit shade -- the legs read
+  // as alternating in front, for free.
+  var RUN = [
+    pz(0, 26, -72, -78, 80, -25, 112, 125, 112, 125, -20, 68, 88, 5),
+    pz(0, 24, -70, -78, 88, -8, 106, 118, 116, 142, -30, 82, 92, 0),
+    pz(0, 25, -70, -80, 98, 25, 98, 100, 100, 140, -44, 96, 96, 8),
+    pz(0, 27, -73, -80, 108, 70, 88, 40, 80, 146, -30, 112, 118, -10),
+    pz(0, 26, -72, -78, 112, 125, 80, -25, 68, 88, 5, 112, 125, -20),
+    pz(0, 24, -70, -78, 106, 118, 88, -8, 82, 92, 0, 116, 142, -30),
+    pz(0, 25, -70, -80, 98, 100, 98, 25, 96, 96, 8, 100, 140, -44),
+    pz(0, 27, -73, -80, 88, 40, 108, 70, 112, 118, -10, 80, 146, -30)
+  ];
+
+  var CROUCH = pz(0, 15, -58, -74, 60, 80, 52, 74, 96, 138, 0, 104, 142, 4);
+  var CROUCH_DEEP = pz(0, 12, -50, -70, 70, 95, 62, 88, 100, 148, 2, 108, 152, 6);
+
+  /* ---- clip table ---------------------------------------------------
+   * `frames` = literal poses. `keys` = [frameIndex, pose] pairs, everything
+   * between them interpolated. `n` = total frames when using keys.
+   */
+  var CLIPS = {
+
+    stand: { frames: [STAND] },
+    alertstand: { frames: [STAND_A] },
+    runcyc: { frames: RUN },
+
+    // startrun: six frames from a standing start into the cycle.
+    // chx in the real table is 0,0,0,8,3,3 -- the lunge is on frame 4.
+    startrun: {
+      frames: [
+        pz(0, 26, -84, -88, 92, 98, 86, 92, 88, 94, 5, 92, 92, 2),
+        pz(0, 25, -80, -85, 102, 118, 76, 66, 94, 104, 2, 86, 96, 6),
+        pz(0, 24, -76, -82, 116, 152, 62, 32, 104, 118, -8, 78, 92, 6),
+        pz(0, 24, -72, -80, 130, 186, 50, 10, 112, 134, -24, 70, 88, 5),
+        pz(0, 25, -71, -79, 138, 192, 46, 6, 116, 140, -28, 68, 88, 5),
+        pz(0, 26, -72, -78, 46, 6, 134, 190, 113, 126, -22, 68, 88, 5)
+      ]
+    },
+
+    // runstop: skid. Weight goes back, front foot planted and braced.
+    runstop: {
+      frames: [
+        pz(0, 25, -80, -84, 60, 30, 118, 170, 100, 120, -10, 74, 90, 12),
+        pz(-2, 22, -96, -92, 30, -10, 140, 190, 108, 130, 0, 58, 78, 20),
+        pz(-3, 21, -100, -95, 20, -25, 148, 200, 112, 126, 4, 55, 74, 22),
+        pz(-2, 23, -96, -92, 40, 5, 130, 180, 104, 116, 6, 64, 82, 14)
+      ]
+    },
+
+    // turn: `aboutface` fires first, so these frames play already facing the
+    // new way -- the figure resolves out of an edge-on pivot. The x-squash
+    // is doing the work a set of three-quarter drawings would have done.
+    turn: {
+      frames: [
+        pz(0, 25, -88, -90, 92, 100, 90, 96, 90, 94, 3, 92, 93, 2, 0.34),
+        pz(0, 25, -88, -90, 94, 102, 88, 95, 90, 93, 3, 92, 92, 2, 0.50),
+        pz(0, 26, -88, -90, 95, 101, 88, 94, 89, 92, 4, 93, 92, 2, 0.66),
+        pz(0, 26, -88, -90, 95, 100, 87, 93, 89, 91, 4, 93, 91, 2, 0.79),
+        pz(0, 27, -88, -90, 95, 99, 87, 92, 88, 90, 5, 93, 91, 2, 0.88),
+        pz(0, 27, -88, -90, 95, 98, 87, 92, 88, 90, 5, 93, 91, 2, 0.94),
+        pz(0, 27, -88, -90, 95, 98, 87, 92, 88, 90, 5, 93, 91, 2, 0.98),
+        STAND
+      ]
+    },
+
+    // standing jump: 18 frames. Crouch, uncoil, tuck, reach, land, recover.
+    standjump: {
+      n: 18,
+      keys: [
+        [0, pz(0, 25, -80, -86, 100, 118, 82, 96, 92, 104, 2, 96, 106, 2)],
+        [3, pz(0, 20, -68, -80, 126, 172, 108, 150, 98, 128, 0, 102, 132, 2)],
+        [5, CROUCH_DEEP],
+        [6, pz(0, 18, -60, -76, 148, 204, 132, 196, 100, 146, 0, 106, 150, 4)],
+        [7, pz(0, 25, -70, -80, 78, 26, 62, 14, 96, 112, -8, 100, 116, -4)],
+        [8, pz(0, 31, -76, -84, 24, -28, 10, -40, 108, 128, -38, 114, 136, -34)],
+        [9, pz(0, 35, -82, -88, 2, -42, -8, -52, 74, 122, -22, 84, 130, -18)],
+        [10, pz(0, 33, -80, -86, 22, -16, 12, -26, 60, 82, 10, 70, 88, 6)],
+        [11, pz(0, 28, -78, -84, 40, 10, 32, 4, 70, 86, 6, 80, 90, 3)],
+        [12, pz(0, 19, -62, -76, 58, 78, 50, 72, 92, 134, 0, 100, 140, 4)],
+        [13, pz(0, 22, -70, -80, 70, 92, 62, 86, 92, 118, 2, 98, 122, 3)],
+        [15, pz(0, 25, -80, -85, 86, 96, 78, 90, 90, 100, 4, 94, 102, 3)],
+        [17, STAND]
+      ]
+    },
+
+    // running jump: 11 frames, the long one. chy goes -3,-9,-2 then +11,+3,
+    // so the arc is entirely in the data -- no gravity involved.
+    runjump: {
+      n: 11,
+      keys: [
+        [0, RUN[2]],
+        [1, pz(0, 26, -68, -78, 92, 60, 96, 140, 92, 160, -50, 100, 100, 8)],
+        [2, pz(0, 25, -64, -76, 120, 150, 70, 30, 78, 140, -30, 112, 116, -4)],
+        [3, pz(0, 23, -60, -74, 140, 190, 44, 0, 62, 96, 4, 122, 140, -30)],
+        [4, pz(0, 28, -66, -78, 150, 200, 20, -30, 74, 84, 8, 132, 152, -40)],
+        [5, pz(0, 33, -74, -84, 130, 186, -2, -48, 96, 96, 4, 138, 160, -44)],
+        [6, pz(0, 36, -80, -88, 100, 150, -14, -56, 116, 118, -14, 120, 156, -40)],
+        [7, pz(0, 35, -80, -88, 70, 106, 4, -36, 100, 108, -6, 86, 138, -22)],
+        [8, pz(0, 31, -78, -86, 46, 52, 30, -6, 76, 88, 8, 66, 100, 2)],
+        [9, pz(0, 25, -70, -80, 58, 72, 52, 40, 88, 116, 2, 78, 96, 6)],
+        [10, pz(0, 26, -72, -78, 46, 8, 132, 186, 110, 124, -20, 70, 90, 5)]
+      ]
+    },
+
+    // jumpup: vertical spring to catch a ledge overhead.
+    jumpup: {
+      n: 9,
+      keys: [
+        [0, pz(0, 24, -80, -86, 102, 120, 84, 98, 92, 108, 2, 96, 110, 2)],
+        [2, CROUCH_DEEP],
+        [3, pz(0, 22, -74, -82, 40, -10, 30, -20, 96, 130, -2, 102, 134, 2)],
+        [4, pz(0, 32, -86, -92, -60, -84, -66, -86, 100, 130, -20, 106, 136, -16)],
+        [5, pz(0, 38, -88, -92, -80, -88, -82, -88, 92, 118, -10, 98, 122, -8)],
+        [6, pz(0, 36, -88, -92, -82, -88, -84, -88, 90, 108, -4, 94, 110, -2)],
+        [7, pz(0, 28, -82, -88, 60, 80, 54, 76, 92, 122, 0, 98, 126, 2)],
+        [8, STAND]
+      ]
+    },
+
+    // hang: hands on the ledge one row up, feet swinging near the floor
+    // below. The cycle in the real table swings back and forth for 40-odd
+    // frames before it gives out; we keep a short loop of the same motion.
+    hang: {
+      n: 12,
+      keys: [
+        [0, pz(0, 33, -88, -84, -86, -89, -88, -89, 84, 96, 20, 90, 100, 16)],
+        [3, pz(0, 32, -86, -82, -86, -89, -88, -89, 74, 88, 26, 80, 92, 22)],
+        [6, pz(0, 33, -88, -84, -86, -89, -88, -89, 88, 98, 18, 94, 102, 14)],
+        [9, pz(0, 32, -90, -86, -86, -89, -88, -89, 100, 110, 8, 106, 114, 6)],
+        [11, pz(0, 33, -88, -84, -86, -89, -88, -89, 86, 97, 19, 92, 101, 15)]
+      ]
+    },
+    hangstraight: {
+      frames: [pz(0, 33, -89, -86, -87, -89, -88, -89, 90, 96, 14, 95, 99, 12)]
+    },
+
+    // hangdrop: let go, absorb the half-storey.
+    hangdrop: {
+      n: 6,
+      keys: [
+        [0, pz(0, 33, -88, -84, -74, -84, -78, -85, 92, 104, 10, 98, 108, 8)],
+        [1, pz(0, 29, -86, -84, -30, -50, -36, -54, 96, 118, 4, 102, 122, 4)],
+        [2, pz(0, 22, -74, -80, 30, 20, 24, 14, 98, 132, 0, 104, 136, 2)],
+        [3, CROUCH],
+        [5, STAND]
+      ]
+    },
+
+    // climbup: 15 frames. Halfway through, the real sequence does
+    // `chx,5 / chy,-63 / up` -- it teleports the character one row up and
+    // switches rooms mid-animation. Frames after that point are authored
+    // against the upper floor, which is why they start in a heap.
+    climbup: {
+      n: 15,
+      keys: [
+        [0, pz(0, 33, -88, -84, -86, -89, -88, -89, 88, 98, 18, 94, 102, 14)],
+        [2, pz(0, 37, -86, -80, -82, -112, -84, -110, 84, 104, 16, 90, 108, 12)],
+        [4, pz(0, 42, -84, -76, -78, -130, -80, -128, 80, 112, 12, 86, 116, 10)],
+        [5, pz(0, 46, -82, -74, -76, -142, -78, -140, 76, 120, 8, 82, 124, 6)],
+        // --- chy,-63: everything below is relative to the upper floor ---
+        [6, pz(-2, 9, -34, -56, 44, 96, 38, 92, 108, 158, 8, 114, 160, 10)],
+        [8, pz(-1, 12, -44, -62, 52, 92, 46, 88, 104, 152, 6, 110, 154, 8)],
+        [10, pz(0, 16, -56, -70, 62, 88, 56, 84, 98, 142, 4, 106, 146, 6)],
+        [12, pz(0, 21, -70, -80, 76, 92, 70, 88, 94, 116, 2, 100, 120, 4)],
+        [14, STAND]
+      ]
+    },
+
+    freefall: {
+      n: 4,
+      keys: [
+        [0, pz(0, 27, -84, -80, -40, -70, -50, -76, 74, 108, -10, 108, 130, -18)],
+        [2, pz(0, 27, -92, -96, -30, -62, -58, -84, 96, 130, -20, 88, 112, -6)],
+        [3, pz(0, 27, -86, -84, -44, -72, -46, -74, 80, 116, -14, 102, 124, -14)]
+      ]
+    },
+
+    softland: {
+      n: 4,
+      keys: [
+        [0, pz(0, 21, -66, -78, 54, 66, 46, 60, 94, 132, 0, 100, 136, 4)],
+        [1, CROUCH],
+        [3, STAND]
+      ]
+    },
+    hardland: {
+      n: 8,
+      keys: [
+        [0, pz(0, 14, -46, -66, 84, 118, 78, 114, 102, 152, 2, 110, 156, 6)],
+        [1, pz(0, 11, -38, -60, 92, 128, 86, 124, 104, 158, 4, 112, 162, 8)],
+        [4, CROUCH_DEEP],
+        [6, CROUCH],
+        [7, STAND]
+      ]
+    },
+
+    crouch: { frames: [CROUCH] },
+
+    // a single walking step, used for the fourteen step-lengths the real
+    // game had for lining up exactly with a ledge.
+    step: {
+      n: 8,
+      keys: [
+        [0, STAND],
+        [1, pz(0, 26, -84, -88, 100, 112, 80, 86, 84, 92, 6, 98, 96, 2)],
+        [3, pz(0, 25, -80, -86, 112, 132, 68, 60, 74, 88, 10, 108, 110, -4)],
+        [5, pz(0, 25, -82, -86, 104, 120, 76, 74, 80, 90, 8, 102, 102, 0)],
+        [7, STAND]
+      ]
+    },
+
+    bump: {
+      n: 5,
+      keys: [
+        [0, pz(0, 25, -96, -94, 40, 8, 34, 2, 94, 100, 2, 88, 96, 4)],
+        [1, pz(-2, 24, -102, -98, 30, -6, 24, -12, 98, 106, 0, 84, 94, 6)],
+        [3, pz(-1, 26, -92, -92, 60, 40, 54, 34, 92, 96, 4, 90, 94, 3)],
+        [4, STAND]
+      ]
+    },
+
+    drink: {
+      n: 10,
+      keys: [
+        [0, STAND],
+        [2, pz(0, 26, -86, -88, 92, 96, 40, -30, 88, 92, 4, 93, 92, 2)],
+        [4, pz(0, 26, -88, -96, 92, 96, 10, -70, 88, 92, 4, 93, 92, 2)],
+        [7, pz(0, 26, -90, -104, 92, 96, 4, -82, 88, 92, 4, 93, 92, 2)],
+        [9, STAND]
+      ]
+    },
+
+    /* ---- swordplay -------------------------------------------------- */
+
+    engarde: {
+      n: 5,
+      keys: [
+        [0, STAND],
+        [2, pz(0, 26, -84, -88, 110, 140, 60, 30, 86, 94, 6, 96, 98, 2)],
+        [4, pz(0, 25, -84, -88, 128, 172, 22, -4, 78, 96, 6, 104, 104, 0)]
+      ],
+      sword: [null, -40, -20, -8, -4]
+    },
+    ready: {
+      n: 4,
+      keys: [
+        [0, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)],
+        [2, pz(0, 24, -83, -88, 132, 178, 24, -2, 78, 98, 6, 104, 104, 0)],
+        [3, pz(0, 25, -84, -88, 130, 176, 21, -5, 76, 96, 6, 106, 106, 0)]
+      ],
+      sword: [-4, -2, 0, -3]
+    },
+    advance: {
+      n: 4,
+      keys: [
+        [0, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)],
+        [1, pz(0, 24, -80, -86, 134, 180, 16, -10, 66, 92, 10, 110, 112, -4)],
+        [2, pz(0, 24, -82, -87, 132, 178, 18, -8, 70, 94, 8, 100, 100, 2)],
+        [3, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)]
+      ],
+      sword: [-4, -6, -5, -4]
+    },
+    retreat: {
+      n: 4,
+      keys: [
+        [0, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)],
+        [1, pz(0, 24, -88, -90, 126, 172, 26, 0, 86, 100, 4, 96, 100, 2)],
+        [2, pz(0, 24, -86, -89, 128, 174, 24, -2, 92, 104, 2, 88, 96, 4)],
+        [3, pz(0, 25, -84, -88, 130, 176, 20, -6, 76, 96, 6, 106, 106, 0)]
+      ],
+      sword: [-4, -8, -6, -4]
+    },
+    // strike: the lunge. Front leg drives out, sword arm extends level.
+    strike: {
+      n: 4,
+      keys: [
+        [0, pz(0, 25, -82, -88, 132, 178, 34, 10, 78, 98, 6, 104, 104, 0)],
+        [1, pz(2, 22, -74, -86, 146, 196, 8, -2, 58, 78, 12, 118, 122, -6)],
+        [2, pz(4, 20, -70, -84, 152, 202, 2, 0, 48, 66, 16, 126, 130, -10)],
+        [3, pz(1, 23, -78, -87, 140, 188, 16, -4, 66, 86, 10, 112, 114, -2)]
+      ],
+      sword: [-14, -4, 0, -6]
+    },
+    block: {
+      n: 3,
+      keys: [
+        [0, pz(0, 25, -84, -88, 128, 172, 10, -34, 78, 96, 6, 104, 104, 0)],
+        [1, pz(0, 25, -86, -90, 126, 168, -6, -54, 82, 98, 4, 100, 102, 0)],
+        [2, pz(0, 25, -85, -89, 127, 170, 2, -44, 80, 97, 5, 102, 103, 0)]
+      ],
+      sword: [-56, -74, -66]
+    },
+    stabbed: {
+      n: 6,
+      keys: [
+        [0, pz(0, 25, -92, -94, 118, 150, 40, 20, 88, 100, 4, 96, 100, 2)],
+        [1, pz(-2, 24, -100, -100, 100, 120, 66, 60, 96, 112, 0, 86, 96, 6)],
+        [3, pz(-4, 23, -108, -106, 80, 96, 88, 92, 104, 124, -4, 78, 90, 10)],
+        [5, pz(-6, 22, -112, -110, 70, 84, 96, 104, 110, 132, -8, 72, 86, 12)]
+      ],
+      sword: [-20, -40, -70, -90]
+    },
+    dead: {
+      n: 5,
+      keys: [
+        [0, pz(-6, 20, -120, -116, 66, 78, 100, 110, 114, 138, -10, 68, 82, 14)],
+        [2, pz(-8, 12, -150, -140, 40, 40, 130, 140, 130, 150, -20, 50, 70, 20)],
+        [4, pz(-10, 4, -172, -168, 14, 10, 160, 168, 152, 166, -30, 30, 52, 26)]
+      ],
+      sword: [null, null, null, null, null]
+    }
+  };
+
+  /* Expand keys into frames. */
+  function expand(clip) {
+    if (clip.frames) return clip.frames;
+    var keys = clip.keys, n = clip.n, out = new Array(n);
+    for (var f = 0; f < n; f++) {
+      var a = keys[0], b = keys[keys.length - 1];
+      for (var i = 0; i < keys.length - 1; i++) {
+        if (f >= keys[i][0] && f <= keys[i + 1][0]) { a = keys[i]; b = keys[i + 1]; break; }
+      }
+      if (f <= keys[0][0]) { out[f] = keys[0][1]; continue; }
+      if (f >= keys[keys.length - 1][0]) { out[f] = keys[keys.length - 1][1]; continue; }
+      var span = b[0] - a[0];
+      var u = span === 0 ? 0 : (f - a[0]) / span;
+      // smoothstep: keeps interpolated in-betweens from looking mechanical
+      u = u * u * (3 - 2 * u);
+      out[f] = lerp(a[1], b[1], u);
+    }
+    return out;
+  }
+
+  P.CLIPS = CLIPS;
+  P.expandClip = expand;
+  P.pz = pz;
+})(POP);
+
+/* ===== src/game/frames.js ===== */
+/*
+ * frames.js -- the baked frame table.
+ *
+ * Mirrors the original FRAMEDEF: a flat, numbered list of frames, each one
+ * carrying a body image and (separately) a sword image. Sequences address
+ * frames by number, so the sequence interpreter never knows what a clip is.
+ *
+ * Everything here runs once, at boot. Afterwards the game only blits.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  // Order matters only in that it fixes the frame numbering; sequences are
+  // resolved through CLIP_BASE so the numbers stay an implementation detail.
+  var CLIP_ORDER = [
+    'stand', 'alertstand', 'startrun', 'runcyc', 'runstop', 'turn',
+    'standjump', 'runjump', 'jumpup', 'hang', 'hangstraight', 'hangdrop',
+    'climbup', 'freefall', 'softland', 'hardland', 'crouch', 'step',
+    'bump', 'drink',
+    'engarde', 'ready', 'advance', 'retreat', 'strike', 'block',
+    'stabbed', 'dead'
+  ];
+
+  /* Build the whole frame table for one wardrobe. Returns
+   * { frames:[{img, sword}], base:{clip->firstIndex}, count:{clip->n} } */
+  function buildFrameTable(skinName) {
+    var sk = P.SKINS[skinName];
+    var frames = [];
+    var base = {};
+    var count = {};
+
+    for (var ci = 0; ci < CLIP_ORDER.length; ci++) {
+      var name = CLIP_ORDER[ci];
+      var clip = P.CLIPS[name];
+      if (!clip) continue;
+      var poses = P.expandClip(clip);
+      base[name] = frames.length;
+      count[name] = poses.length;
+      for (var i = 0; i < poses.length; i++) {
+        var pose = poses[i];
+        var body = P.Rig.bakePose(pose, sk, {});
+        // sword angle: authored where it matters, otherwise follow the
+        // forearm so an armed prince carries the blade naturally
+        var ang = null;
+        if (clip.sword && clip.sword.length) {
+          ang = clip.sword[Math.min(i, clip.sword.length - 1)];
+          if (ang === undefined) ang = null;
+        }
+        if (ang === null || ang === undefined) ang = pose[7];
+        var sword = P.Rig.bakeSword(pose, ang);
+        frames.push({ img: body, sword: sword });
+      }
+    }
+    return { frames: frames, base: base, count: count };
+  }
+
+  /* A colour table that turns the prince's bitmaps into a guard's. The
+   * original halved its sprite budget by mirroring frames; this is the same
+   * instinct applied to palette instead of geometry. */
+  function buildWardrobeMap(from, to) {
+    var m = new Uint8Array(64);
+    for (var i = 0; i < 64; i++) m[i] = i;
+    var keys = ['clothD', 'clothM', 'clothL', 'clothH',
+                'skinD', 'skinM', 'skinL', 'hair', 'hair2',
+                'sashD', 'sashM', 'bootD', 'bootM'];
+    for (var k = 0; k < keys.length; k++) {
+      var a = from[keys[k]], b = to[keys[k]];
+      if (a && b) m[a] = b;
+    }
+    return m;
+  }
+
+  P.buildFrameTable = buildFrameTable;
+  P.buildWardrobeMap = buildWardrobeMap;
+  P.CLIP_ORDER = CLIP_ORDER;
+})(POP);
+
+/* ===== src/game/seq.js ===== */
+/*
+ * seq.js -- the sequence table, ported in structure from SEQTABLE.S.
+ *
+ * This is the single most important idea in Prince of Persia and the reason
+ * it moves the way it does. There is no velocity variable and no gravity
+ * integrator for anything happening on the ground. A character is a program
+ * counter walking a byte stream. The stream says "show this frame, and move
+ * 5 pixels", then "show this frame, and move 1 pixel". Displacement is a
+ * property of the drawing, baked in by whoever traced it.
+ *
+ * The real run cycle is:
+ *     runcyc1 db 7,chx,5      runcyc5 db 11,chx,5
+ *     runcyc2 db 8,chx,1      runcyc6 db 12,chx,2
+ *     runcyc3 db tap,1,9,chx,2 runcyc7 db tap,1,13,chx,3
+ *     runcyc4 db 10,chx,4     runcyc8 db 14,chx,4
+ * -- 26 pixels per eight frames, and those exact numbers are used below.
+ *
+ * Opcode numbering follows the original's negative-constant convention.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  // instructions, exactly the set from the top of SEQTABLE.S
+  var OP = {
+    GOTO: -1, ABOUTFACE: -2, UP: -3, DOWN: -4, CHX: -5, CHY: -6,
+    ACT: -7, SETFALL: -8, IFWTLESS: -9, DIE: -10, JARU: -11, JARD: -12,
+    EFFECT: -13, TAP: -14, NEXTLEVEL: -15
+  };
+
+  // action states, as the original used them for collision decisions
+  var ACT = {
+    STAND: 0, RUN: 1, HANG: 2, INAIR: 3, FREEFALL: 4,
+    DEAD: 5, HANGSTRAIGHT: 6, TURN: 7
+  };
+
+  /* ---- authoring helpers -------------------------------------------
+   * Each returns a token list. `F` puts the chx/chy ahead of the frame so
+   * that "this frame carries this much movement" reads the way the data
+   * actually means it.
+   */
+  function F(clip, i, chx, chy) {
+    var t = [];
+    if (chx) t.push(OP.CHX, chx);
+    if (chy) t.push(OP.CHY, chy);
+    t.push(['F', clip, i]);
+    return t;
+  }
+  function ACTION(n) { return [OP.ACT, n]; }
+  function GOTO(l) { return [OP.GOTO, ['L', l]]; }
+  function JUMPTO(seqName) { return [OP.GOTO, ['S', seqName]]; }
+  function LABEL(l) { return [['LABEL', l]]; }
+  function ABOUTFACE() { return [OP.ABOUTFACE]; }
+  function JARD() { return [OP.JARD]; }
+  function JARU() { return [OP.JARU]; }
+  function TAP(n) { return [OP.TAP, n]; }
+  function SETFALL(vx, vy) { return [OP.SETFALL, vx, vy]; }
+  function UP() { return [OP.UP]; }
+  function DOWN() { return [OP.DOWN]; }
+  function DIE() { return [OP.DIE]; }
+  function CHX(n) { return [OP.CHX, n]; }
+  function CHY(n) { return [OP.CHY, n]; }
+  function EFFECT(n) { return [OP.EFFECT, n]; }
+
+  /* Run a whole clip through, one frame per tick, with an optional
+   * per-frame chx list. Saves writing out fourteen near-identical lines. */
+  function CLIP(clip, n, dxs, dys) {
+    var t = [];
+    for (var i = 0; i < n; i++) {
+      t = t.concat(F(clip, i, dxs ? (dxs[i] || 0) : 0, dys ? (dys[i] || 0) : 0));
+    }
+    return t;
+  }
+
+  function cat() {
+    var out = [];
+    for (var i = 0; i < arguments.length; i++) out = out.concat(arguments[i]);
+    return out;
+  }
+
+  /* ---- the table ----------------------------------------------------
+   * Sequence names and structure mirror the original's list.
+   */
+  var SEQ = {
+
+    stand: cat(ACTION(ACT.STAND), LABEL('s'), F('stand', 0), GOTO('s')),
+
+    alertstand: cat(ACTION(ACT.STAND), LABEL('s'), F('alertstand', 0), GOTO('s')),
+
+    // startrun's chx values are the original's: 0,0,0,8,3,3
+    startrun: cat(
+      ACTION(ACT.RUN),
+      F('startrun', 0), F('startrun', 1), F('startrun', 2),
+      F('startrun', 3, 9), F('startrun', 4, 4), F('startrun', 5, 4),
+      JUMPTO('runcyc')
+    ),
+
+    // the real thing: 5,1,2,4,5,2,3,4
+    runcyc: cat(
+      ACTION(ACT.RUN),
+      LABEL('c'),
+      F('runcyc', 0, 6), F('runcyc', 1, 1),
+      cat(TAP(1), F('runcyc', 2, 3)), F('runcyc', 3, 5),
+      F('runcyc', 4, 6), F('runcyc', 5, 2),
+      cat(TAP(1), F('runcyc', 6, 4)), F('runcyc', 7, 5),
+      GOTO('c')
+    ),
+
+    // runstop db 53,chx,2 / tap,1,54,chx,7 / 55 / tap,1,56,chx,2 / 49,chx,-2
+    runstop: cat(
+      ACTION(ACT.RUN),
+      F('runstop', 0, 2),
+      cat(TAP(1), F('runstop', 1, 8)),
+      F('runstop', 2),
+      cat(TAP(1), F('runstop', 3, 2)),
+      JUMPTO('stand')
+    ),
+
+    // turn: aboutface happens first, then the recovery frames play in the
+    // new facing. chx,6 compensates for the body pivoting about its axis.
+    turn: cat(
+      ACTION(ACT.TURN),
+      ABOUTFACE(), CHX(6),
+      F('turn', 0, 1), F('turn', 1, 2), F('turn', 2, -1),
+      F('turn', 3, 1), F('turn', 4, -2),
+      F('turn', 5), F('turn', 6), F('turn', 7),
+      JUMPTO('stand')
+    ),
+
+    // turnrun: turn while running, drops straight back into the run cycle
+    turnrun: cat(
+      ACTION(ACT.RUN),
+      ABOUTFACE(), CHX(4),
+      F('turn', 2, -1), F('turn', 3, 1), F('turn', 4), F('turn', 5),
+      JUMPTO('startrun')
+    ),
+
+    /* standing jump. The original:
+     *   16 / 17..21 chx,2 each / 22 chx,7 / 23 chx,9 / 24 chx,5 chy,-6
+     *   25 chx,1 chy,6 / 26 chx,4 / jard / 27 chx,-3 / 28 chx,5 / 29..33
+     * Total forward travel and the whole arc live in these numbers. */
+    standjump: cat(
+      ACTION(ACT.RUN),
+      F('standjump', 0),
+      ACTION(ACT.INAIR),
+      F('standjump', 1, 2), F('standjump', 2, 2), F('standjump', 3, 2),
+      F('standjump', 4, 2), F('standjump', 5, 2),
+      cat(TAP(3), F('standjump', 6, 8)),
+      F('standjump', 7, 10),
+      F('standjump', 8, 6, -6),
+      F('standjump', 9, 1, 6),
+      F('standjump', 10, 5),
+      JARD(),
+      ACTION(ACT.RUN),
+      cat(TAP(0), F('standjump', 11, -3)),
+      F('standjump', 12, 6), F('standjump', 13), F('standjump', 14),
+      F('standjump', 15), F('standjump', 16), F('standjump', 17, 1),
+      JUMPTO('stand')
+    ),
+
+    /* running jump. The original:
+     *   34 chx,5 / 35 chx,6 / 36 chx,3 / 37 chx,5 / 38 chx,7
+     *   39 chx,12 chy,-3 / 40 chx,8 chy,-9 / 41 chx,8 chy,-2
+     *   42 chx,4 chy,11 / 43 chx,4 chy,3 / 44 chx,5 / jard
+     * Nine tiles of travel, and every pixel of the arc is authored. */
+    runjump: cat(
+      ACTION(ACT.INAIR),
+      cat(TAP(1), F('runjump', 0, 6)),
+      F('runjump', 1, 7), F('runjump', 2, 3), F('runjump', 3, 6),
+      cat(TAP(3), F('runjump', 4, 8)),
+      F('runjump', 5, 14, -3),
+      F('runjump', 6, 9, -9),
+      F('runjump', 7, 9, -2),
+      F('runjump', 8, 5, 11),
+      F('runjump', 9, 5, 3),
+      ACTION(ACT.RUN),
+      cat(TAP(0), F('runjump', 10, 6)),
+      JARD(),
+      JUMPTO('runcyc')
+    ),
+
+    // jumpup: spring straight up to catch a ledge. jaru does the catching.
+    jumpup: cat(
+      ACTION(ACT.RUN),
+      F('jumpup', 0), F('jumpup', 1),
+      ACTION(ACT.INAIR),
+      cat(TAP(3), F('jumpup', 2, 0, -4)),
+      F('jumpup', 3, 0, -10),
+      JARU(),
+      F('jumpup', 4, 0, -6),
+      F('jumpup', 5, 0, 6),
+      F('jumpup', 6, 0, 10),
+      ACTION(ACT.RUN),
+      cat(TAP(0), F('jumpup', 7, 0, 4)),
+      F('jumpup', 8),
+      JUMPTO('stand')
+    ),
+
+    // hangs on the ledge; the loop eventually gives out into hangdrop, the
+    // way the original's forty-frame swing does
+    hang: cat(
+      ACTION(ACT.HANG),
+      LABEL('h'),
+      CLIP('hang', 12),
+      CLIP('hang', 12),
+      CLIP('hang', 12),
+      JUMPTO('hangdrop')
+    ),
+    hangstraight: cat(
+      ACTION(ACT.HANGSTRAIGHT),
+      cat(TAP(2), F('hangstraight', 0)),
+      LABEL('h'), F('hangstraight', 0), GOTO('h')
+    ),
+
+    // hangdrop: let go and take the half-storey
+    hangdrop: cat(
+      ACTION(ACT.STAND),
+      F('hangdrop', 0), F('hangdrop', 1),
+      F('hangdrop', 2),
+      JARD(),
+      cat(TAP(0), F('hangdrop', 3)),
+      F('hangdrop', 4), F('hangdrop', 5, 3),
+      JUMPTO('stand')
+    ),
+
+    // hangfall: the ledge wasn't there. setfall,0,12 then freefall.
+    hangfall: cat(
+      ACTION(ACT.INAIR),
+      F('hangdrop', 0, 0, 6),
+      F('hangdrop', 0, 0, 9),
+      F('hangdrop', 0, 0, 12),
+      CHX(2),
+      SETFALL(0, 12),
+      JUMPTO('freefall')
+    ),
+
+    /* climbup. Mid-sequence the original does chx,5 / chy,-63 / up --
+     * it relocates the character a whole tile upward and switches rooms
+     * while the animation is still playing. Frames after that point were
+     * drawn against the upper floor. */
+    climbup: cat(
+      ACTION(ACT.RUN),
+      F('climbup', 0), F('climbup', 1), F('climbup', 2),
+      F('climbup', 3), F('climbup', 4), F('climbup', 5),
+      CHX(21), CHY(-63), UP(),
+      ACTION(ACT.DEAD),   // "to clr flags", per the original's comment
+      F('climbup', 6), F('climbup', 7), F('climbup', 8),
+      F('climbup', 9), F('climbup', 10), F('climbup', 11),
+      ACTION(ACT.RUN),
+      F('climbup', 12), F('climbup', 13), F('climbup', 14, 1),
+      JUMPTO('stand')
+    ),
+
+    freefall: cat(
+      ACTION(ACT.FREEFALL),
+      LABEL('f'),
+      CLIP('freefall', 4),
+      GOTO('f')
+    ),
+
+    softland: cat(
+      ACTION(ACT.RUN),
+      cat(TAP(0), F('softland', 0)),
+      F('softland', 1), F('softland', 2), F('softland', 3),
+      JUMPTO('stand')
+    ),
+    medland: cat(
+      ACTION(ACT.RUN),
+      cat(TAP(4), F('hardland', 0)),
+      F('hardland', 2), F('hardland', 4), F('hardland', 6), F('hardland', 7),
+      JUMPTO('stand')
+    ),
+    hardland: cat(
+      ACTION(ACT.DEAD),
+      cat(TAP(5), F('hardland', 0)),
+      CLIP('hardland', 8),
+      DIE()
+    ),
+
+    stepfall: cat(
+      ACTION(ACT.INAIR),
+      F('standjump', 9, 1, 6),
+      SETFALL(0, 6),
+      JUMPTO('freefall')
+    ),
+
+    crouch: cat(ACTION(ACT.STAND), LABEL('c'), F('crouch', 0), GOTO('c')),
+
+    // a single full step -- the original had fourteen of these at graduated
+    // lengths so you could inch up to a ledge exactly
+    step: cat(
+      ACTION(ACT.RUN),
+      F('step', 0), F('step', 1, 2), F('step', 2, 3), F('step', 3, 3),
+      F('step', 4, 2), F('step', 5, 2), F('step', 6, 1), F('step', 7),
+      JUMPTO('stand')
+    ),
+    stepsmall: cat(
+      ACTION(ACT.RUN),
+      F('step', 0), F('step', 2, 2), F('step', 4, 2), F('step', 7),
+      JUMPTO('stand')
+    ),
+
+    bump: cat(
+      ACTION(ACT.RUN),
+      cat(TAP(6), F('bump', 0, -1)),
+      F('bump', 1, -2), F('bump', 2, -1), F('bump', 3), F('bump', 4),
+      JUMPTO('stand')
+    ),
+
+    drink: cat(
+      ACTION(ACT.STAND),
+      CLIP('drink', 10),
+      EFFECT(1),
+      JUMPTO('stand')
+    ),
+
+    /* ---- swordplay --------------------------------------------------
+     * engarde -> ready is the original's structure; strike/advance/retreat
+     * all return to ready, so the fight is a little state machine driven
+     * entirely by which sequence gets selected next.
+     */
+    engarde: cat(
+      ACTION(ACT.RUN),
+      CHX(2),
+      F('engarde', 0), F('engarde', 1, 2), F('engarde', 2, 2),
+      F('engarde', 3, 3), F('engarde', 4),
+      JUMPTO('ready')
+    ),
+    ready: cat(
+      ACTION(ACT.RUN),
+      LABEL('r'),
+      CLIP('ready', 4),
+      GOTO('r')
+    ),
+    advance: cat(
+      ACTION(ACT.RUN),
+      F('advance', 0, 3), F('advance', 1, 4), F('advance', 2, 3), F('advance', 3, 2),
+      JUMPTO('ready')
+    ),
+    retreat: cat(
+      ACTION(ACT.RUN),
+      F('retreat', 0, -3), F('retreat', 1, -4), F('retreat', 2, -3), F('retreat', 3, -2),
+      JUMPTO('ready')
+    ),
+    strike: cat(
+      ACTION(ACT.RUN),
+      cat(TAP(7), F('strike', 0, 2)),
+      F('strike', 1, 4),
+      EFFECT(2),                 // the frame the blade is actually out
+      F('strike', 2, 2),
+      F('strike', 3, -4),
+      JUMPTO('ready')
+    ),
+    block: cat(
+      ACTION(ACT.RUN),
+      cat(TAP(8), F('block', 0)),
+      F('block', 1), F('block', 2),
+      JUMPTO('ready')
+    ),
+    stabbed: cat(
+      ACTION(ACT.DEAD),
+      SETFALL(-1, 0),
+      cat(TAP(9), F('stabbed', 0, -1, 1)),
+      F('stabbed', 1, -1),
+      F('stabbed', 2, -1, 2),
+      F('stabbed', 3, -2, 1),
+      F('stabbed', 4, -3),
+      F('stabbed', 5, -2),
+      JUMPTO('dead')
+    ),
+    dead: cat(
+      ACTION(ACT.DEAD),
+      CLIP('dead', 5),
+      LABEL('d'), F('dead', 4), GOTO('d')
+    )
+  };
+
+  /* ---- assembler -----------------------------------------------------
+   * Flattens the token lists into one Int16Array, resolving frame
+   * references through the baked frame table and patching label/sequence
+   * addresses. The runtime then walks a flat stream of numbers, which is
+   * what the 6502 original was doing all along.
+   */
+  function assemble(frameTable) {
+    var code = [];
+    var owner = [];        // address -> which sequence that word belongs to
+    var seqStart = {};
+    var labelAddr = {};   // "seqName/label" -> address
+    var fixups = [];
+
+    for (var name in SEQ) {
+      if (!SEQ.hasOwnProperty(name)) continue;
+      seqStart[name] = code.length;
+      var ownerStart = code.length;
+      var toks = SEQ[name];
+      for (var i = 0; i < toks.length; i++) {
+        var t = toks[i];
+        if (Array.isArray(t)) {
+          if (t[0] === 'F') {
+            var b = frameTable.base[t[1]];
+            if (b === undefined) throw new Error('unknown clip ' + t[1]);
+            var n = frameTable.count[t[1]];
+            var idx = Math.min(t[2], n - 1);
+            code.push(b + idx + 1); // +1 so frame 0 is never confused with a pad
+          } else if (t[0] === 'LABEL') {
+            labelAddr[name + '/' + t[1]] = code.length;
+          } else if (t[0] === 'L') {
+            fixups.push({ at: code.length, key: name + '/' + t[1] });
+            code.push(0);
+          } else if (t[0] === 'S') {
+            fixups.push({ at: code.length, seq: t[1] });
+            code.push(0);
+          }
+        } else {
+          code.push(t);
+        }
+      }
+      // every word this sequence emitted is tagged with its name, so a
+      // fall-through into another sequence updates seqName correctly
+      while (owner.length < code.length) owner.push(name);
+      void ownerStart;
+    }
+
+    for (var f = 0; f < fixups.length; f++) {
+      var fx = fixups[f];
+      var addr = fx.seq !== undefined ? seqStart[fx.seq] : labelAddr[fx.key];
+      if (addr === undefined) throw new Error('unresolved ' + (fx.seq || fx.key));
+      code[fx.at] = addr;
+    }
+
+    return { code: new Int16Array(code), start: seqStart, owner: owner };
+  }
+
+  P.OP = OP;
+  P.ACT = ACT;
+  P.SEQ = SEQ;
+  P.assembleSeq = assemble;
+})(POP);
+
+/* ===== src/game/level.js ===== */
+/*
+ * level.js -- rooms, tiles, and the dungeon renderer.
+ *
+ * Geometry follows the original: a room is 10 by 3 tiles, a tile is 32 by
+ * 63 pixels, so a room is exactly one 320-pixel screen. Rooms do not
+ * scroll -- walking off an edge hard-cuts to the neighbour, which is what
+ * let a 1989 machine hold a whole castle in memory.
+ *
+ * The background is drawn once per room into the framebuffer's bg plane;
+ * the per-frame loop then just restores from it. Only torches are redrawn
+ * live, because a flickering torch is worth the pixels.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  var C = P.C;
+  var TILE_W = 32, TILE_H = 63, ROOM_W = 10, ROOM_H = 3;
+  var SLAB = 8;                 // thickness of the floor slab
+  var FLOOR_OFF = TILE_H - SLAB; // 55: surface of the slab within its tile
+
+  var T = {
+    SPACE: 0, FLOOR: 1, WALL: 2, GATE: 3,
+    PLATE_OPEN: 4, PLATE_SHUT: 5, LOOSE: 6, SPIKES: 7,
+    POTION: 8, SWORD: 9, EXIT: 10, TORCH: 11, PILLAR: 12
+  };
+
+  var CHARMAP = {
+    '.': T.SPACE, '=': T.FLOOR, '#': T.WALL, '|': T.GATE,
+    'v': T.PLATE_OPEN, 'V': T.PLATE_SHUT, '~': T.LOOSE, '^': T.SPIKES,
+    'o': T.POTION, 's': T.SWORD, 'E': T.EXIT, 't': T.TORCH, 'p': T.PILLAR
+  };
+
+  // tiles you can stand on
+  var STANDABLE = {};
+  [T.FLOOR, T.PLATE_OPEN, T.PLATE_SHUT, T.LOOSE, T.SPIKES,
+    T.POTION, T.SWORD, T.EXIT, T.PILLAR].forEach(function (t) { STANDABLE[t] = 1; });
+
+  /* ---- level 1 -------------------------------------------------------
+   * Not a tile-for-tile copy of the original's twenty-four rooms, but the
+   * same shape of journey: you start unarmed, the direct route is cut off,
+   * you drop into the lower level to find the sword, climb back, and only
+   * then meet the guard standing between you and the exit.
+   */
+  var LEVEL1 = {
+    start: { room: 1, col: 1, row: 2, facing: 1 },
+    rooms: {
+      // 1 -- the cell you wake up in
+      1: {
+        map: ['..........',
+              '.....t....',
+              '=========='],
+        links: { right: 2 }
+      },
+      // 2 -- the floor is out in the middle. A standing jump will not
+      // clear two tiles; you have to be running.
+      2: {
+        map: ['..........',
+              't.........',
+              '====..===='],
+        links: { left: 1, right: 3 }
+      },
+      // 3 -- loose slabs, then a spike trap
+      3: {
+        map: ['..........',
+              '.........t',
+              '==~~===^=='],
+        links: { left: 2, right: 4 }
+      },
+      // 4 -- the floor steps up a storey, and the sword is waiting on the
+      // ledge. Below the gap there is nothing at all.
+      4: {
+        map: ['........t.',
+              '.....====s',
+              '=====....#'],
+        links: { left: 3, right: 5 }
+      },
+      // 5 -- a guard between you and the gate; the plate by the door opens it
+      5: {
+        map: ['..t.......',
+              '=v=====|==',
+              '##########'],
+        links: { left: 4, right: 6 },
+        guards: [{ col: 5, row: 1, facing: -1 }]
+      },
+      // 6 -- out
+      6: {
+        map: ['......t...',
+              '=======E==',
+              '##########'],
+        links: { left: 5 }
+      }
+    }
+  };
+
+  function Level(def) {
+    this.def = def;
+    this.rooms = {};
+    for (var id in def.rooms) {
+      if (!def.rooms.hasOwnProperty(id)) continue;
+      var r = def.rooms[id];
+      var tiles = new Uint8Array(ROOM_W * ROOM_H);
+      for (var row = 0; row < ROOM_H; row++) {
+        var line = r.map[row] || '..........';
+        for (var col = 0; col < ROOM_W; col++) {
+          var ch = line[col] || '.';
+          tiles[row * ROOM_W + col] = CHARMAP[ch] === undefined ? T.SPACE : CHARMAP[ch];
+        }
+      }
+      this.rooms[id] = {
+        id: +id, tiles: tiles, links: r.links || {},
+        items: (r.items || []).map(function (i) { return { col: i.col, row: i.row, kind: i.kind, taken: false }; }),
+        guards: r.guards || [],
+        gatesOpen: false,
+        loose: {}      // col*16+row -> shake/fall state
+      };
+    }
+  }
+
+  Level.prototype.room = function (id) { return this.rooms[id]; };
+
+  Level.prototype.tile = function (roomId, col, row) {
+    var r = this.rooms[roomId];
+    if (!r) return T.WALL;
+    if (col < 0 || col >= ROOM_W || row < 0 || row >= ROOM_H) return T.SPACE;
+    return r.tiles[row * ROOM_W + col];
+  };
+
+  Level.prototype.setTile = function (roomId, col, row, t) {
+    var r = this.rooms[roomId];
+    if (!r || col < 0 || col >= ROOM_W || row < 0 || row >= ROOM_H) return;
+    r.tiles[row * ROOM_W + col] = t;
+  };
+
+  Level.prototype.isFloor = function (roomId, col, row) {
+    if (col < 0 || col >= ROOM_W) return false;
+    var t = this.tile(roomId, col, row);
+    if (t === T.GATE) return false;
+    return !!STANDABLE[t] || t === T.WALL;
+  };
+
+  Level.prototype.isWall = function (roomId, col, row) {
+    var t = this.tile(roomId, col, row);
+    if (t === T.WALL) return true;
+    if (t === T.GATE) return !this.rooms[roomId].gatesOpen;
+    return false;
+  };
+
+  // can you catch a ledge on the tile at (col,row)? -- i.e. is its floor
+  // solid and the space above it clear
+  Level.prototype.canHang = function (roomId, col, row) {
+    if (col < 0 || col >= ROOM_W || row < 0) return false;
+    return this.isFloor(roomId, col, row) && !this.isWall(roomId, col, row);
+  };
+
+  /* ---- rendering ---------------------------------------------------- */
+
+  // deterministic hash so the brickwork is stable across redraws
+  function h2(a, b) {
+    var n = (a * 374761393 + b * 668265263) | 0;
+    n = (n ^ (n >> 13)) * 1274126177;
+    return ((n ^ (n >> 16)) >>> 0) / 4294967296;
+  }
+
+  /* Running-bond masonry.
+   *
+   * All drawing here is in logical 320x200 units, but the framebuffer is
+   * RES times denser, and fillRect scales on the way in. That means a
+   * fractional logical coordinate addresses a single real pixel -- D below
+   * is exactly one device pixel -- so the wall can carry mortar joints and
+   * bevels a logical-resolution renderer simply has no room for.
+   *
+   * The back wall stays low-contrast so the character reads against it.
+   */
+  var D = 1 / (P.RES || 1);
+
+  function brickWall(g, x0, y0, w, h, dim) {
+    var bg = g.bg;
+    g.fillRect(x0, y0, w, h, dim ? C.VOID : C.BRICK_S, bg);   // mortar
+    var bh = 8, bw = 16;
+    for (var y = y0 - (((y0 % bh) + bh) % bh) - bh; y < y0 + h; y += bh) {
+      var rowIdx = Math.round(y / bh);
+      var off = (rowIdx & 1) ? Math.floor(bw / 2) : 0;
+      for (var x = x0 - (((x0 + off) % bw + bw) % bw) - bw; x < x0 + w; x += bw) {
+        var bx = x + off, by = y;
+        var r = h2(bx, by);
+        var col, lip, low;
+        if (dim) {
+          col = r < 0.40 ? C.SHADOW : r < 0.82 ? C.BRICK_S : C.BRICK_D;
+          lip = C.BRICK_S; low = C.VOID;
+        } else {
+          col = r < 0.34 ? C.BRICK_D : r < 0.72 ? C.BRICK_MD : C.BRICK_M;
+          lip = C.BRICK_L; low = C.BRICK_S;
+        }
+        var px = Math.max(x0, bx + D), pw = Math.min(x0 + w, bx + bw - D) - px;
+        var py = Math.max(y0, by + D), ph = Math.min(y0 + h, by + bh - D) - py;
+        if (pw <= 0 || ph <= 0) continue;
+        g.fillRect(px, py, pw, ph, col, bg);
+        // one-device-pixel bevel: lit along the top, shaded along the bottom
+        if (py > y0) g.fillRect(px, py, pw, D, lip, bg);
+        if (py + ph < y0 + h) g.fillRect(px, py + ph - D, pw, D, low, bg);
+        // a little weathering so the courses are not identical
+        if (r > 0.90) g.fillRect(px + pw * 0.25, py + ph * 0.4, pw * 0.3, D, low, bg);
+        else if (r < 0.08) g.fillRect(px + pw * 0.5, py + ph * 0.55, pw * 0.25, D, lip, bg);
+      }
+    }
+  }
+
+  /* Brighten a region of the background by walking each pixel one or more
+   * steps up a fixed lightness chain. This is a palette trick, not a blend:
+   * no new colours are invented, which is exactly the constraint an indexed
+   * framebuffer imposes and why lighting in these games looks the way it
+   * does. */
+  var BRIGHTEN = new Uint8Array(64);
+  (function () {
+    for (var i = 0; i < 64; i++) BRIGHTEN[i] = i;
+    var chain = [C.VOID, C.SHADOW, C.BRICK_S, C.BRICK_D, C.BRICK_MD,
+                 C.BRICK_M, C.BRICK_L, C.BRICK_H, C.STONE_H, C.CREAM];
+    for (var k = 0; k < chain.length - 1; k++) BRIGHTEN[chain[k]] = chain[k + 1];
+    BRIGHTEN[C.CREAM] = C.CREAM;
+  })();
+
+  function glow(g, lcx, lcy, lrx, lry, strength) {
+    var bg = g.bg, W = g.w, s = g.s;
+    var cx = lcx * s, cy = lcy * s, rx = lrx * s, ry = lry * s;
+    var y0 = Math.max(0, Math.floor(cy - ry)), y1 = Math.min(g.h - 1, Math.ceil(cy + ry));
+    var x0 = Math.max(0, Math.floor(cx - rx)), x1 = Math.min(W - 1, Math.ceil(cx + rx));
+    for (var y = y0; y <= y1; y++) {
+      var dy = (y - cy) / ry;
+      for (var x = x0; x <= x1; x++) {
+        var dx = (x - cx) / rx;
+        var d = dx * dx + dy * dy;
+        if (d >= 1) continue;
+        var steps = Math.round((1 - Math.sqrt(d)) * strength);
+        var i = y * W + x, v = bg[i];
+        for (var s = 0; s < steps; s++) v = BRIGHTEN[v];
+        bg[i] = v;
+      }
+    }
+  }
+
+  function floorSlab(g, x0, y0) {
+    var bg = g.bg;
+    var top = y0 + FLOOR_OFF;
+    // the walking surface, banded a device pixel at a time
+    g.fillRect(x0, top, TILE_W, D, C.STONE_H, bg);
+    g.fillRect(x0, top + D, TILE_W, D, C.BRICK_H, bg);
+    g.fillRect(x0, top + 2 * D, TILE_W, 1, C.BRICK_L, bg);
+    g.fillRect(x0, top + 1 + 2 * D, TILE_W, 2, C.BRICK_M, bg);
+    g.fillRect(x0, top + 3 + 2 * D, TILE_W, SLAB - 3 - 2 * D, C.BRICK_D, bg);
+    g.fillRect(x0, top + SLAB - D, TILE_W, D, C.SHADOW, bg);
+    // course joints across the slab face
+    for (var j = 0; j < 2; j++) {
+      g.fillRect(x0 + j * 16, top + 2 * D, D, SLAB - 2 * D, C.BRICK_S, bg);
+    }
+    // dentils under the lip give the ledge its thickness -- the motif that
+    // makes a floor read as a Prince of Persia floor
+    for (var d = 0; d < 4; d++) {
+      var dx = x0 + 2 + d * 8;
+      g.fillRect(dx, top + SLAB, 5, 4, C.BRICK_S, bg);
+      g.fillRect(dx, top + SLAB, 5, D, C.BRICK_MD, bg);
+      g.fillRect(dx + 5 - D, top + SLAB, D, 4, C.VOID, bg);
+      g.fillRect(dx, top + SLAB + 4 - D, 5, D, C.VOID, bg);
+    }
+    g.fillRect(x0, top + SLAB + 4, TILE_W, D, C.VOID, bg);
+  }
+
+  function drawTorchBracket(g, x0, y0) {
+    var bg = g.bg;
+    var cx = x0 + 16;
+    g.fillRect(cx - 2, y0 + 26, 4, 9, C.BRACKET, bg);
+    g.fillRect(cx - 2, y0 + 26, D, 9, C.RED_M, bg);
+    g.fillRect(cx - 4, y0 + 24, 8, 2, C.BRICK_D, bg);
+    g.fillRect(cx - 4, y0 + 24, 8, D, C.BRICK_M, bg);
+    g.fillRect(cx - 1, y0 + 35, 2, 3, C.BRICK_S, bg);
+  }
+
+  /* Draw a whole room into the background plane. */
+  Level.prototype.renderRoom = function (g, roomId) {
+    var r = this.rooms[roomId];
+    g.clearBg(C.VOID);
+    if (!r) return;
+    var col, row, t, x0, y0;
+
+    // pass 1: the wall behind everything
+    for (row = 0; row < ROOM_H; row++) {
+      for (col = 0; col < ROOM_W; col++) {
+        x0 = col * TILE_W; y0 = row * TILE_H;
+        t = r.tiles[row * ROOM_W + col];
+        if (t === T.WALL) brickWall(g, x0, y0, TILE_W, TILE_H, false);
+        else brickWall(g, x0, y0, TILE_W, TILE_H, true);
+      }
+    }
+
+    // pass 2: floors and furniture
+    for (row = 0; row < ROOM_H; row++) {
+      for (col = 0; col < ROOM_W; col++) {
+        x0 = col * TILE_W; y0 = row * TILE_H;
+        t = r.tiles[row * ROOM_W + col];
+        var top = y0 + FLOOR_OFF;
+        switch (t) {
+          case T.FLOOR: case T.POTION: case T.SWORD:
+            floorSlab(g, x0, y0); break;
+          case T.PILLAR:
+            floorSlab(g, x0, y0);
+            g.fillRect(x0 + 12, y0 + 18, 8, FLOOR_OFF - 18, C.BRICK_MD, g.bg);
+            g.fillRect(x0 + 10, y0 + 14, 12, 4, C.BRICK_M, g.bg);
+            break;
+          case T.LOOSE:
+            floorSlab(g, x0, y0);
+            // a cracked lip, so you can tell before you stand on it
+            g.hline(x0 + 6, top, 5, C.BRICK_D, g.bg);
+            g.hline(x0 + 18, top, 7, C.BRICK_D, g.bg);
+            g.vline(x0 + 11, top, 4, C.SHADOW, g.bg);
+            g.vline(x0 + 24, top, 3, C.SHADOW, g.bg);
+            break;
+          case T.PLATE_OPEN: case T.PLATE_SHUT:
+            floorSlab(g, x0, y0);
+            g.fillRect(x0 + 8, top - 2, 16, 2, t === T.PLATE_OPEN ? C.GOLD : C.STEEL_M, g.bg);
+            g.hline(x0 + 7, top - 3, 18, C.BRICK_H, g.bg);
+            break;
+          case T.SPIKES:
+            floorSlab(g, x0, y0);
+            for (var s = 0; s < 4; s++) {
+              var sx = x0 + 4 + s * 7;
+              for (var k = 0; k < 7; k++) {
+                g.hline(sx + k / 2, top - 8 + k, Math.max(1, 4 - k / 2), C.STEEL_L, g.bg);
+              }
+              g.vline(sx + 1, top - 8, 8, C.STEEL_D, g.bg);
+            }
+            break;
+          case T.EXIT:
+            glow(g, x0 + 16, y0 + 30, 54, 46, 3.4);
+            floorSlab(g, x0, y0);
+            // a lit doorway: the way out
+            g.fillRect(x0 + 4, y0 + 8, 24, FLOOR_OFF - 8, C.SHADOW, g.bg);
+            g.fillRect(x0 + 6, y0 + 12, 20, FLOOR_OFF - 12, C.BRICK_D, g.bg);
+            g.fillRect(x0 + 9, y0 + 16, 14, FLOOR_OFF - 16, C.GOLD, g.bg);
+            g.fillRect(x0 + 11, y0 + 20, 10, FLOOR_OFF - 20, C.HOT, g.bg);
+            break;
+          case T.GATE:
+            floorSlab(g, x0, y0);
+            break;
+          case T.TORCH:
+            glow(g, x0 + 16, y0 + 20, 46, 40, 3.2);
+            drawTorchBracket(g, x0, y0);
+            break;
+          default: break;
+        }
+      }
+    }
+  };
+
+  /* Things that move get drawn per frame, over the restored background. */
+  Level.prototype.renderDynamic = function (g, roomId, t) {
+    var r = this.rooms[roomId];
+    if (!r) return;
+    for (var row = 0; row < ROOM_H; row++) {
+      for (var col = 0; col < ROOM_W; col++) {
+        var tt = r.tiles[row * ROOM_W + col];
+        var x0 = col * TILE_W, y0 = row * TILE_H;
+        if (tt === T.TORCH) this.drawFlame(g, x0 + 16, y0 + 26, t + col * 7 + row * 13);
+        else if (tt === T.GATE) this.drawGate(g, x0, y0, r.gatesOpen);
+        else if (tt === T.POTION) this.drawPotion(g, x0, y0, t);
+        else if (tt === T.SWORD) this.drawSword(g, x0, y0);
+      }
+    }
+    // loose tiles mid-collapse
+    for (var k in r.loose) {
+      if (!r.loose.hasOwnProperty(k)) continue;
+      var L = r.loose[k];
+      if (L.state === 'shake') {
+        var sx = (t % 2) ? 1 : -1;
+        floorSlabLive(g, L.col * TILE_W + sx, L.row * TILE_H);
+      } else if (L.state === 'fall') {
+        floorSlabLive(g, L.col * TILE_W, L.row * TILE_H + L.dy);
+      }
+    }
+  };
+
+  function floorSlabLive(g, x0, y0) {
+    var top = y0 + FLOOR_OFF;
+    g.hline(x0, top, TILE_W, C.BRICK_H);
+    g.hline(x0, top + 1, TILE_W, C.BRICK_L);
+    g.fillRect(x0, top + 2, TILE_W, 3, C.BRICK_M);
+    g.fillRect(x0, top + 5, TILE_W, SLAB - 5, C.BRICK_D);
+  }
+
+  Level.prototype.drawFlame = function (g, cx, cy, t) {
+    // a stack of tapering bands with a travelling wobble: cheap, and it
+    // reads as fire because the palette is doing the work
+    var w1 = Math.sin(t * 0.7) * 1.1, w2 = Math.sin(t * 1.13 + 2) * 1.5;
+    var w3 = Math.sin(t * 0.53 + 1) * 0.8;
+    g.fillRect(cx - 3.2 + w3 * 0.3, cy - 5, 6.4, 6, C.RED_M);
+    g.fillRect(cx - 2.6 + w1 * 0.4, cy - 9, 5.2, 5, C.FLAME);
+    g.fillRect(cx - 1.8 + w1 * 0.8, cy - 12, 3.6, 4, C.FLAME);
+    g.fillRect(cx - 1.1 + w2 * 0.7, cy - 15, 2.2, 4, C.FLAME);
+    g.fillRect(cx - 2, cy - 4, 4, 4, C.GOLD);
+    g.fillRect(cx - 1.4 + w1 * 0.5, cy - 8, 2.8, 5, C.GOLD);
+    g.fillRect(cx - 0.8 + w2 * 0.6, cy - 11, 1.6, 3, C.GOLD);
+    g.fillRect(cx - 1.2, cy - 3.5, 2.4, 3, C.HOT);
+    g.fillRect(cx - 0.6 + w1 * 0.4, cy - 6, 1.2, 3, C.HOT);
+  };
+
+  Level.prototype.drawGate = function (g, x0, y0, open) {
+    var top = y0 + 2;
+    var height = open ? 8 : FLOOR_OFF - 2;
+    // frame
+    g.fillRect(x0 + 2, y0, TILE_W - 4, 3, C.BRICK_M);
+    for (var b = 0; b < 5; b++) {
+      var bx = x0 + 4 + b * 6;
+      g.fillRect(bx, top, 2, height, C.STEEL_M);
+      g.vline(bx, top, height, C.STEEL_L);
+    }
+    // cross-bar at the bottom of the travelling section
+    g.fillRect(x0 + 3, top + height - 3, TILE_W - 6, 3, C.STEEL_D);
+  };
+
+  Level.prototype.drawPotion = function (g, x0, y0, t) {
+    var bx = x0 + 14, by = y0 + FLOOR_OFF - 11;
+    g.fillRect(bx, by + 3, 5, 8, C.GREEN_D);
+    g.fillRect(bx + 1, by + 4, 3, 6, C.RED_M);
+    g.fillRect(bx + 1, by, 3, 4, C.GREEN_D);
+    g.fillRect(bx + 1, by - 1, 3, 1, C.STEEL_M);
+    if ((t >> 2) % 4 === 0) g.px(bx + 1, by + 5, C.HOT);
+  };
+
+  Level.prototype.drawSword = function (g, x0, y0) {
+    var sx = x0 + 6, sy = y0 + FLOOR_OFF - 3;
+    g.fillRect(sx, sy, 20, 2, C.STEEL_L);
+    g.fillRect(sx + 19, sy - 1, 3, 4, C.STEEL_M);
+    g.fillRect(sx - 2, sy - 1, 3, 4, C.GOLD);
+  };
+
+  P.T = T;
+  P.Level = Level;
+  P.LEVEL1 = LEVEL1;
+  P.LEVEL_GEO = { TILE_W: TILE_W, TILE_H: TILE_H, ROOM_W: ROOM_W, ROOM_H: ROOM_H, SLAB: SLAB, FLOOR_OFF: FLOOR_OFF };
+})(POP);
+
+/* ===== src/game/char.js ===== */
+/*
+ * char.js -- an actor: a program counter walking the sequence table.
+ *
+ * The whole of a character's motion on the ground comes out of seq.js. The
+ * engine only intervenes for the things the animation genuinely cannot
+ * know: whether there is still floor underneath, whether a wall got in the
+ * way, and free fall (the one place the original does integrate a velocity).
+ *
+ * This inversion -- animation drives movement, physics only vetoes it -- is
+ * what makes the character feel heavy and committed. Once a jump starts you
+ * are watching a recording play out, and that is exactly the point.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  var OP = P.OP, ACT = P.ACT;
+
+  var TILE_W = 32, TILE_H = 63;
+  var ROOM_W = 10, ROOM_H = 3;
+  var ROOM_PX_H = ROOM_H * TILE_H;          // 189
+  var FLOOR0 = 55;                          // floor line of the top row
+
+  P.GEO = {
+    TILE_W: TILE_W, TILE_H: TILE_H, ROOM_W: ROOM_W, ROOM_H: ROOM_H,
+    ROOM_PX_H: ROOM_PX_H, FLOOR0: FLOOR0,
+    floorY: function (row) { return FLOOR0 + row * TILE_H; },
+    rowOf: function (y) { return Math.round((y - FLOOR0) / TILE_H); },
+    colOf: function (x) { return Math.floor(x / TILE_W); }
+  };
+
+  function Char(game, kind) {
+    this.game = game;
+    this.kind = kind;              // 'kid' | 'guard'
+    this.ft = kind === 'kid' ? game.ftKid : game.ftGuard;
+    this.x = 0;
+    this.y = FLOOR0;
+    this.facing = 1;
+    this.room = 1;
+    this.pc = 0;
+    this.frame = 0;
+    this.action = ACT.STAND;
+    this.seqName = '';
+    this.fallVx = 0;
+    this.fallVy = 0;
+    this.fallStartY = 0;
+    this.armed = false;
+    this.hp = 3;
+    this.maxHp = 3;
+    this.alive = true;
+    this.ctrl = { left: 0, right: 0, up: 0, down: 0, shift: 0 };
+    this.hurtFlash = 0;
+    this.startSeq('stand');
+  }
+
+  Char.prototype.startSeq = function (name) {
+    var a = this.game.seq.start[name];
+    if (a === undefined) { console.warn('no seq ' + name); return; }
+    this.seqName = name;
+    this.pc = a;
+    this.step();                  // land on the sequence's first frame at once
+    // control() runs before tick(); without this the tick would step again
+    // and every single transition would silently eat its second frame
+    this.fresh = true;
+  };
+
+  /* One tick of the interpreter: execute instructions until a frame
+   * instruction, which is the yield point. */
+  Char.prototype.step = function () {
+    var code = this.game.seq.code;
+    for (var guard = 0; guard < 512; guard++) {
+      var op = code[this.pc++];
+      if (op > 0) {
+        this.frame = op - 1;
+        // a sequence can fall through into another one; the owner table
+        // keeps seqName honest, which control() depends on
+        var o = this.game.seq.owner[this.pc - 1];
+        if (o) this.seqName = o;
+        return;
+      }
+      switch (op) {
+        case OP.CHX: this.x += code[this.pc++] * this.facing; break;
+        case OP.CHY: this.y += code[this.pc++]; break;
+        case OP.ACT: this.action = code[this.pc++]; break;
+        case OP.GOTO: this.pc = code[this.pc]; break;
+        case OP.ABOUTFACE: this.facing = -this.facing; break;
+        case OP.SETFALL:
+          this.fallVx = code[this.pc++];
+          this.fallVy = code[this.pc++];
+          break;
+        case OP.TAP: this.game.sound(code[this.pc++], this); break;
+        case OP.EFFECT: this.game.effect(code[this.pc++], this); break;
+        case OP.UP: this.game.moveRoom(this, 'up'); break;
+        case OP.DOWN: this.game.moveRoom(this, 'down'); break;
+        case OP.DIE: this.die(); return;
+        // a divert re-points the pc at another sequence; carrying on
+        // through the old stream after that would run the wrong code
+        case OP.JARD: if (this.jard()) return; break;
+        case OP.JARU: if (this.jaru()) return; break;
+        case OP.IFWTLESS: break;
+        case OP.NEXTLEVEL: this.game.nextLevel(); break;
+        default:
+          // ran off the end of the table; park in a safe loop
+          this.startSeq('stand');
+          return;
+      }
+    }
+    this.startSeq('stand');
+  };
+
+  /* jard -- "is there ground under me?" If not, the jump becomes a fall.
+   * The original uses this to catch jumps that came up short. */
+  Char.prototype.jard = function () {
+    if (this.floorHere()) return false;
+    this.fallStartY = this.y;
+    this.fallVy = 4;
+    this.startSeq('freefall');
+    return true;
+  };
+
+  /* jaru -- reaching up: if there is a ledge to catch, catch it. */
+  Char.prototype.jaru = function () {
+    var col = this.ledgeAhead();
+    if (col < 0) return false;
+    this.grabLedge(col);
+    return true;
+  };
+
+  /* Which column holds the ledge we could catch, or -1. Reaching half a
+   * tile ahead is what makes standing at the lip feel right. */
+  Char.prototype.ledgeAhead = function () {
+    var lvl = this.game.level;
+    var row = P.GEO.rowOf(this.y);
+    if (row <= 0) return -1;
+    var col = P.GEO.colOf(this.x + this.facing * 14);
+    if (!lvl.canHang(this.room, col, row - 1)) return -1;
+    if (lvl.isFloor(this.room, P.GEO.colOf(this.x), row - 1)) return -1;
+    return col;
+  };
+
+  /* Snap to the face of the ledge so the pull-up lands on top of it rather
+   * than back in the gap. */
+  Char.prototype.grabLedge = function (col) {
+    var row = P.GEO.rowOf(this.y);
+    this.x = this.facing > 0 ? col * TILE_W - 6 : (col + 1) * TILE_W + 6;
+    this.y = P.GEO.floorY(row);
+    this.startSeq('hang');
+  };
+
+  Char.prototype.floorHere = function () {
+    var row = P.GEO.rowOf(this.y);
+    var col = P.GEO.colOf(this.x);
+    return this.game.level.isFloor(this.room, col, row);
+  };
+
+  Char.prototype.die = function () {
+    if (!this.alive) return;
+    this.alive = false;
+    this.hp = 0;
+    this.game.onDeath(this);
+  };
+
+  Char.prototype.hurt = function (n) {
+    if (!this.alive) return;
+    this.hp -= (n || 1);
+    this.hurtFlash = 3;
+    this.game.sound(9, this);
+    if (this.hp <= 0) {
+      this.startSeq('stabbed');
+    } else {
+      this.startSeq('block');
+    }
+  };
+
+  var GROUNDED = {};
+  GROUNDED[ACT.STAND] = 1; GROUNDED[ACT.RUN] = 1; GROUNDED[ACT.TURN] = 1;
+
+  /* One game tick. */
+  Char.prototype.tick = function () {
+    if (this.hurtFlash > 0) this.hurtFlash--;
+
+    if (this.action === ACT.FREEFALL) {
+      this.fallTick();
+    } else if (this.fresh) {
+      this.fresh = false;         // control() already advanced us this tick
+    } else {
+      this.step();
+    }
+
+    this.crossRooms();
+
+    // ground contract: if the sequence thinks we are on the floor but the
+    // floor is gone, hand over to gravity
+    if (GROUNDED[this.action] && this.alive) {
+      if (!this.floorHere()) {
+        this.fallStartY = this.y;
+        this.fallVx = 0;
+        this.fallVy = 2;
+        this.startSeq('freefall');
+      } else {
+        this.blockWalls();
+        this.game.onGroundTile(this);
+      }
+    }
+    if (this.action === ACT.HANG || this.action === ACT.HANGSTRAIGHT) {
+      this.blockWalls();
+    }
+  };
+
+  /* Free fall is the one place a velocity exists. Everything else is
+   * displacement baked into frames. */
+  Char.prototype.fallTick = function () {
+    if (this.fresh) this.fresh = false; else this.step();  // flail animation
+    this.y += this.fallVy;
+    this.x += this.fallVx * this.facing;
+    this.fallVy += 4;
+    if (this.fallVy > 32) this.fallVy = 32;
+
+    var lvl = this.game.level;
+    // did we pass through a floor line on the way down?
+    for (var row = 0; row < ROOM_H; row++) {
+      var fy = P.GEO.floorY(row);
+      if (this.y >= fy && this.y - this.fallVy < fy + 1) {
+        var col = P.GEO.colOf(this.x);
+        if (lvl.isFloor(this.room, col, row)) {
+          this.y = fy;
+          this.land();
+          return;
+        }
+      }
+    }
+    if (this.y >= ROOM_PX_H) {
+      if (!this.game.moveRoom(this, 'down')) {
+        // no room below: the pit
+        this.y = ROOM_PX_H;
+        this.die();
+      }
+    }
+  };
+
+  Char.prototype.land = function () {
+    var drop = this.y - this.fallStartY;
+    this.fallVy = 0;
+    this.fallVx = 0;
+    var storeys = drop / TILE_H;
+    if (storeys < 1.2) {
+      this.startSeq('softland');
+    } else if (storeys < 2.4) {
+      this.hp -= 1;
+      this.hurtFlash = 4;
+      if (this.hp <= 0) { this.startSeq('hardland'); return; }
+      this.startSeq('medland');
+    } else {
+      this.hp = 0;
+      this.startSeq('hardland');
+    }
+  };
+
+  /* Walls stop you where you stand; the original plays a bump for it. */
+  Char.prototype.blockWalls = function () {
+    var lvl = this.game.level;
+    var row = P.GEO.rowOf(this.y);
+    var lead = this.x + this.facing * 8;
+    var col = P.GEO.colOf(lead);
+    if (lvl.isWall(this.room, col, row)) {
+      var edge = this.facing > 0 ? col * TILE_W - 8 : (col + 1) * TILE_W + 8;
+      if ((this.facing > 0 && this.x > edge) || (this.facing < 0 && this.x < edge)) {
+        this.x = edge;
+        if (this.seqName === 'runcyc' || this.seqName === 'startrun') {
+          this.startSeq('bump');
+        }
+      }
+    }
+  };
+
+  /* Hand-cut to the neighbouring room the moment the body axis leaves this
+   * one. This has to happen before the floor test, or walking off the right
+   * edge reads as "no floor under column 10" and turns into a fall. */
+  Char.prototype.crossRooms = function () {
+    var W = ROOM_W * TILE_W;
+    if (this.x < 0) {
+      if (this.game.moveRoom(this, 'left')) this.x += W;
+      else this.x = 0;
+    } else if (this.x >= W) {
+      if (this.game.moveRoom(this, 'right')) this.x -= W;
+      else this.x = W - 1;
+    }
+  };
+
+  /* ---- control ------------------------------------------------------
+   * Sequence selection. The original only lets you change your mind at
+   * specific points, which is why the character feels committed rather
+   * than twitchy: input is a request to start a new sequence, and it is
+   * only honoured when the current one is in a state that permits it.
+   */
+  Char.prototype.control = function (c) {
+    if (!this.alive) return;
+    var s = this.seqName;
+    var fwd = this.facing > 0 ? c.right : c.left;
+    var back = this.facing > 0 ? c.left : c.right;
+    var lvl = this.game.level;
+
+    // fighting takes over entirely when a blade is out and someone is close
+    if (this.armed && this.game.foeNear(this)) {
+      this.fightControl(c);
+      return;
+    }
+
+    if (s === 'stand' || s === 'crouch') {
+      if (s === 'crouch' && !c.down) { this.startSeq('stand'); return; }
+      if (c.down && s !== 'crouch') {
+        if (this.canClimbDown()) { this.startSeq('hangstraight'); this.climbDownTo(); }
+        else this.startSeq('crouch');
+        return;
+      }
+      if (c.up) {
+        // jump up and let jaru decide whether there is a ledge to catch --
+        // the original never teleports you into a climb
+        if (fwd && this.ledgeAhead() < 0) { this.startSeq('standjump'); return; }
+        this.startSeq('jumpup');
+        return;
+      }
+      if (fwd) {
+        this.startSeq(c.shift ? 'stepsmall' : 'startrun');
+        return;
+      }
+      if (back) { this.startSeq('turn'); return; }
+    } else if (s === 'runcyc' || s === 'startrun') {
+      if (c.up) { this.startSeq('runjump'); return; }
+      if (back) { this.startSeq('turnrun'); return; }
+      if (!fwd) { this.startSeq('runstop'); return; }
+    } else if (s === 'hang') {
+      if (c.up) {
+        var row2 = P.GEO.rowOf(this.y);
+        if (lvl.canHang(this.room, P.GEO.colOf(this.x + this.facing * 14), row2 - 1)) {
+          this.startSeq('climbup');
+          return;
+        }
+      }
+      if (c.down || !c.shift) {
+        // letting go is the default; holding shift keeps the grip
+        if (c.down) { this.startSeq('hangdrop'); return; }
+      }
+    }
+  };
+
+  var FIGHT_SEQS = { engarde: 1, ready: 1, advance: 1, retreat: 1, strike: 1, block: 1, stabbed: 1, dead: 1 };
+
+  Char.prototype.fightControl = function (c) {
+    var s = this.seqName;
+    if (!FIGHT_SEQS[s]) { this.startSeq('engarde'); return; }
+    if (s !== 'ready') return;      // only interruptible on the guard stance
+    var fwd = this.facing > 0 ? c.right : c.left;
+    var back = this.facing > 0 ? c.left : c.right;
+    if (c.up) { this.startSeq('strike'); return; }
+    if (c.down) { this.startSeq('block'); return; }
+    if (fwd) { this.startSeq('advance'); return; }
+    if (back) { this.startSeq('retreat'); return; }
+  };
+
+  Char.prototype.canClimbUp = function () { return this.ledgeAhead() >= 0; };
+
+  Char.prototype.canClimbDown = function () {
+    var lvl = this.game.level;
+    var row = P.GEO.rowOf(this.y);
+    var col = P.GEO.colOf(this.x + this.facing * 14);
+    return !lvl.isFloor(this.room, col, row) && row < ROOM_H - 1;
+  };
+
+  Char.prototype.climbDownTo = function () {
+    this.x += this.facing * 10;
+    this.y += TILE_H;
+    this.startSeq('hang');
+  };
+
+  /* Sprite reference point and the current pair of bitmaps. */
+  Char.prototype.sprites = function () {
+    var f = this.ft.frames[this.frame];
+    return f || this.ft.frames[0];
+  };
+
+  P.Char = Char;
+})(POP);
+
+/* ===== src/game/bot.js ===== */
+/*
+ * bot.js -- attract-mode demo player.
+ *
+ * Arcade cabinets ran a canned input tape. A tape is brittle here: one
+ * missed pixel and the rest of the run is nonsense. So this is a waypoint
+ * walker instead -- per room, a list of "get to this x, then do this" --
+ * which self-corrects and survives the odd bad landing.
+ *
+ * It drives exactly the same control struct a human does. It has no special
+ * access to the character.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  var GEO = P.GEO;
+
+  /* Per room: waypoints. {to: x} walks there; {do: ...} performs a move and
+   * waits for the character to come to rest before moving on. */
+  var PLAN = {
+    1: [{ to: 340 }],
+    // the gap is cols 4-5 (x 128..191). A running jump carries ~78px, so
+    // leave the ground around x=118 to land clear on the far side.
+    2: [{ to: 118 }, { do: 'runjump' }, { to: 340 }],
+    // spike at col 7 (x 224..255); loose slabs at 2-3 want a brisk pace
+    3: [{ to: 178 }, { do: 'runjump' }, { to: 340 }],
+    // the floor steps up: stop at the lip, then pull up onto the ledge
+    4: [{ to: 138 }, { do: 'stop' }, { do: 'climb' }, { to: 340 }],
+    5: [{ do: 'fight' }, { to: 340 }],
+    6: [{ to: 240 }, { do: 'idle' }]
+  };
+
+  function Bot(game) {
+    this.game = game;
+    this.reset();
+  }
+
+  Bot.prototype.reset = function () {
+    this.room = -1;
+    this.step = 0;
+    this.phase = 0;
+    this.timer = 0;
+    this.c = { left: 0, right: 0, up: 0, down: 0, shift: 0 };
+  };
+
+  Bot.prototype.clear = function () {
+    var c = this.c;
+    c.left = c.right = c.up = c.down = c.shift = 0;
+    return c;
+  };
+
+  Bot.prototype.think = function () {
+    var k = this.game.kid;
+    var c = this.clear();
+    if (!k.alive) return c;
+
+    if (k.room !== this.room) {
+      this.room = k.room;
+      this.step = 0;
+      this.phase = 0;
+      this.timer = 0;
+    }
+
+    var plan = PLAN[this.room];
+    if (!plan) return c;
+
+    // advance through finished waypoints in the same tick -- returning
+    // early with no input would read as "let go", and letting go mid-run
+    // makes him skid to a halt exactly where we wanted him to jump
+    for (var i = 0; i < 4; i++) {
+      if (this.step >= plan.length) return c;
+      if (this.waypoint(plan[this.step], k, c) !== 'next') return c;
+      this.step++;
+      this.phase = 0;
+    }
+    return c;
+  };
+
+  Bot.prototype.waypoint = function (wp, k, c) {
+    if (wp.to !== undefined) {
+      if (k.x >= wp.to) return 'next';
+      c.right = 1;
+      return 'hold';
+    }
+    if (wp.back !== undefined) {
+      if (k.x <= wp.back) return 'next';
+      c.left = 1;
+      return 'hold';
+    }
+
+    switch (wp.do) {
+      case 'runjump':
+        if (this.phase === 0) {
+          c.right = 1; c.up = 1;
+          if (k.seqName === 'runjump' || k.seqName === 'standjump') this.phase = 1;
+          return 'hold';
+        }
+        if (k.seqName === 'runcyc' || k.seqName === 'stand' ||
+            k.seqName === 'softland' || k.seqName === 'medland') return 'next';
+        c.right = 1;
+        return 'hold';
+
+      case 'stop':
+        return k.seqName === 'stand' ? 'next' : 'hold';
+
+      case 'climb':
+        if (k.seqName === 'stand' && this.phase === 1) return 'next';
+        if (k.seqName === 'hang' || this.phase === 0) {
+          c.up = 1;
+          if (k.seqName === 'jumpup' || k.seqName === 'hang' || k.seqName === 'climbup') this.phase = 1;
+        }
+        return 'hold';
+
+      case 'fight':
+        return this.fight(k, c);
+
+      case 'idle':
+      default:
+        return 'hold';
+    }
+  };
+
+  /* Fighting: close the distance, then trade. Mixes strikes with blocks so
+   * the demo shows both sides of the swordplay rather than mashing attack. */
+  Bot.prototype.fight = function (k, c) {
+    var foe = this.game.foeOf(k);
+    if (!foe || !foe.alive) {
+      return (this.timer++ > 8) ? 'next' : 'hold';
+    }
+    this.timer = 0;
+    if (!k.armed) { c.right = 1; return 'hold'; }
+
+    var d = (foe.x - k.x) * k.facing;
+    if (d < 0) {                      // he got behind us; turn round
+      if (k.facing > 0) c.left = 1; else c.right = 1;
+      return 'hold';
+    }
+    // closing the distance has to happen whatever sequence we are in --
+    // gating it on the guard stance meant he stood still until the guard
+    // walked to him, which it never did
+    if (d > 48) {
+      if (k.facing > 0) c.right = 1; else c.left = 1;
+      return 'hold';
+    }
+    if (k.seqName !== 'ready') return 'hold';
+    // block while the guard is committed, otherwise take the opening
+    if (foe.seqName === 'strike') { c.down = 1; return 'hold'; }
+    this.beat = (this.beat || 0) + 1;
+    if (this.beat % 4 === 0) c.down = 1; else c.up = 1;
+    return 'hold';
+  };
+
+  P.Bot = Bot;
+})(POP);
+
+/* ===== src/game/game.js ===== */
+/*
+ * game.js -- boot, the fixed-rate tick, and everything that isn't the
+ * sequence table.
+ *
+ * The loop is deliberately not tied to the display refresh. The original ran
+ * its logic at a fixed low rate and every animation was authored to that
+ * clock; interpolating between frames to hit 60Hz would smear exactly the
+ * poses the rotoscope was made to hold. So we tick at a fixed rate and let
+ * frames land on whole ticks -- chunky on purpose.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  var C = P.C, ACT = P.ACT, T = P.T;
+  var GEO = P.GEO;
+  var TICK_HZ = 20;                     // DOS-speed; the Apple II was slower
+  var PLAYFIELD_H = 189;
+
+  function Game(canvas) {
+    this.g = new P.Gfx(320, 200);
+    this.g.attach(canvas);
+    this.t = 0;
+    this.acc = 0;
+    this.last = 0;
+    this.paused = false;
+    this.message = '';
+    this.messageT = 0;
+    this.shake = 0;
+    this.flash = 0;
+
+    this.ftKid = P.buildFrameTable('prince');
+    this.ftGuard = this.ftKid;          // same bitmaps, different wardrobe
+    this.guardMap = P.buildWardrobeMap(P.SKINS.prince, P.SKINS.guard);
+    this.seq = P.assembleSeq(this.ftKid);
+
+    this.level = new P.Level(P.LEVEL1);
+    this.audio = new P.Audio();
+
+    this.kid = new P.Char(this, 'kid');
+    var st = P.LEVEL1.start;
+    this.kid.room = st.room;
+    this.kid.x = st.col * GEO.TILE_W + 16;
+    this.kid.y = GEO.floorY(st.row);
+    this.kid.facing = st.facing;
+    this.kid.startSeq('stand');
+
+    this.guards = [];
+    this.spawnGuards();
+
+    this.autoplay = true;
+    this.bot = new P.Bot(this);
+    this.input = { left: 0, right: 0, up: 0, down: 0, shift: 0 };
+    this.won = false;
+    this.deaths = 0;
+
+    this.roomDirty = true;
+    this.curRoom = -1;
+  }
+
+  Game.prototype.spawnGuards = function () {
+    this.guards = [];
+    var rooms = this.level.rooms;
+    for (var id in rooms) {
+      if (!rooms.hasOwnProperty(id)) continue;
+      var defs = rooms[id].guards || [];
+      for (var i = 0; i < defs.length; i++) {
+        var d = defs[i];
+        var gd = new P.Char(this, 'guard');
+        gd.room = +id;
+        gd.x = d.col * GEO.TILE_W + 16;
+        gd.y = GEO.floorY(d.row);
+        gd.facing = d.facing;
+        gd.armed = true;
+        gd.hp = gd.maxHp = 3;
+        gd.ai = { cool: 0, engaged: false };
+        gd.startSeq('alertstand');
+        this.guards.push(gd);
+      }
+    }
+  };
+
+  /* ---- callbacks the sequence interpreter reaches back into ---------- */
+
+  Game.prototype.sound = function (id, ch) { this.audio.play(id, ch === this.kid); };
+
+  Game.prototype.effect = function (id, ch) {
+    if (id === 1) {               // finished drinking
+      ch.hp = Math.min(ch.maxHp, ch.hp + 1);
+      this.flash = 3;
+    } else if (id === 2) {        // the frame a sword strike actually lands
+      this.resolveStrike(ch);
+    }
+  };
+
+  Game.prototype.moveRoom = function (ch, dir) {
+    var r = this.level.rooms[ch.room];
+    if (!r) return false;
+    var to = r.links[dir];
+    if (!to || !this.level.rooms[to]) return false;
+    ch.room = to;
+    if (dir === 'down') ch.y -= GEO.ROOM_PX_H;
+    if (dir === 'up') ch.y += GEO.ROOM_PX_H;
+    if (ch === this.kid) this.roomDirty = true;
+    return true;
+  };
+
+  Game.prototype.onDeath = function (ch) {
+    if (ch === this.kid) {
+      this.deaths++;
+      this.say('YOU HAVE FAILED', 40);
+      var self = this;
+      this.restartT = 34;
+    }
+  };
+
+  Game.prototype.nextLevel = function () { this.win(); };
+
+  Game.prototype.win = function () {
+    if (this.won) return;
+    this.won = true;
+    this.say('THE WAY IS OPEN', 60);
+    this.flash = 6;
+  };
+
+  Game.prototype.say = function (m, t) { this.message = m; this.messageT = t; };
+
+  /* Standing on a tile: loose slabs, spikes, plates, pickups, the exit. */
+  Game.prototype.onGroundTile = function (ch) {
+    var lvl = this.level;
+    var col = GEO.colOf(ch.x), row = GEO.rowOf(ch.y);
+    var t = lvl.tile(ch.room, col, row);
+    var r = lvl.rooms[ch.room];
+
+    if (t === T.SPIKES && ch.alive) {
+      // spikes only bite if you are actually standing on them
+      if (ch.seqName === 'stand' || ch.seqName === 'crouch' ||
+          ch.seqName === 'softland' || ch.seqName === 'medland') {
+        ch.hp = 0;
+        this.sound(5, ch);
+        ch.startSeq('stabbed');
+      }
+      return;
+    }
+    if (t === T.LOOSE) {
+      var key = col * 16 + row;
+      if (!r.loose[key]) r.loose[key] = { col: col, row: row, state: 'shake', t: 0, dy: 0 };
+    }
+    if (t === T.PLATE_OPEN) { r.gatesOpen = true; r.gateT = 60; }
+    if (t === T.PLATE_SHUT) { r.gatesOpen = false; }
+    if (t === T.SWORD && ch === this.kid && !ch.armed) {
+      ch.armed = true;
+      lvl.setTile(ch.room, col, row, T.FLOOR);
+      this.roomDirty = true;
+      this.say('YOU HAVE THE SWORD', 40);
+      this.sound(10, ch);
+    }
+    if (t === T.POTION && ch === this.kid) {
+      lvl.setTile(ch.room, col, row, T.FLOOR);
+      this.roomDirty = true;
+      ch.startSeq('drink');
+    }
+    if (t === T.EXIT && ch === this.kid) this.win();
+  };
+
+  /* ---- combat -------------------------------------------------------- */
+
+  Game.prototype.foeNear = function (ch) {
+    var f = this.foeOf(ch);
+    return !!f && Math.abs(f.x - ch.x) < 70;
+  };
+
+  Game.prototype.foeOf = function (ch) {
+    if (ch === this.kid) {
+      for (var i = 0; i < this.guards.length; i++) {
+        var gd = this.guards[i];
+        if (gd.alive && gd.room === ch.room) return gd;
+      }
+      return null;
+    }
+    return (this.kid.alive && this.kid.room === ch.room) ? this.kid : null;
+  };
+
+  Game.prototype.resolveStrike = function (ch) {
+    var f = this.foeOf(ch);
+    if (!f || !f.alive) return;
+    var d = (f.x - ch.x) * ch.facing;
+    if (d < 4 || d > 40) { this.audio.play(11, true); return; }
+    if (f.seqName === 'block') {
+      this.audio.play(8, true);          // parried
+      this.shake = 2;
+      return;
+    }
+    f.hurt(1);
+    this.shake = 3;
+    this.flash = 2;
+  };
+
+  /* Guard AI. Deliberately readable rather than clever: the original's
+   * guards mostly advance, hold, strike and block on a timer, and the
+   * tension comes from the animation commitment, not the decision tree. */
+  Game.prototype.guardAI = function (gd) {
+    var k = this.kid;
+    var ai = gd.ai;
+    if (!gd.alive) return;
+    if (!k.alive || k.room !== gd.room) {
+      if (ai.engaged && gd.seqName === 'ready') gd.startSeq('alertstand');
+      ai.engaged = false;
+      return;
+    }
+    var dist = Math.abs(k.x - gd.x);
+    var want = k.x > gd.x ? 1 : -1;
+
+    if (!ai.engaged) {
+      if (dist < 96) {
+        ai.engaged = true;
+        if (gd.facing !== want) gd.facing = want;
+        gd.startSeq('engarde');
+      }
+      return;
+    }
+    if (gd.seqName !== 'ready') return;
+    if (gd.facing !== want && dist > 6) { gd.startSeq('turn'); return; }
+
+    if (ai.cool > 0) { ai.cool--; return; }
+
+    // block if the kid is committed to a strike and we are in range
+    if (k.seqName === 'strike' && dist < 46) { gd.startSeq('block'); ai.cool = 2; return; }
+
+    var r = Math.random();
+    if (dist > 44) {
+      if (r < 0.75) gd.startSeq('advance');
+      ai.cool = 1;
+    } else if (dist < 26) {
+      if (r < 0.5) gd.startSeq('retreat'); else gd.startSeq('strike');
+      ai.cool = 2;
+    } else {
+      if (r < 0.45) gd.startSeq('strike');
+      else if (r < 0.65) gd.startSeq('advance');
+      else if (r < 0.8) gd.startSeq('retreat');
+      ai.cool = 2 + (Math.random() * 3 | 0);
+    }
+  };
+
+  /* ---- tick ---------------------------------------------------------- */
+
+  Game.prototype.tick = function () {
+    this.t++;
+    if (this.messageT > 0) this.messageT--;
+    if (this.shake > 0) this.shake--;
+    if (this.flash > 0) this.flash--;
+
+    if (this.restartT !== undefined) {
+      if (--this.restartT <= 0) { this.restartT = undefined; this.restart(); return; }
+    }
+
+    var ctrl = this.autoplay ? this.bot.think() : this.input;
+
+    if (this.kid.alive) this.kid.control(ctrl);
+    this.kid.tick();
+
+    for (var i = 0; i < this.guards.length; i++) {
+      var gd = this.guards[i];
+      this.guardAI(gd);
+      gd.tick();
+    }
+
+    this.tickLoose();
+    if (this.won && this.messageT <= 0) this.restart();
+  };
+
+  Game.prototype.tickLoose = function () {
+    var lvl = this.level;
+    for (var id in lvl.rooms) {
+      if (!lvl.rooms.hasOwnProperty(id)) continue;
+      var r = lvl.rooms[id];
+      for (var k in r.loose) {
+        if (!r.loose.hasOwnProperty(k)) continue;
+        var L = r.loose[k];
+        L.t++;
+        if (L.state === 'shake') {
+          if (L.t > 13) { L.state = 'fall'; L.dy = 0; lvl.setTile(+id, L.col, L.row, T.SPACE); if (+id === this.kid.room) this.roomDirty = true; this.audio.play(12, +id === this.kid.room); }
+        } else if (L.state === 'fall') {
+          L.dy += 6;
+          if (L.dy > 70) delete r.loose[k];
+        }
+      }
+    }
+  };
+
+  Game.prototype.restart = function () {
+    var st = P.LEVEL1.start;
+    this.level = new P.Level(P.LEVEL1);
+    this.kid = new P.Char(this, 'kid');
+    this.kid.room = st.room;
+    this.kid.x = st.col * GEO.TILE_W + 16;
+    this.kid.y = GEO.floorY(st.row);
+    this.kid.facing = st.facing;
+    this.kid.startSeq('stand');
+    this.spawnGuards();
+    this.bot.reset();
+    this.won = false;
+    this.roomDirty = true;
+    this.message = '';
+    this.messageT = 0;
+  };
+
+  /* ---- render -------------------------------------------------------- */
+
+  Game.prototype.drawChar = function (ch) {
+    var g = this.g;
+    var f = ch.sprites();
+    if (!f) return;
+    var x = Math.round(ch.x), y = Math.round(ch.y);
+    var flip = ch.facing < 0;
+    var map = null;
+    if (ch.hurtFlash > 0 && (this.t & 1)) map = this.hurtMap || (this.hurtMap = buildHurtMap());
+    else if (ch.kind === 'guard') map = this.guardMap;
+    if (map) {
+      g.blitRemap(f.img, x, y, flip, map, null, 0, PLAYFIELD_H);
+      if (ch.armed) g.blitRemap(f.sword, x, y, flip, map, null, 0, PLAYFIELD_H);
+      return;
+    }
+    g.blit(f.img, x, y, flip, null, 0, PLAYFIELD_H);
+    if (ch.armed) g.blit(f.sword, x, y, flip, null, 0, PLAYFIELD_H);
+  };
+
+  function buildHurtMap() {
+    var m = new Uint8Array(64);
+    for (var i = 0; i < 64; i++) m[i] = i;
+    // everything but the outline goes hot -- a palette trick, no extra art
+    for (var j = 1; j < 40; j++) if (j !== C.OUTLINE) m[j] = C.RED_M;
+    return m;
+  }
+
+  Game.prototype.render = function () {
+    var g = this.g;
+    var room = this.kid.room;
+    if (this.roomDirty || room !== this.curRoom) {
+      this.level.renderRoom(g, room);
+      this.curRoom = room;
+      this.roomDirty = false;
+    }
+    g.restore();
+    this.level.renderDynamic(g, room, this.t);
+
+    for (var i = 0; i < this.guards.length; i++) {
+      if (this.guards[i].room === room) this.drawChar(this.guards[i]);
+    }
+    this.drawChar(this.kid);
+
+    this.drawHud();
+
+    // palette flash instead of touching pixels -- the cheap 1989 way
+    g.buildPalette(this.flash > 0 ? 0.10 * this.flash : 0);
+    g.present();
+  };
+
+  Game.prototype.drawHud = function () {
+    var g = this.g;
+    g.fillRect(0, PLAYFIELD_H, 320, 200 - PLAYFIELD_H, C.VOID);
+    g.hline(0, PLAYFIELD_H, 320, C.BRICK_S);
+
+    // the prince's life, as little vials on the left
+    for (var i = 0; i < this.kid.maxHp; i++) {
+      var x = 4 + i * 7, y = PLAYFIELD_H + 3;
+      var on = i < this.kid.hp;
+      g.fillRect(x, y, 4, 6, on ? C.RED_M : C.BRICK_S);
+      g.hline(x, y, 4, on ? C.FLAME : C.BRICK_D);
+    }
+    // the guard's, on the right, only while it matters
+    var f = this.foeOf(this.kid);
+    if (f && f.alive && f.ai && f.ai.engaged) {
+      for (var j = 0; j < f.maxHp; j++) {
+        var gx = 316 - 4 - j * 7;
+        g.fillRect(gx, PLAYFIELD_H + 3, 4, 6, j < f.hp ? C.BLUE_L : C.BRICK_S);
+        g.hline(gx, PLAYFIELD_H + 3, 4, j < f.hp ? C.STEEL_L : C.BRICK_D);
+      }
+    }
+
+    if (this.messageT > 0 && this.message) {
+      var w = P.Font.width(this.message);
+      P.Font.text(g, this.message, (320 - w) >> 1, 92, C.CREAM, C.VOID);
+    }
+    if (this.autoplay) {
+      P.Font.text(g, 'DEMO', 320 - 4 - P.Font.width('DEMO'), PLAYFIELD_H + 3, C.BRICK_L);
+    }
+  };
+
+  /* ---- frame pump ---------------------------------------------------- */
+
+  Game.prototype.frame = function (now) {
+    if (!this.last) this.last = now;
+    var dt = Math.min(250, now - this.last);
+    this.last = now;
+    var drew = false;
+    if (!this.paused) {
+      this.acc += dt;
+      var step = 1000 / TICK_HZ;
+      var n = 0;
+      while (this.acc >= step && n < 5) { this.tick(); this.acc -= step; n++; drew = true; }
+    }
+    if (drew || !this.everDrew) { this.render(); this.everDrew = true; }
+  };
+
+  Game.prototype.setInput = function (k, v) {
+    if (this.input[k] === v) return;
+    this.input[k] = v;
+    if (v) this.userTookOver();
+  };
+
+  Game.prototype.userTookOver = function () {
+    if (this.autoplay) {
+      this.autoplay = false;
+      this.say('YOU HAVE CONTROL', 24);
+    }
+    this.audio.enable();
+  };
+
+  P.Game = Game;
+  P.TICK_HZ = TICK_HZ;
+})(POP);
+
+/* ===== src/shell.js ===== */
+/*
+ * shell.js -- page wiring: canvas scaling, keyboard, touch.
+ *
+ * The framebuffer is always 320x200. Scaling to the viewport is left to the
+ * one thing a browser does that is genuinely equivalent to what we want --
+ * nearest-neighbour upscale of an integer bitmap. No smoothing, ever: on a
+ * phone this fills the width and the pixels get bigger, which is the point.
+ */
+var POP = POP || {};
+(function (P) {
+  'use strict';
+
+  function boot(opts) {
+    opts = opts || {};
+    var canvas = document.getElementById('screen');
+    var game = new P.Game(canvas);
+    P.game = game;
+
+    /* ---- keyboard --------------------------------------------------- */
+    var KEYS = {
+      ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down',
+      KeyA: 'left', KeyD: 'right', KeyW: 'up', KeyS: 'down',
+      ShiftLeft: 'shift', ShiftRight: 'shift'
+    };
+    window.addEventListener('keydown', function (e) {
+      if (e.code === 'KeyM') { game.audio.mute(game.audio.on); return; }
+      if (e.code === 'KeyP') { game.paused = !game.paused; return; }
+      if (e.code === 'KeyR') { game.restart(); game.userTookOver(); return; }
+      var k = KEYS[e.code];
+      if (!k) return;
+      e.preventDefault();
+      game.setInput(k, 1);
+    }, { passive: false });
+    window.addEventListener('keyup', function (e) {
+      var k = KEYS[e.code];
+      if (!k) return;
+      e.preventDefault();
+      game.input[k] = 0;
+    }, { passive: false });
+
+    /* ---- touch ------------------------------------------------------
+     * Buttons are real DOM elements rather than hit-tested canvas regions,
+     * so they get native touch handling and stay usable with a thumb.
+     */
+    var pad = document.getElementById('pad');
+    if (pad) {
+      var held = {};
+      function bind(el, key) {
+        function down(e) { e.preventDefault(); held[key] = 1; game.setInput(key, 1); el.classList.add('on'); }
+        function up(e) { e.preventDefault(); held[key] = 0; game.input[key] = 0; el.classList.remove('on'); }
+        el.addEventListener('touchstart', down, { passive: false });
+        el.addEventListener('touchend', up, { passive: false });
+        el.addEventListener('touchcancel', up, { passive: false });
+        el.addEventListener('mousedown', down);
+        el.addEventListener('mouseup', up);
+        el.addEventListener('mouseleave', up);
+      }
+      var btns = pad.querySelectorAll('[data-key]');
+      for (var i = 0; i < btns.length; i++) bind(btns[i], btns[i].getAttribute('data-key'));
+    }
+
+    // any tap on the screen also counts as taking over
+    canvas.addEventListener('pointerdown', function () { game.userTookOver(); });
+
+    /* ---- fit --------------------------------------------------------
+     * Integer-ish scale to the viewport. The canvas stays 320x200; CSS
+     * blows it up with image-rendering: pixelated, so one game pixel
+     * becomes a crisp square block instead of a blurry smear.
+     */
+    function fit() {
+      var wrap = document.getElementById('wrap');
+      var padEl = document.getElementById('pad');
+      var availW = window.innerWidth;
+      var padH = padEl ? padEl.offsetHeight : 0;
+      var availH = window.innerHeight - padH;
+      var scale = Math.min(availW / 320, availH / 200);
+      // prefer whole-number scales when there is room; a fractional scale
+      // on a small phone is better than wasting a third of the screen
+      if (scale >= 2) scale = Math.floor(scale);
+      var w = Math.round(320 * scale), h = Math.round(200 * scale);
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      if (wrap) wrap.style.height = h + 'px';
+    }
+    window.addEventListener('resize', fit);
+    window.addEventListener('orientationchange', function () { setTimeout(fit, 120); });
+    fit();
+
+    function loop(now) { game.frame(now); requestAnimationFrame(loop); }
+    requestAnimationFrame(loop);
+
+    return game;
+  }
+
+  P.boot = boot;
+})(POP);
+
+POP.boot();
+</script>

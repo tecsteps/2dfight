@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Prince of Persia — software renderer</title>
+<style>
+  :root { --ink:#e8d5b5; --bg:#0b0908; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    overflow:hidden; height:100%; overscroll-behavior:none; touch-action:none; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #wrap { display:flex; align-items:center; justify-content:center; }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    display:block;
+    background:#000;
+    box-shadow: 0 0 0 1px #2b211a, 0 8px 40px rgba(0,0,0,.8);
+  }
+  #pad { display:none; width:100%; padding:8px 8px calc(8px + env(safe-area-inset-bottom));
+    gap:8px; justify-content:space-between; align-items:flex-end; }
+  .cluster { display:flex; gap:8px; }
+  .btn { width:60px; height:52px; border-radius:8px; border:1px solid #54402f;
+    background:#1a1410; color:var(--ink); font-size:19px; display:flex;
+    align-items:center; justify-content:center; user-select:none; font-weight:700; }
+  .btn.on { background:#54402f; border-color:#a3856a; }
+  .btn.wide { width:74px; }
+  #hint { font-size:11px; opacity:.5; padding:6px; text-align:center; letter-spacing:.04em; }
+  @media (pointer:coarse), (max-width: 760px) {
+    #pad { display:flex; }
+    #hint { display:none; }
+  }
+</style>
+</head>
+<body>
+  <div id="wrap"><canvas id="screen"></canvas></div>
+  <div id="hint">&larr; &rarr; move &nbsp;·&nbsp; &uarr; jump / climb &nbsp;·&nbsp; &darr; crouch / block &nbsp;·&nbsp; shift step &nbsp;·&nbsp; M mute &nbsp;·&nbsp; R restart</div>
+  <div id="pad">
+    <div class="cluster">
+      <div class="btn" data-key="left">&#9664;</div>
+      <div class="btn" data-key="right">&#9654;</div>
+    </div>
+    <div class="cluster">
+      <div class="btn wide" data-key="shift">step</div>
+      <div class="btn" data-key="down">&#9660;</div>
+      <div class="btn" data-key="up">&#9650;</div>
+    </div>
+  </div>
+
+  <script src="src/engine/gfx.js"></script>
+  <script src="src/engine/raster.js"></script>
+  <script src="src/engine/font.js"></script>
+  <script src="src/engine/audio.js"></script>
+  <script src="src/game/rig.js"></script>
+  <script src="src/game/poses.js"></script>
+  <script src="src/game/frames.js"></script>
+  <script src="src/game/seq.js"></script>
+  <script src="src/game/level.js"></script>
+  <script src="src/game/char.js"></script>
+  <script src="src/game/bot.js"></script>
+  <script src="src/game/game.js"></script>
+  <script src="src/shell.js"></script>
+  <script>POP.boot();</script>
+</body>
+</html>
